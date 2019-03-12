@@ -18,7 +18,7 @@ Tested with Ansible v2.5+
 
 - Edit/search plaintext as needed
 
-- Run `./bulk-decrypt-vault.py open` to re-encrypt any changed files
+- Run `./bulk-decrypt-vault.py close` to re-encrypt any changed files
 
   Any unchanged files will returned to their original state.
 
