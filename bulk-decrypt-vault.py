@@ -80,7 +80,7 @@ def decrypt_vault_files():
         # print json.dumps(vaultedFileList, indent=2)
 
     # load vault password into memory
-    with open('../../vault_password_file', 'r') as vault_password_file:
+    with open(VAULT_PASSWORD_PATH, 'r') as vault_password_file:
         vaultPassword = vault_password_file.read().strip()
 
     # create a new Vault instance with the
