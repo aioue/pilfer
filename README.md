@@ -1,5 +1,5 @@
 # pilfer
-Decrypt all ansible vault files recursively for search/editing, then re-encrypt them.
+Decrypt *all* ansible vault files in a project recursively for search/editing, then re-encrypt them all at once when you're done.
 
 Borrows heavily from the excellent, but no longer supported [Ansible Toolkit](https://github.com/dellis23/ansible-toolkit).
 
