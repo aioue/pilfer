@@ -3,6 +3,8 @@ Decrypt *all* ansible vault files in a project recursively for search/editing, t
 
 Borrows heavily from the excellent, but no longer supported [Ansible Toolkit](https://github.com/dellis23/ansible-toolkit).
 
+## This project is no longer maintained. If you wish to maintain it, get in touch: pilfermaint()aioue.net
+
 Tested with Ansible v2.5+
 
 ## Usage
