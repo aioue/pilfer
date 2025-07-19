@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
-# heavily borrows from this excellent repo https://github.com/dellis23/ansible-toolkit
+# Borrows from this excellent, now unmaintained, repo https://github.com/dellis23/ansible-toolkit
 
-# bulk decrypt recrypt ansible vault files
-# ./bulk-decrypt-vault.py [open|close]
+"""
+Pilfer - Decrypt all ansible vault files in a project recursively for search/editing
+
+Standalone script that can be downloaded and run without installation.
+
+Usage:
+    python pilfer.py [open|close] [-p VAULT_PASSWORD_FILE]
+
+For packaged installation, use:
+    pipx install pilfer
+"""
 
 import argparse
 import errno
@@ -18,6 +27,8 @@ from pathlib import Path
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.parsing.vault import VaultLib, VaultSecret
 
+
+__version__ = "1.0.0"
 
 temp_vault_file_list_path = "vaultedFileList.json"
 list_of_vault_encrypted_files = []
@@ -55,23 +66,14 @@ def get_vault_password_file():
     raise FileNotFoundError("Could not find vault password file. Please ensure it exists or specify with -p argument.")
 
 
-# find all files that have the ansible vault header and write it to disk
 def write_vaulted_file_list():
+    """Find all files that have the ansible vault header and write it to disk"""
     walk_dir = os.path.abspath(os.getcwd())
 
     for dirpath, dirnames, filenames in os.walk(walk_dir):
-
         for name in filenames:
-            # print name
-
-            # disable filename filter since we might have encrypted everything
-            # yamlExtensions = ('yml','yaml')
-            # if name.endswith(yamlExtensions):
-            #     print name
-
             # full path
             filePath = os.path.join(dirpath, name)
-            # print filePath
 
             # find all files with the ansible vault header
             try:
@@ -79,24 +81,20 @@ def write_vaulted_file_list():
                     first_line = open_file.readline()
 
                     if first_line.startswith(b'$ANSIBLE_VAULT;'):
-                        # print filePath
                         list_of_vault_encrypted_files.append(filePath)
             except (IOError, OSError, PermissionError):
                 # Skip files we can't read
                 continue
 
-    # print vaultedFileList
     with open(temp_vault_file_list_path, 'w') as open_file:
         json.dump(list_of_vault_encrypted_files, open_file, indent=2)
 
 
 def decrypt_vault_files(vault_password_file_path=None):
+    """Decrypt all vault files found in the project"""
     # load the list of encrypted files
     with open(temp_vault_file_list_path, 'r') as vaultListFile:
         vaultedFileList = json.load(vaultListFile)
-
-        # list the detected encrypted files
-        # print json.dumps(vaultedFileList, indent=2)
 
     # determine vault password file
     if vault_password_file_path:
@@ -144,6 +142,7 @@ def decrypt_vault_files(vault_password_file_path=None):
 
 
 def mkdir_p(path):
+    """Create directory path if it doesn't exist"""
     try:
         os.makedirs(path)
     except OSError as exc:  # Python >2.5
@@ -154,6 +153,7 @@ def mkdir_p(path):
 
 
 def recrypt_vault_files(vault_password_file_path=None):
+    """Re-encrypt all vault files, only changing ones that were modified"""
     with open(temp_vault_file_list_path, 'r') as vaultListFile:
         vaultedFileList = json.load(vaultListFile)
 
@@ -192,6 +192,7 @@ def recrypt_vault_files(vault_password_file_path=None):
                 # File was modified, re-encrypt it using Ansible's official vault implementation
                 # VaultLib.encrypt() expects and returns bytes
                 new_encrypted_data = vault.encrypt(new_data_bytes)
+                print(f"Re-encrypting modified file: {vaultedFilePath}")
             else:
                 # File unchanged, restore original encrypted version
                 new_encrypted_data = old_encrypted_data
@@ -222,30 +223,55 @@ def recrypt_vault_files(vault_password_file_path=None):
         pass
 
 
-if __name__ == '__main__':
-
+def main():
+    """Main CLI entry point for pilfer standalone script"""
     # Parse Args
-    parser = argparse.ArgumentParser()
-    parser.add_argument('action', help="open, close")
+    parser = argparse.ArgumentParser(
+        prog='pilfer',
+        description='Decrypt all ansible vault files in a project recursively for search/editing, then re-encrypt them when done',
+        epilog="""
+Examples:
+  python pilfer.py open                    # Decrypt all vault files using ansible.cfg
+  python pilfer.py open -p ~/.vault-pass   # Decrypt using specific password file  
+  python pilfer.py close                   # Re-encrypt modified files
+
+For installation via pipx:
+  pipx install pilfer
+        """
+    )
+    parser.add_argument('action', choices=['open', 'close'], 
+                       help="'open' to decrypt all vault files, 'close' to re-encrypt modified files")
     parser.add_argument('-p', '--vault-password-file', type=str,
                         help="Path to vault password file")
+    parser.add_argument('--version', action='version', version=f'pilfer {__version__}')
+    
     args = parser.parse_args()
-    if args.action not in ['open', 'close']:
-        raise RuntimeError(
-            "command must be either 'open' or 'close'")
 
     # Open / Close Vault
     if args.action == 'open':
-
+        print("🔓 Searching for and decrypting vault files...")
         # check for an existing encrypted file list
         # if one exists, decrypt the files
         # if it doesn't, make one
         if Path(temp_vault_file_list_path).is_file():
-            # print "path exists, skipping file creation"
             decrypt_vault_files(args.vault_password_file)
         else:
             write_vaulted_file_list()
-            decrypt_vault_files(args.vault_password_file)
+            if list_of_vault_encrypted_files:
+                print(f"Found {len(list_of_vault_encrypted_files)} vault file(s)")
+                decrypt_vault_files(args.vault_password_file)
+                print("✅ All vault files decrypted. Edit as needed, then run 'pilfer close' to re-encrypt.")
+            else:
+                print("No vault files found in current directory tree.")
 
     elif args.action == 'close':
-        recrypt_vault_files(args.vault_password_file)
+        print("🔒 Re-encrypting vault files...")
+        if Path(temp_vault_file_list_path).is_file():
+            recrypt_vault_files(args.vault_password_file)
+            print("✅ Vault files re-encrypted. Modified files have been updated.")
+        else:
+            print("No vault file list found. Run 'pilfer open' first.")
+
+
+if __name__ == '__main__':
+    main() 

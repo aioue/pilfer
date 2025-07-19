@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=45.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pilfer"
+version = "1.0.2"
+authors = [
+    {name = "Tom Paine", email = "github@aioue.net"},
+]
+description = "Decrypt all ansible vault files in a project recursively for search/editing, then re-encrypt when done."
+readme = "README.md"
+
+requires-python = ">=3.6"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "ansible>=2.9.0",
+]
+keywords = ["ansible", "vault", "encryption", "devops", "automation"]
+
+[project.urls]
+Homepage = "https://github.com/aioue/pilfer"
+Repository = "https://github.com/aioue/pilfer"
+Issues = "https://github.com/aioue/pilfer/issues"
+
+[project.scripts]
+pilfer = "pilfer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pilfer*"]
+
+[tool.setuptools.package-data]
+pilfer = ["py.typed"] 

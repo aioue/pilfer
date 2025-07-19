@@ -18,14 +18,22 @@ Tested with Ansible v2.18.x and Python 3.12.x
 
 ## Usage
 ```
-./bulk-decrypt-vault.py [open|close] [-p VAULT_PASSWORD_FILE]
+pilfer [open|close] [-p VAULT_PASSWORD_FILE]
 ```
 
 ### Basic Usage
-- Download `bulk-decrypt-vault.py` and place it at the root of your Ansible directories
-- Run `./bulk-decrypt-vault.py open` to decrypt all vaulted files recursively
+
+**Option 1: Standalone Script (No Installation)**
+- Download `pilfer.py` and place it in your Ansible project directory
+- Run `python pilfer.py open` to decrypt all vaulted files recursively
 - Edit/search plaintext as needed
-- Run `./bulk-decrypt-vault.py close` to re-encrypt any changed files
+- Run `python pilfer.py close` to re-encrypt any changed files
+
+**Option 2: Installed via pipx (Recommended)**
+- Install pilfer via pipx: `pipx install pilfer`
+- Run `pilfer open` to decrypt all vaulted files recursively
+- Edit/search plaintext as needed
+- Run `pilfer close` to re-encrypt any changed files
 
 Any unchanged files will be returned to their original state.
 
@@ -43,34 +51,87 @@ The script automatically detects your vault password file in this order:
 
 ### Examples
 
+**Using the installed version:**
 ```bash
 # Use ansible.cfg vault_password_file setting (recommended)
-./bulk-decrypt-vault.py open
+pilfer open
 
 # Specify custom vault password file
-./bulk-decrypt-vault.py open -p ~/.my-vault-password
+pilfer open -p ~/.my-vault-password
 
-# Close and re-encrypt modified files, any unchanged files will returned to their original state.
-./bulk-decrypt-vault.py close
+# Close and re-encrypt modified files
+pilfer close
+```
+
+**Using the standalone script:**
+```bash
+# Use ansible.cfg vault_password_file setting (recommended)
+python pilfer.py open
+
+# Specify custom vault password file
+python pilfer.py open -p ~/.my-vault-password
+
+# Close and re-encrypt modified files
+python pilfer.py close
 ```
 
 ## Installation
 
-### Requirements
+### Option 1: Standalone Script (No Installation Required)
 
-**Python 3.6+** with Ansible installed:
+Download and use the standalone script directly:
 
 ```bash
-# Standard installation using pip
-pip install ansible
+# Download the standalone script
+curl -O https://raw.githubusercontent.com/aioue/pilfer/main/pilfer.py
 
-# In containerized/restricted environments (use with caution)
-pip install ansible --break-system-packages
+# Make it executable (required for ./pilfer.py usage)
+chmod +x pilfer.py
 
+# Use it directly
+./pilfer.py open
+# OR
+python pilfer.py open
+```
+
+### Option 2: Install via pipx (Recommended for Regular Use)
+
+**Python 3.6+** is required. Install pilfer using pipx for isolated CLI tool management:
+
+```bash
+# Install pilfer via pipx (recommended)
+pipx install pilfer
+
+# Verify installation
+pilfer --help
+```
+
+### Alternative Installation Methods
+
+If you prefer other installation methods:
+
+```bash
+# Install from source (in development mode)
+git clone https://github.com/aioue/pilfer.git
+cd pilfer
+pip install -e .
+
+# Direct pip installation (not recommended for CLI tools)
+pip install pilfer
+```
+
+### Requirements
+
+Pilfer requires **Ansible** to be available. If not already installed:
+
+```bash
 # Using pipx (recommended for CLI tools)
 pipx install ansible
 
-# System package manager (recommended for production)
+# Using pip
+pip install ansible
+
+# System package manager
 # Ubuntu/Debian:
 sudo apt update && sudo apt install ansible
 
@@ -90,3 +151,60 @@ vault_password_file = ~/.ansible-vault/.vault-file
 ```
 
 This eliminates the need to manually configure vault password paths.
+
+## Development and Publishing
+
+### For Developers
+
+To set up for development:
+
+```bash
+# Clone the repository
+git clone https://github.com/aioue/pilfer.git
+cd pilfer
+
+# Install in development mode
+pip install -e .
+
+# Make changes and test
+pilfer --help
+```
+
+### Publishing to PyPI
+
+Prerequisites:
+```bash
+# Install build tools
+pip install build twine
+
+# Configure PyPI credentials
+# ~/.pypirc or use environment variables
+```
+
+Build and publish:
+```bash
+# Make the script executable
+chmod +x build_and_publish.sh
+
+# Publish to TestPyPI first
+./build_and_publish.sh test
+
+# After testing, publish to production PyPI
+./build_and_publish.sh prod
+```
+
+The build script will:
+1. Clean previous builds
+2. Build the package using modern Python packaging
+3. Upload to PyPI/TestPyPI using twine
+4. Provide installation instructions
+
+## License
+
+This project is licensed under the GNU General Public License v3 or later (GPLv3+). See the [LICENSE](../LICENSE) file for the complete license text from the [official GNU website](https://www.gnu.org/licenses/gpl-3.0.txt).
+
+### Packaging Note
+
+Due to a compatibility issue between modern setuptools (which supports SPDX license expressions) and PyPI's current metadata validation (which doesn't yet support the new format), the license file is renamed to `PILFER_LICENSE.txt` during packaging to avoid auto-detection issues. This is a temporary workaround until PyPI updates its metadata validation to support the newer standards.
+
+This package heavily borrows from the excellent, but no longer supported [Ansible Toolkit](https://github.com/dellis23/ansible-toolkit).
