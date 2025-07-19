@@ -1,0 +1,160 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # Allows manual triggering
+
+jobs:
+  test:
+    name: Test on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # Continue testing other versions if one fails
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install ansible  # Required for VaultLib
+        pip install -e .     # Install pilfer in development mode
+        
+    - name: Verify installation
+      run: |
+        python -c "import pilfer.cli; print('CLI import successful')"
+        python pilfer.py --version
+        
+    - name: Run tests
+      run: |
+        cd tests
+        python run_tests.py
+        
+    - name: Run individual test classes (for debugging)
+      if: failure()  # Only run if main tests failed
+      run: |
+        cd tests
+        echo "Running CLI tests separately..."
+        python -m unittest test_pilfer_unified.TestPilferCLI -v
+        echo "Running standalone tests separately..."
+        python -m unittest test_pilfer_unified.TestPilferStandalone -v
+        echo "Running compatibility tests separately..."
+        python -m unittest test_pilfer_unified.TestCompatibility -v
+
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-lint-${{ hashFiles('**/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-lint-
+          
+    - name: Install linting tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black isort
+        
+    - name: Check code formatting with black
+      run: black --check --diff pilfer/ pilfer.py tests/
+      
+    - name: Check import sorting with isort
+      run: isort --check-only --diff pilfer/ pilfer.py tests/
+      
+    - name: Lint with flake8
+      run: flake8 pilfer/ pilfer.py tests/ --max-line-length=100 --ignore=E203,W503
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+        
+    - name: Install security tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit safety
+        
+    - name: Run bandit security scan
+      run: bandit -r pilfer/ pilfer.py -f json -o bandit-report.json || true
+      
+    - name: Run safety check
+      run: |
+        pip install ansible  # Install dependencies for safety check
+        safety check --json --output safety-report.json || true
+        
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json
+
+  test-coverage:
+    name: Test Coverage
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+        
+    - name: Install dependencies with coverage
+      run: |
+        python -m pip install --upgrade pip
+        pip install ansible coverage
+        pip install -e .
+        
+    - name: Run tests with coverage
+      run: |
+        cd tests
+        coverage run --source=../pilfer run_tests.py
+        coverage report --show-missing
+        coverage html
+        
+    - name: Upload coverage reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: coverage-report
+        path: tests/htmlcov/ 

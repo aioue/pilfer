@@ -171,6 +171,7 @@ def recrypt_vault_files(vault_password_file_path=None):
         (DEFAULT_VAULT_ID_MATCH, VaultSecret(vaultPassword.encode('utf-8')))
     ])
 
+    modified_count = 0
     # iterate over the list of vaulted files
     for vaultedFilePath in vaultedFileList:
         try:
@@ -191,6 +192,7 @@ def recrypt_vault_files(vault_password_file_path=None):
                 # File was modified, re-encrypt it using Ansible's official vault implementation
                 # VaultLib.encrypt() expects and returns bytes
                 new_encrypted_data = vault.encrypt(new_data_bytes)
+                modified_count += 1
             else:
                 # File unchanged, restore original encrypted version
                 new_encrypted_data = old_encrypted_data
@@ -219,6 +221,8 @@ def recrypt_vault_files(vault_password_file_path=None):
         os.remove(temp_vault_file_list_path)
     except Exception:
         pass
+    
+    return modified_count
 
 
 def main():
@@ -247,7 +251,8 @@ def main():
             decrypt_vault_files(args.vault_password_file)
 
     elif args.action == 'close':
-        recrypt_vault_files(args.vault_password_file)
+        modified_count = recrypt_vault_files(args.vault_password_file)
+        print(f"✅ Vault files re-encrypted. {modified_count} modified files have been updated.")
 
 
 if __name__ == '__main__':

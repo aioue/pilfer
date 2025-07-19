@@ -28,7 +28,7 @@ from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.parsing.vault import VaultLib, VaultSecret
 
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 temp_vault_file_list_path = "vaultedFileList.json"
 list_of_vault_encrypted_files = []
@@ -172,6 +172,7 @@ def recrypt_vault_files(vault_password_file_path=None):
         (DEFAULT_VAULT_ID_MATCH, VaultSecret(vaultPassword.encode('utf-8')))
     ])
 
+    modified_count = 0
     # iterate over the list of vaulted files
     for vaultedFilePath in vaultedFileList:
         try:
@@ -193,6 +194,7 @@ def recrypt_vault_files(vault_password_file_path=None):
                 # VaultLib.encrypt() expects and returns bytes
                 new_encrypted_data = vault.encrypt(new_data_bytes)
                 print(f"Re-encrypting modified file: {vaultedFilePath}")
+                modified_count += 1
             else:
                 # File unchanged, restore original encrypted version
                 new_encrypted_data = old_encrypted_data
@@ -221,6 +223,8 @@ def recrypt_vault_files(vault_password_file_path=None):
         os.remove(temp_vault_file_list_path)
     except Exception:
         pass
+    
+    return modified_count
 
 
 def main():
@@ -267,8 +271,8 @@ For installation via pipx:
     elif args.action == 'close':
         print("🔒 Re-encrypting vault files...")
         if Path(temp_vault_file_list_path).is_file():
-            recrypt_vault_files(args.vault_password_file)
-            print("✅ Vault files re-encrypted. Modified files have been updated.")
+            modified_count = recrypt_vault_files(args.vault_password_file)
+            print(f"✅ Vault files re-encrypted. {modified_count} modified files have been updated.")
         else:
             print("No vault file list found. Run 'pilfer open' first.")
 

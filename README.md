@@ -1,4 +1,10 @@
 # pilfer
+
+[![CI](https://github.com/aioue/pilfer/workflows/CI/badge.svg)](https://github.com/aioue/pilfer/actions)
+[![Test Suite](https://github.com/aioue/pilfer/workflows/Test%20Suite/badge.svg)](https://github.com/aioue/pilfer/actions)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
 Decrypt *all* ansible vault files in a project recursively for search/editing, then re-encrypt them all at once when you're done.
 
 Borrows heavily from the excellent, but no longer supported [Ansible Toolkit](https://github.com/dellis23/ansible-toolkit).
