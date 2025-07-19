@@ -5,16 +5,16 @@ Borrows heavily from the excellent, but no longer supported [Ansible Toolkit](ht
 
 **Updated for Python 3 compatibility with modern features and ansible.cfg integration.**
 
-Tested with Ansible v2.5+ and Python 3.6+
+Tested with Ansible v2.18.x and Python 3.12.x
 
 ## Features
 
 - **Python 3 compatible** - Modernized for current Python versions
 - **ansible.cfg integration** - Automatically reads `vault_password_file` from your ansible.cfg
-- **Smart fallback** - Searches common locations for vault password files
 - **Change detection** - Only re-encrypts files that were actually modified (using SHA256)
 - **Safe operation** - Preserves original encrypted content for unchanged files
-- **Error handling** - Robust error handling with meaningful messages
+- **No third-party dependencies** - Uses Ansible's official vault implementation directly
+- **Binary data preservation** - Preserves exact line endings and formatting (critical for certificates)
 
 ## Usage
 ```
@@ -50,7 +50,7 @@ The script automatically detects your vault password file in this order:
 # Specify custom vault password file
 ./bulk-decrypt-vault.py open -p ~/.my-vault-password
 
-# Close and re-encrypt modified files
+# Close and re-encrypt modified files, any unchanged files will returned to their original state.
 ./bulk-decrypt-vault.py close
 ```
 
@@ -58,17 +58,27 @@ The script automatically detects your vault password file in this order:
 
 ### Requirements
 
-**Python 3.6+** with the ansible-vault library:
+**Python 3.6+** with Ansible installed:
 
 ```bash
-# Standard installation
-pip install ansible-vault
+# Standard installation using pip
+pip install ansible
 
-# In containerized/restricted environments
-pip install ansible-vault --break-system-packages
+# In containerized/restricted environments (use with caution)
+pip install ansible --break-system-packages
 
 # Using pipx (recommended for CLI tools)
-pipx inject ansible ansible-vault
+pipx install ansible
+
+# System package manager (recommended for production)
+# Ubuntu/Debian:
+sudo apt update && sudo apt install ansible
+
+# RHEL/CentOS/Fedora:
+sudo dnf install ansible
+
+# macOS:
+brew install ansible
 ```
 
 ### ansible.cfg Setup (Recommended)

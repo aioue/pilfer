@@ -14,8 +14,9 @@ import shutil
 import configparser
 from pathlib import Path
 
-# pip install ansible-vault (https://github.com/tomoh1r/ansible-vault)
-from ansible_vault import Vault
+# Use Ansible's official vault implementation instead of third-party library
+from ansible.constants import DEFAULT_VAULT_ID_MATCH
+from ansible.parsing.vault import VaultLib, VaultSecret
 
 
 temp_vault_file_list_path = "vaultedFileList.json"
@@ -107,8 +108,10 @@ def decrypt_vault_files(vault_password_file_path=None):
     with open(vault_file, 'r') as vault_password_file:
         vaultPassword = vault_password_file.read().strip()
 
-    # create a new Vault instance
-    vault = Vault(vaultPassword)
+    # create VaultLib instance using Ansible's official implementation
+    vault = VaultLib([
+        (DEFAULT_VAULT_ID_MATCH, VaultSecret(vaultPassword.encode('utf-8')))
+    ])
 
     # iterate over the list of vaulted files
     for vaultedFilePath in vaultedFileList:
@@ -119,22 +122,21 @@ def decrypt_vault_files(vault_password_file_path=None):
             # make a copy of the encrypted file
             shutil.copy2(vaultedFilePath, temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted')
 
-            # decrypt the file
-            with open(vaultedFilePath, 'r') as f:
-                decryptedFileContents = vault.load_raw(f.read())
+            # decrypt the file using Ansible's official vault implementation
+            # Read encrypted data as bytes to preserve exact formatting
+            with open(vaultedFilePath, 'rb') as f:
+                encrypted_data = f.read()
+                # VaultLib.decrypt() returns bytes, preserving binary data and line endings
+                decrypted_bytes = vault.decrypt(encrypted_data)
 
-            # Convert bytes to string if necessary
-            if isinstance(decryptedFileContents, bytes):
-                decryptedFileContents = decryptedFileContents.decode('utf-8')
-
-            # write a hash of the decrypted file to disk in the temporary directory
-            file_hash = hashlib.sha256(decryptedFileContents.encode('utf-8')).hexdigest()
+            # write a hash of the decrypted content (bytes) to disk in the temporary directory
+            file_hash = hashlib.sha256(decrypted_bytes).hexdigest()
             with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/hash', 'w') as decryptedVaultFileHash:
                 decryptedVaultFileHash.write(file_hash)
 
-            # write the decrypted data to disk
-            with open(vaultedFilePath, 'w') as decryptedVaultFile:
-                decryptedVaultFile.write(decryptedFileContents)
+            # write the decrypted data to disk as bytes to preserve exact formatting
+            with open(vaultedFilePath, 'wb') as decryptedVaultFile:
+                decryptedVaultFile.write(decrypted_bytes)
                 
         except Exception as e:
             print(f"Failed to decrypt {vaultedFilePath}: {e}")
@@ -165,35 +167,38 @@ def recrypt_vault_files(vault_password_file_path=None):
     with open(vault_file, 'r') as vault_password_file:
         vaultPassword = vault_password_file.read().strip()
 
-    # create a new Vault instance
-    vault = Vault(vaultPassword)
+    # create VaultLib instance using Ansible's official implementation
+    vault = VaultLib([
+        (DEFAULT_VAULT_ID_MATCH, VaultSecret(vaultPassword.encode('utf-8')))
+    ])
 
     # iterate over the list of vaulted files
     for vaultedFilePath in vaultedFileList:
         try:
-            # Load stored data
-            with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted', 'r') as f:
-                old_data = f.read()
+            # Load stored encrypted data as bytes
+            with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted', 'rb') as f:
+                old_encrypted_data = f.read()
 
             with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/hash', 'r') as f:
                 old_hash = f.read().strip()
 
-            # Load (potentially) new data from original path
-            with open(vaultedFilePath, 'r') as f:
-                new_data = f.read()
-                new_hash = hashlib.sha256(new_data.encode('utf-8')).hexdigest()
+            # Load (potentially) new data from original path as bytes
+            with open(vaultedFilePath, 'rb') as f:
+                new_data_bytes = f.read()
+                new_hash = hashlib.sha256(new_data_bytes).hexdigest()
 
             # Determine whether to re-encrypt
             if old_hash != new_hash:
-                # File was modified, re-encrypt it
-                new_data = vault.dump_raw(new_data)
+                # File was modified, re-encrypt it using Ansible's official vault implementation
+                # VaultLib.encrypt() expects and returns bytes
+                new_encrypted_data = vault.encrypt(new_data_bytes)
             else:
                 # File unchanged, restore original encrypted version
-                new_data = old_data
+                new_encrypted_data = old_encrypted_data
 
-            # Update file
-            with open(vaultedFilePath, 'w') as f:
-                f.write(new_data)
+            # Update file with bytes to preserve exact formatting
+            with open(vaultedFilePath, 'wb') as f:
+                f.write(new_encrypted_data)
 
             # Clean vault
             try:
