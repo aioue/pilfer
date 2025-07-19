@@ -14,7 +14,6 @@ import shutil
 import configparser
 from pathlib import Path
 
-# Use Ansible's official vault implementation instead of third-party library
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.parsing.vault import VaultLib, VaultSecret
 
