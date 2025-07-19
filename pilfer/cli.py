@@ -261,7 +261,10 @@ def main():
     # Parse Args
     parser = argparse.ArgumentParser(
         prog="pilfer",
-        description="Decrypt all ansible vault files in a project recursively for search/editing, then re-encrypt them when done",
+        description=(
+            "Decrypt all ansible vault files in a project recursively "
+            "for search/editing, then re-encrypt them when done"
+        ),
     )
     parser.add_argument(
         "action",

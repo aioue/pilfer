@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pilfer"))
 
-from pilfer import cli as pilfer_cli
+from pilfer import cli as pilfer_cli  # noqa: E402
 
 
 class PilferTestBase(unittest.TestCase, ABC):

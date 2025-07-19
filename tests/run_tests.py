@@ -76,7 +76,8 @@ def main():
 
         status = "PASS" if (failures == 0 and errors == 0) else "FAIL"
         print(
-            f"{module_name:<20} {tests_run:>3} tests  {failures:>3} failures  {errors:>3} errors  [{status}]"
+            f"{module_name:<20} {tests_run:>3} tests  "
+            f"{failures:>3} failures  {errors:>3} errors  [{status}]"
         )
 
     print(f"{'-' * 60}")

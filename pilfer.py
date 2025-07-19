@@ -303,7 +303,8 @@ For installation via pipx:
                 print(f"Found {len(list_of_vault_encrypted_files)} vault file(s)")
                 decrypt_vault_files(args.vault_password_file)
                 print(
-                    "✅ All vault files decrypted. Edit as needed, then run 'pilfer close' to re-encrypt."
+                    "✅ All vault files decrypted. Edit as needed, "
+                    "then run 'pilfer close' to re-encrypt."
                 )
             else:
                 print("No vault files found in current directory tree.")
