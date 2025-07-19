@@ -15,24 +15,23 @@ For packaged installation, use:
 """
 
 import argparse
+import configparser
 import errno
 import hashlib
 import json
 import os
 import shutil
-import configparser
 from pathlib import Path
 
 # Use Ansible's official vault implementation instead of third-party library
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.parsing.vault import VaultLib, VaultSecret
 
-
 __version__ = "1.1.0"
 
 temp_vault_file_list_path = "vaultedFileList.json"
 list_of_vault_encrypted_files = []
-temp_hidden_encrypted_copies_directory_path = '.vault'
+temp_hidden_encrypted_copies_directory_path = ".vault"
 
 
 def get_vault_password_file():
@@ -40,30 +39,32 @@ def get_vault_password_file():
     # First try to read from ansible.cfg
     try:
         config = configparser.ConfigParser()
-        config.read('ansible.cfg')
-        if 'defaults' in config and 'vault_password_file' in config['defaults']:
-            vault_file = config['defaults']['vault_password_file']
+        config.read("ansible.cfg")
+        if "defaults" in config and "vault_password_file" in config["defaults"]:
+            vault_file = config["defaults"]["vault_password_file"]
             # Expand tilde for home directory
             vault_file = os.path.expanduser(vault_file)
             if os.path.exists(vault_file):
                 return vault_file
     except Exception:
         pass
-    
+
     # Fall back to common locations
     fallback_locations = [
         "../../vault_password_file",  # Original default
         "~/.ansible-vault/.vault-file",  # Common location
         ".vault_password",  # Local project file
-        "vault_password_file"  # Simple local file
+        "vault_password_file",  # Simple local file
     ]
-    
+
     for location in fallback_locations:
         expanded_location = os.path.expanduser(location)
         if os.path.exists(expanded_location):
             return expanded_location
-    
-    raise FileNotFoundError("Could not find vault password file. Please ensure it exists or specify with -p argument.")
+
+    raise FileNotFoundError(
+        "Could not find vault password file. Please ensure it exists or specify with -p argument."
+    )
 
 
 def write_vaulted_file_list():
@@ -77,23 +78,23 @@ def write_vaulted_file_list():
 
             # find all files with the ansible vault header
             try:
-                with open(filePath, 'rb') as open_file:
+                with open(filePath, "rb") as open_file:
                     first_line = open_file.readline()
 
-                    if first_line.startswith(b'$ANSIBLE_VAULT;'):
+                    if first_line.startswith(b"$ANSIBLE_VAULT;"):
                         list_of_vault_encrypted_files.append(filePath)
             except (IOError, OSError, PermissionError):
                 # Skip files we can't read
                 continue
 
-    with open(temp_vault_file_list_path, 'w') as open_file:
+    with open(temp_vault_file_list_path, "w") as open_file:
         json.dump(list_of_vault_encrypted_files, open_file, indent=2)
 
 
 def decrypt_vault_files(vault_password_file_path=None):
     """Decrypt all vault files found in the project"""
     # load the list of encrypted files
-    with open(temp_vault_file_list_path, 'r') as vaultListFile:
+    with open(temp_vault_file_list_path, "r") as vaultListFile:
         vaultedFileList = json.load(vaultListFile)
 
     # determine vault password file
@@ -103,39 +104,51 @@ def decrypt_vault_files(vault_password_file_path=None):
         vault_file = get_vault_password_file()
 
     # load vault password into memory
-    with open(vault_file, 'r') as vault_password_file:
+    with open(vault_file, "r") as vault_password_file:
         vaultPassword = vault_password_file.read().strip()
 
     # create VaultLib instance using Ansible's official implementation
-    vault = VaultLib([
-        (DEFAULT_VAULT_ID_MATCH, VaultSecret(vaultPassword.encode('utf-8')))
-    ])
+    vault = VaultLib(
+        [(DEFAULT_VAULT_ID_MATCH, VaultSecret(vaultPassword.encode("utf-8")))]
+    )
 
     # iterate over the list of vaulted files
     for vaultedFilePath in vaultedFileList:
         try:
             # recursively build a mirror directory structure for this file
-            mkdir_p(os.path.join(temp_hidden_encrypted_copies_directory_path + vaultedFilePath))
+            mkdir_p(
+                os.path.join(
+                    temp_hidden_encrypted_copies_directory_path + vaultedFilePath
+                )
+            )
 
             # make a copy of the encrypted file
-            shutil.copy2(vaultedFilePath, temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted')
+            shutil.copy2(
+                vaultedFilePath,
+                temp_hidden_encrypted_copies_directory_path
+                + vaultedFilePath
+                + "/encrypted",
+            )
 
             # decrypt the file using Ansible's official vault implementation
             # Read encrypted data as bytes to preserve exact formatting
-            with open(vaultedFilePath, 'rb') as f:
+            with open(vaultedFilePath, "rb") as f:
                 encrypted_data = f.read()
                 # VaultLib.decrypt() returns bytes, preserving binary data and line endings
                 decrypted_bytes = vault.decrypt(encrypted_data)
 
             # write a hash of the decrypted content (bytes) to disk in the temporary directory
             file_hash = hashlib.sha256(decrypted_bytes).hexdigest()
-            with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/hash', 'w') as decryptedVaultFileHash:
+            with open(
+                temp_hidden_encrypted_copies_directory_path + vaultedFilePath + "/hash",
+                "w",
+            ) as decryptedVaultFileHash:
                 decryptedVaultFileHash.write(file_hash)
 
             # write the decrypted data to disk as bytes to preserve exact formatting
-            with open(vaultedFilePath, 'wb') as decryptedVaultFile:
+            with open(vaultedFilePath, "wb") as decryptedVaultFile:
                 decryptedVaultFile.write(decrypted_bytes)
-                
+
         except Exception as e:
             print(f"Failed to decrypt {vaultedFilePath}: {e}")
             continue
@@ -154,7 +167,7 @@ def mkdir_p(path):
 
 def recrypt_vault_files(vault_password_file_path=None):
     """Re-encrypt all vault files, only changing ones that were modified"""
-    with open(temp_vault_file_list_path, 'r') as vaultListFile:
+    with open(temp_vault_file_list_path, "r") as vaultListFile:
         vaultedFileList = json.load(vaultListFile)
 
     # determine vault password file
@@ -164,27 +177,35 @@ def recrypt_vault_files(vault_password_file_path=None):
         vault_file = get_vault_password_file()
 
     # load vault password into memory
-    with open(vault_file, 'r') as vault_password_file:
+    with open(vault_file, "r") as vault_password_file:
         vaultPassword = vault_password_file.read().strip()
 
     # create VaultLib instance using Ansible's official implementation
-    vault = VaultLib([
-        (DEFAULT_VAULT_ID_MATCH, VaultSecret(vaultPassword.encode('utf-8')))
-    ])
+    vault = VaultLib(
+        [(DEFAULT_VAULT_ID_MATCH, VaultSecret(vaultPassword.encode("utf-8")))]
+    )
 
     modified_count = 0
     # iterate over the list of vaulted files
     for vaultedFilePath in vaultedFileList:
         try:
             # Load stored encrypted data as bytes
-            with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted', 'rb') as f:
+            with open(
+                temp_hidden_encrypted_copies_directory_path
+                + vaultedFilePath
+                + "/encrypted",
+                "rb",
+            ) as f:
                 old_encrypted_data = f.read()
 
-            with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/hash', 'r') as f:
+            with open(
+                temp_hidden_encrypted_copies_directory_path + vaultedFilePath + "/hash",
+                "r",
+            ) as f:
                 old_hash = f.read().strip()
 
             # Load (potentially) new data from original path as bytes
-            with open(vaultedFilePath, 'rb') as f:
+            with open(vaultedFilePath, "rb") as f:
                 new_data_bytes = f.read()
                 new_hash = hashlib.sha256(new_data_bytes).hexdigest()
 
@@ -200,20 +221,30 @@ def recrypt_vault_files(vault_password_file_path=None):
                 new_encrypted_data = old_encrypted_data
 
             # Update file with bytes to preserve exact formatting
-            with open(vaultedFilePath, 'wb') as f:
+            with open(vaultedFilePath, "wb") as f:
                 f.write(new_encrypted_data)
 
             # Clean vault
             try:
-                os.remove(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted')
-                os.remove(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/hash')
-                os.removedirs(temp_hidden_encrypted_copies_directory_path + vaultedFilePath)
+                os.remove(
+                    temp_hidden_encrypted_copies_directory_path
+                    + vaultedFilePath
+                    + "/encrypted"
+                )
+                os.remove(
+                    temp_hidden_encrypted_copies_directory_path
+                    + vaultedFilePath
+                    + "/hash"
+                )
+                os.removedirs(
+                    temp_hidden_encrypted_copies_directory_path + vaultedFilePath
+                )
             except Exception as e:
                 print(f"Warning: Failed to clean temp files for {vaultedFilePath}: {e}")
         except Exception as e:
             print(f"Failed to process {vaultedFilePath}: {e}")
             continue
-    
+
     try:
         os.removedirs(temp_hidden_encrypted_copies_directory_path)
     except Exception:
@@ -223,7 +254,7 @@ def recrypt_vault_files(vault_password_file_path=None):
         os.remove(temp_vault_file_list_path)
     except Exception:
         pass
-    
+
     return modified_count
 
 
@@ -231,28 +262,35 @@ def main():
     """Main CLI entry point for pilfer standalone script"""
     # Parse Args
     parser = argparse.ArgumentParser(
-        prog='pilfer',
-        description='Decrypt all ansible vault files in a project recursively for search/editing, then re-encrypt them when done',
+        prog="pilfer",
+        description=(
+            "Decrypt all ansible vault files in a project recursively for "
+            "search/editing, then re-encrypt them when done"
+        ),
         epilog="""
 Examples:
   python pilfer.py open                    # Decrypt all vault files using ansible.cfg
-  python pilfer.py open -p ~/.vault-pass   # Decrypt using specific password file  
+  python pilfer.py open -p ~/.vault-pass   # Decrypt using specific password file
   python pilfer.py close                   # Re-encrypt modified files
 
 For installation via pipx:
   pipx install pilfer
-        """
+        """,
     )
-    parser.add_argument('action', choices=['open', 'close'], 
-                       help="'open' to decrypt all vault files, 'close' to re-encrypt modified files")
-    parser.add_argument('-p', '--vault-password-file', type=str,
-                        help="Path to vault password file")
-    parser.add_argument('--version', action='version', version=f'pilfer {__version__}')
-    
+    parser.add_argument(
+        "action",
+        choices=["open", "close"],
+        help="'open' to decrypt all vault files, 'close' to re-encrypt modified files",
+    )
+    parser.add_argument(
+        "-p", "--vault-password-file", type=str, help="Path to vault password file"
+    )
+    parser.add_argument("--version", action="version", version=f"pilfer {__version__}")
+
     args = parser.parse_args()
 
     # Open / Close Vault
-    if args.action == 'open':
+    if args.action == "open":
         print("🔓 Searching for and decrypting vault files...")
         # check for an existing encrypted file list
         # if one exists, decrypt the files
@@ -264,18 +302,22 @@ For installation via pipx:
             if list_of_vault_encrypted_files:
                 print(f"Found {len(list_of_vault_encrypted_files)} vault file(s)")
                 decrypt_vault_files(args.vault_password_file)
-                print("✅ All vault files decrypted. Edit as needed, then run 'pilfer close' to re-encrypt.")
+                print(
+                    "✅ All vault files decrypted. Edit as needed, then run 'pilfer close' to re-encrypt."
+                )
             else:
                 print("No vault files found in current directory tree.")
 
-    elif args.action == 'close':
+    elif args.action == "close":
         print("🔒 Re-encrypting vault files...")
         if Path(temp_vault_file_list_path).is_file():
             modified_count = recrypt_vault_files(args.vault_password_file)
-            print(f"✅ Vault files re-encrypted. {modified_count} modified files have been updated.")
+            print(
+                f"✅ Vault files re-encrypted. {modified_count} modified files have been updated."
+            )
         else:
             print("No vault file list found. Run 'pilfer open' first.")
 
 
-if __name__ == '__main__':
-    main() 
+if __name__ == "__main__":
+    main()

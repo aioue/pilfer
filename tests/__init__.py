@@ -1,1 +1,1 @@
-# Tests for pilfer - lightweight vault file manipulation tool 
+# Tests for pilfer - lightweight vault file manipulation tool
