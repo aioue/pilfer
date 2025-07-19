@@ -14,6 +14,7 @@ Tested with Ansible v2.18.x and Python 3.12.x
 - **Change detection** - Only re-encrypts files that were actually modified (using SHA256)
 - **Safe operation** - Preserves original encrypted content for unchanged files
 - **No third-party dependencies** - Uses Ansible's official vault implementation directly
+- **Binary data preservation** - Preserves exact line endings and formatting (critical for certificates)
 
 ## Usage
 ```
