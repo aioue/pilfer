@@ -14,8 +14,9 @@ import shutil
 import configparser
 from pathlib import Path
 
-# pip install ansible-vault (https://github.com/tomoh1r/ansible-vault)
-from ansible_vault import Vault
+# Use Ansible's official vault implementation instead of third-party library
+from ansible.constants import DEFAULT_VAULT_ID_MATCH
+from ansible.parsing.vault import VaultLib, VaultSecret
 
 
 temp_vault_file_list_path = "vaultedFileList.json"
@@ -107,8 +108,10 @@ def decrypt_vault_files(vault_password_file_path=None):
     with open(vault_file, 'r') as vault_password_file:
         vaultPassword = vault_password_file.read().strip()
 
-    # create a new Vault instance
-    vault = Vault(vaultPassword)
+    # create VaultLib instance using Ansible's official implementation
+    vault = VaultLib([
+        (DEFAULT_VAULT_ID_MATCH, VaultSecret(vaultPassword.encode('utf-8')))
+    ])
 
     # iterate over the list of vaulted files
     for vaultedFilePath in vaultedFileList:
@@ -119,9 +122,10 @@ def decrypt_vault_files(vault_password_file_path=None):
             # make a copy of the encrypted file
             shutil.copy2(vaultedFilePath, temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted')
 
-            # decrypt the file
+            # decrypt the file using Ansible's official vault implementation
             with open(vaultedFilePath, 'r') as f:
-                decryptedFileContents = vault.load_raw(f.read())
+                encrypted_data = f.read()
+                decryptedFileContents = vault.decrypt(encrypted_data)
 
             # Convert bytes to string if necessary
             if isinstance(decryptedFileContents, bytes):
@@ -165,8 +169,10 @@ def recrypt_vault_files(vault_password_file_path=None):
     with open(vault_file, 'r') as vault_password_file:
         vaultPassword = vault_password_file.read().strip()
 
-    # create a new Vault instance
-    vault = Vault(vaultPassword)
+    # create VaultLib instance using Ansible's official implementation
+    vault = VaultLib([
+        (DEFAULT_VAULT_ID_MATCH, VaultSecret(vaultPassword.encode('utf-8')))
+    ])
 
     # iterate over the list of vaulted files
     for vaultedFilePath in vaultedFileList:
@@ -185,8 +191,8 @@ def recrypt_vault_files(vault_password_file_path=None):
 
             # Determine whether to re-encrypt
             if old_hash != new_hash:
-                # File was modified, re-encrypt it
-                new_data = vault.dump_raw(new_data)
+                # File was modified, re-encrypt it using Ansible's official vault implementation
+                new_data = vault.encrypt(new_data)
             else:
                 # File unchanged, restore original encrypted version
                 new_data = old_data
