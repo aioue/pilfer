@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 # heavily borrows from this excellent repo https://github.com/dellis23/ansible-toolkit
 
@@ -11,33 +11,47 @@ import hashlib
 import json
 import os
 import shutil
-
-
+import configparser
+from pathlib import Path
 
 # pip install ansible-vault (https://github.com/tomoh1r/ansible-vault)
 from ansible_vault import Vault
-# pip install pathlib(2?)
-from pathlib import Path
-
-
-# extend Vault to allow for raw
-# https://stackoverflow.com/a/50859586/1053741
-class MyVault(Vault):
-    def load_raw(self, stream):
-        return self.vault.decrypt(stream)
-
-    def dump_raw(self, text, stream=None):
-        encrypted = self.vault.encrypt(text)
-        if stream:
-            stream.write(encrypted)
-        else:
-            return encrypted
 
 
 temp_vault_file_list_path = "vaultedFileList.json"
 list_of_vault_encrypted_files = []
 temp_hidden_encrypted_copies_directory_path = '.vault'
-VAULT_PASSWORD_PATH = "../../vault_password_file"
+
+
+def get_vault_password_file():
+    """Get vault password file from ansible.cfg or fall back to default locations"""
+    # First try to read from ansible.cfg
+    try:
+        config = configparser.ConfigParser()
+        config.read('ansible.cfg')
+        if 'defaults' in config and 'vault_password_file' in config['defaults']:
+            vault_file = config['defaults']['vault_password_file']
+            # Expand tilde for home directory
+            vault_file = os.path.expanduser(vault_file)
+            if os.path.exists(vault_file):
+                return vault_file
+    except Exception:
+        pass
+    
+    # Fall back to common locations
+    fallback_locations = [
+        "../../vault_password_file",  # Original default
+        "~/.ansible-vault/.vault-file",  # Common location
+        ".vault_password",  # Local project file
+        "vault_password_file"  # Simple local file
+    ]
+    
+    for location in fallback_locations:
+        expanded_location = os.path.expanduser(location)
+        if os.path.exists(expanded_location):
+            return expanded_location
+    
+    raise FileNotFoundError("Could not find vault password file. Please ensure it exists or specify with -p argument.")
 
 
 # find all files that have the ansible vault header and write it to disk
@@ -59,51 +73,72 @@ def write_vaulted_file_list():
             # print filePath
 
             # find all files with the ansible vault header
-            with open(filePath, 'rb') as open_file:
-                first_line = open_file.readline()
+            try:
+                with open(filePath, 'rb') as open_file:
+                    first_line = open_file.readline()
 
-                if first_line.startswith('$ANSIBLE_VAULT;'):
-                    # print filePath
-                    list_of_vault_encrypted_files.append(filePath)
+                    if first_line.startswith(b'$ANSIBLE_VAULT;'):
+                        # print filePath
+                        list_of_vault_encrypted_files.append(filePath)
+            except (IOError, OSError, PermissionError):
+                # Skip files we can't read
+                continue
 
     # print vaultedFileList
-    with open(temp_vault_file_list_path, 'wb') as open_file:
+    with open(temp_vault_file_list_path, 'w') as open_file:
         json.dump(list_of_vault_encrypted_files, open_file, indent=2)
 
 
-def decrypt_vault_files():
+def decrypt_vault_files(vault_password_file_path=None):
     # load the list of encrypted files
-    with open(temp_vault_file_list_path, 'rb') as vaultListFile:
+    with open(temp_vault_file_list_path, 'r') as vaultListFile:
         vaultedFileList = json.load(vaultListFile)
 
         # list the detected encrypted files
         # print json.dumps(vaultedFileList, indent=2)
 
+    # determine vault password file
+    if vault_password_file_path:
+        vault_file = vault_password_file_path
+    else:
+        vault_file = get_vault_password_file()
+
     # load vault password into memory
-    with open(VAULT_PASSWORD_PATH, 'r') as vault_password_file:
+    with open(vault_file, 'r') as vault_password_file:
         vaultPassword = vault_password_file.read().strip()
 
-    # create a new Vault instance with the
-    vault = MyVault(vaultPassword)
+    # create a new Vault instance
+    vault = Vault(vaultPassword)
 
     # iterate over the list of vaulted files
     for vaultedFilePath in vaultedFileList:
-        # recursively build a mirror directory structure for this file
-        mkdir_p(os.path.join(temp_hidden_encrypted_copies_directory_path + vaultedFilePath))
+        try:
+            # recursively build a mirror directory structure for this file
+            mkdir_p(os.path.join(temp_hidden_encrypted_copies_directory_path + vaultedFilePath))
 
-        # make a copy of the encrypted file
-        shutil.copy2(vaultedFilePath, temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted')
+            # make a copy of the encrypted file
+            shutil.copy2(vaultedFilePath, temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted')
 
-        # decrypt the file
-        decryptedFileContents = vault.load_raw(open(vaultedFilePath).read())
+            # decrypt the file
+            with open(vaultedFilePath, 'r') as f:
+                decryptedFileContents = vault.load_raw(f.read())
 
-        # write a hash of the decrypted file to disk in the temporary directory
-        with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/hash', 'wb') as decryptedVaultFileHash:
-            decryptedVaultFileHash.write(hashlib.sha1(decryptedFileContents).hexdigest())
+            # Convert bytes to string if necessary
+            if isinstance(decryptedFileContents, bytes):
+                decryptedFileContents = decryptedFileContents.decode('utf-8')
 
-        # write the decrypted data to disk
-        with open(vaultedFilePath, 'wb') as decryptedVaultFile:
-            decryptedVaultFile.write(decryptedFileContents)
+            # write a hash of the decrypted file to disk in the temporary directory
+            file_hash = hashlib.sha256(decryptedFileContents.encode('utf-8')).hexdigest()
+            with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/hash', 'w') as decryptedVaultFileHash:
+                decryptedVaultFileHash.write(file_hash)
+
+            # write the decrypted data to disk
+            with open(vaultedFilePath, 'w') as decryptedVaultFile:
+                decryptedVaultFile.write(decryptedFileContents)
+                
+        except Exception as e:
+            print(f"Failed to decrypt {vaultedFilePath}: {e}")
+            continue
 
 
 def mkdir_p(path):
@@ -116,59 +151,69 @@ def mkdir_p(path):
             raise
 
 
-def recrypt_vault_files():
-    with open(temp_vault_file_list_path, 'rb') as vaultListFile:
-
+def recrypt_vault_files(vault_password_file_path=None):
+    with open(temp_vault_file_list_path, 'r') as vaultListFile:
         vaultedFileList = json.load(vaultListFile)
 
+    # determine vault password file
+    if vault_password_file_path:
+        vault_file = vault_password_file_path
+    else:
+        vault_file = get_vault_password_file()
+
     # load vault password into memory
-    with open(VAULT_PASSWORD_PATH, 'r') as vault_password_file:
+    with open(vault_file, 'r') as vault_password_file:
         vaultPassword = vault_password_file.read().strip()
 
-    # create a new Vault instance with the
-    vault = MyVault(vaultPassword)
+    # create a new Vault instance
+    vault = Vault(vaultPassword)
 
     # iterate over the list of vaulted files
     for vaultedFilePath in vaultedFileList:
-
-        # Load stored data
-        with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted', 'rb') as f:
-            old_data = f.read()
-
-        with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/hash', 'rb') as f:
-            old_hash = f.read()
-
-        # Load (potentially) new data from original path
-        with open(vaultedFilePath, 'rb') as f:
-            new_data = f.read()
-            new_hash = hashlib.sha1(new_data).hexdigest()
-
-        # Determine whether to re-encrypt
-        if old_hash != new_hash:
-            new_data = vault.dump_raw(new_data)
-        else:
-            new_data = old_data
-
-        # Update file
-        with open(vaultedFilePath, 'wb') as f:
-            f.write(new_data)
-
-        # Clean vault
         try:
-            os.remove(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted')
-            os.remove(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/hash')
-            os.removedirs(temp_hidden_encrypted_copies_directory_path + vaultedFilePath)
+            # Load stored data
+            with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted', 'r') as f:
+                old_data = f.read()
+
+            with open(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/hash', 'r') as f:
+                old_hash = f.read().strip()
+
+            # Load (potentially) new data from original path
+            with open(vaultedFilePath, 'r') as f:
+                new_data = f.read()
+                new_hash = hashlib.sha256(new_data.encode('utf-8')).hexdigest()
+
+            # Determine whether to re-encrypt
+            if old_hash != new_hash:
+                # File was modified, re-encrypt it
+                new_data = vault.dump_raw(new_data)
+            else:
+                # File unchanged, restore original encrypted version
+                new_data = old_data
+
+            # Update file
+            with open(vaultedFilePath, 'w') as f:
+                f.write(new_data)
+
+            # Clean vault
+            try:
+                os.remove(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/encrypted')
+                os.remove(temp_hidden_encrypted_copies_directory_path + vaultedFilePath + '/hash')
+                os.removedirs(temp_hidden_encrypted_copies_directory_path + vaultedFilePath)
+            except Exception as e:
+                print(f"Warning: Failed to clean temp files for {vaultedFilePath}: {e}")
         except Exception as e:
-            print "FAIL"
-            pass
+            print(f"Failed to process {vaultedFilePath}: {e}")
+            continue
+    
     try:
         os.removedirs(temp_hidden_encrypted_copies_directory_path)
-    except Exception as e:
+    except Exception:
         pass
 
     try:
         os.remove(temp_vault_file_list_path)
-    except Exception as e:
+    except Exception:
         pass
 
 
@@ -192,10 +237,10 @@ if __name__ == '__main__':
         # if it doesn't, make one
         if Path(temp_vault_file_list_path).is_file():
             # print "path exists, skipping file creation"
-            decrypt_vault_files()
+            decrypt_vault_files(args.vault_password_file)
         else:
             write_vaulted_file_list()
-            decrypt_vault_files()
+            decrypt_vault_files(args.vault_password_file)
 
     elif args.action == 'close':
-        recrypt_vault_files()
+        recrypt_vault_files(args.vault_password_file)
