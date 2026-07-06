@@ -60,6 +60,23 @@ def write_vaulted_file_list():
     walk_dir = os.path.abspath(os.getcwd())
 
     for dirpath, dirnames, filenames in os.walk(walk_dir):
+        # Prune directories we should never descend into.
+        # Modifying dirnames in-place stops os.walk from recursing into them.
+        pruned = []
+        for d in dirnames:
+            # Skip pilfer's own backup directory and git metadata.
+            if d in (temp_hidden_encrypted_copies_directory_path, ".git"):
+                continue
+            # Skip subdirectories that are their own git repos - they may use a
+            # different vault password. Run pilfer from that repo's root instead.
+            if os.path.isdir(os.path.join(dirpath, d, ".git")):
+                print(
+                    f"Skipping nested git repo: {os.path.join(dirpath, d)}"
+                    f" (run 'pilfer open' from that directory instead)"
+                )
+                continue
+            pruned.append(d)
+        dirnames[:] = pruned
 
         for name in filenames:
             # print name
