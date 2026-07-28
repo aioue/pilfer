@@ -4,79 +4,109 @@ This directory contains automated workflows for the pilfer project.
 
 ## Workflows
 
-### 🚀 `ci.yml` - Quick CI
-**Purpose**: Fast, essential testing on every push/PR
+### `ci.yml` - Quick CI
 
-**What it does**:
-- Tests on Python 3.11 with Ubuntu latest
-- Runs the unified test suite
-- Verifies standalone script works
-- Completes in ~2-3 minutes
+Fast, essential testing on every push and pull request.
 
-**When to use**: This is the primary workflow for most development work.
+- Python 3.12 on Ubuntu
+- Unified test suite
+- Standalone `pilfer.py --version` check
 
-### 🔬 `test.yml` - Comprehensive Test Suite  
-**Purpose**: Thorough testing, code quality, and security scanning
+### `test.yml` - Comprehensive Test Suite
 
-**What it does**:
-- **Multi-Python Testing**: Tests on Python 3.8-3.12
-- **Code Quality**: Black formatting, isort import sorting, flake8 linting
-- **Security Scanning**: Bandit security analysis, safety dependency check
-- **Test Coverage**: Coverage reports with HTML output
-- **Fail-safe**: Continues testing other versions even if one fails
-- **Debugging**: Runs individual test classes if main tests fail
+Thorough validation for larger changes and pre-release checks.
 
-**When to use**: 
-- Before releases
-- For thorough validation of major changes
-- When you want comprehensive analysis
+- Multi-Python matrix (3.8-3.12)
+- Black, isort, and flake8
+- Bandit and safety scans
+- Coverage reports uploaded as artifacts
+
+### `release.yml` - Release and PyPI publish
+
+Runs on version tags (`v*`) and can be dry-run with `workflow_dispatch`.
+
+1. Validates `pyproject.toml`, `pilfer/__init__.py`, and `pilfer.py` versions match the tag
+2. Runs the test suite
+3. Builds sdist and wheel (`python -m build`, `twine check`)
+4. Creates a GitHub release with distribution artifacts
+5. Publishes to PyPI using trusted publishing (OIDC)
+
+Tag pushes publish. Manual `workflow_dispatch` validates and builds only.
+
+## Dependabot
+
+`.github/dependabot.yml` opens weekly PRs for:
+
+- GitHub Actions updates (grouped)
+- Python dependencies from `pyproject.toml` (grouped)
 
 ## Triggers
 
-Both workflows trigger on:
-- Push to `main` or `master` branches
-- Pull requests to `main` or `master` branches
-- Manual dispatch (via GitHub UI)
+| Workflow | Push/PR | Tags | Manual |
+|----------|---------|------|--------|
+| `ci.yml` | main, master | - | - |
+| `test.yml` | main, master | - | yes |
+| `release.yml` | - | `v*` | yes (dry-run) |
 
-## Best Practices Implemented
+## Releasing
 
-### ✅ **Security**
-- Pinned action versions (e.g., `@v4`, `@v3`)
-- Minimal permissions (default is read-only)
+1. Bump the version in all three places:
+   - `pyproject.toml`
+   - `pilfer/__init__.py`
+   - `pilfer.py`
+2. Commit and push to `master`
+3. Tag and push:
+
+```bash
+git tag v2.21.0
+git push origin v2.21.0
+```
+
+4. The Release workflow creates the GitHub release and publishes to PyPI
+
+### PyPI trusted publishing (one-time setup)
+
+Configure on [pypi.org](https://pypi.org/manage/project/pilfer/settings/publishing/):
+
+| Field | Value |
+|-------|-------|
+| PyPI project name | `pilfer` |
+| Owner | `aioue` |
+| Repository | `pilfer` |
+| Workflow name | `release.yml` |
+| Environment name | `pypi` |
+
+Then create a GitHub environment named `pypi` under **Settings → Environments**. Optional: add required reviewers for manual approval before publish.
+
+Trusted publishing uses OIDC (`id-token: write`) - no long-lived PyPI API token in secrets.
+
+### Local publish (fallback)
+
+`build_and_publish.sh` remains for manual TestPyPI or PyPI uploads when needed.
+
+## Best Practices
+
+### Security
+
+- Minimal `permissions` on each workflow
+- PyPI trusted publishing instead of stored API tokens
 - Dependency scanning with safety
 - Code security analysis with bandit
 
-### ✅ **Performance**
-- Dependency caching for faster builds
-- Parallel job execution
-- Strategic use of `fail-fast: false`
+### Performance
 
-### ✅ **Reliability**
+- Pip dependency caching
+- Parallel jobs in the test suite
+- Concurrency groups cancel superseded runs
+
+### Reliability
+
+- Version consistency checks before release
+- `twine check` on built artifacts
 - Matrix testing across Python versions
-- Conditional steps (e.g., debug steps only on failure)
-- Artifact preservation for investigation
-
-### ✅ **Observability**
-- Clear job and step names
-- Detailed error output
-- Coverage and security reports as artifacts
-
-## Viewing Results
-
-### Status Badges
-Add to your README.md:
-```markdown
-[![CI](https://github.com/YOUR_USERNAME/pilfer/workflows/CI/badge.svg)](https://github.com/YOUR_USERNAME/pilfer/actions)
-[![Test Suite](https://github.com/YOUR_USERNAME/pilfer/workflows/Test%20Suite/badge.svg)](https://github.com/YOUR_USERNAME/pilfer/actions)
-```
-
-### Artifacts
-- **Coverage Reports**: HTML coverage reports from test-coverage job
-- **Security Reports**: JSON reports from bandit and safety scans
+- Release artifacts preserved on GitHub
 
 ## Local Development
-
-To run the same checks locally:
 
 ```bash
 # Quick test (same as ci.yml)
@@ -87,45 +117,12 @@ black --check pilfer/ pilfer.py tests/
 isort --check-only pilfer/ pilfer.py tests/
 flake8 pilfer/ pilfer.py tests/ --max-line-length=100
 
-# Security scanning  
+# Security scanning
 bandit -r pilfer/ pilfer.py
 safety check
 
-# Coverage
-cd tests
-coverage run --source=../pilfer run_tests.py
-coverage report
-coverage html
+# Release dry-run
+python -m pip install build twine
+python -m build
+python -m twine check dist/*
 ```
-
-## Customization
-
-### Enable/Disable Jobs
-Comment out jobs in `test.yml` you don't need:
-```yaml
-jobs:
-  test:
-    # ... always keep this
-  # lint:
-  #   # ... comment out to disable
-  # security:  
-  #   # ... comment out to disable
-```
-
-### Add More Python Versions
-Edit the matrix in `test.yml`:
-```yaml
-matrix:
-  python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
-```
-
-### Different Triggers
-Modify the `on` section to change when workflows run:
-```yaml
-on:
-  push:
-    branches: [ main, develop ]  # Add more branches
-    tags: [ "v*" ]              # Run on version tags
-  schedule:
-    - cron: '0 2 * * 1'         # Weekly on Mondays at 2 AM
-``` 

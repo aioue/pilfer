@@ -1,0 +1,30 @@
+# Keep GitHub Actions and Python dependencies current.
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore
+      include: scope
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore
+      include: scope

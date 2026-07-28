@@ -178,25 +178,22 @@ pilfer --help
 
 ### Publishing to PyPI
 
-Prerequisites:
-```bash
-# Install build tools
-pip install build twine
+**Recommended:** push a version tag after bumping the version in `pyproject.toml`, `pilfer/__init__.py`, and `pilfer.py`:
 
-# Configure PyPI credentials
-# ~/.pypirc or use environment variables
+```bash
+git tag v2.21.0
+git push origin v2.21.0
 ```
 
-Build and publish:
+The [Release workflow](.github/workflows/release.yml) validates versions, runs tests, creates a GitHub release, and publishes to PyPI via trusted publishing. See [.github/workflows/README.md](.github/workflows/README.md) for one-time PyPI and GitHub environment setup.
+
+**Manual fallback** (TestPyPI or local publish):
+
 ```bash
-# Make the script executable
+pip install build twine
 chmod +x build_and_publish.sh
-
-# Publish to TestPyPI first
-./build_and_publish.sh test
-
-# After testing, publish to production PyPI
-./build_and_publish.sh prod
+./build_and_publish.sh test   # TestPyPI
+./build_and_publish.sh prod   # production PyPI
 ```
 
 The build script will:
