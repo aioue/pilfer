@@ -178,14 +178,17 @@ pilfer --help
 
 ### Publishing to PyPI
 
-**Recommended:** push a version tag after bumping the version in `pyproject.toml`, `pilfer/__init__.py`, and `pilfer.py`:
+**Recommended:** bump the version in `pyproject.toml`, `pilfer/__init__.py`, and `pilfer.py`, then commit, push, and tag:
 
 ```bash
-git tag v2.21.2
-git push origin v2.21.0
+# Bump version in pyproject.toml, pilfer/__init__.py, and pilfer.py first
+git commit -am "chore(release): X.Y.Z"
+git push origin master
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
-The [Release workflow](.github/workflows/release.yml) validates versions, runs tests, creates a GitHub release, and publishes to PyPI via trusted publishing. See [.github/workflows/README.md](.github/workflows/README.md) for one-time PyPI and GitHub environment setup.
+The [Release workflow](.github/workflows/release.yml) validates versions, runs tests, creates a GitHub release, and publishes to PyPI via trusted publishing. See [.github/workflows/README.md](.github/workflows/README.md) for one-time PyPI setup.
 
 **Manual fallback** (TestPyPI or local publish):
 

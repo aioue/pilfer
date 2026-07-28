@@ -58,8 +58,10 @@ Tag pushes publish. Manual `workflow_dispatch` validates and builds only.
 3. Tag and push:
 
 ```bash
-git tag v2.21.0
-git push origin v2.21.0
+git commit -am "chore(release): X.Y.Z"
+git push origin master
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 4. The Release workflow creates the GitHub release and publishes to PyPI
@@ -74,9 +76,7 @@ Configure on [pypi.org](https://pypi.org/manage/project/pilfer/settings/publishi
 | Owner | `aioue` |
 | Repository | `pilfer` |
 | Workflow name | `release.yml` |
-| Environment name | `pypi` |
-
-Then create a GitHub environment named `pypi` under **Settings → Environments**. Optional: add required reviewers for manual approval before publish.
+| Environment name | *(leave blank)* |
 
 Trusted publishing uses OIDC (`id-token: write`) - no long-lived PyPI API token in secrets.
 
