@@ -27,7 +27,7 @@ from pathlib import Path
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.parsing.vault import VaultLib, VaultSecret
 
-__version__ = "2.21.1"
+__version__ = "2.21.2"
 
 temp_vault_file_list_path = "vaultedFileList.json"
 list_of_vault_encrypted_files = []

@@ -181,7 +181,7 @@ pilfer --help
 **Recommended:** push a version tag after bumping the version in `pyproject.toml`, `pilfer/__init__.py`, and `pilfer.py`:
 
 ```bash
-git tag v2.21.1
+git tag v2.21.2
 git push origin v2.21.0
 ```
 
