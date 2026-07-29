@@ -78,6 +78,10 @@ Configure on [pypi.org](https://pypi.org/manage/project/pilfer/settings/publishi
 | Workflow name | `release.yml` |
 | Environment name | *(leave blank)* |
 
+The `pypi-publish` job omits a GitHub environment so OIDC claims match PyPI.
+A follow-up `record-pypi-deployment` job uses the `pypi` environment only to
+record a successful deployment on GitHub after publish completes.
+
 Trusted publishing uses OIDC (`id-token: write`) - no long-lived PyPI API token in secrets.
 
 ### Local publish (fallback)
