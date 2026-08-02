@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pilfer"))
 
+from pilfer import __version__ as pilfer_version  # noqa: E402
 from pilfer import cli as pilfer_cli  # noqa: E402
 
 
@@ -325,7 +326,7 @@ class TestVersion(unittest.TestCase):
                 with self.assertRaises(SystemExit) as cm:
                     pilfer_cli.main()
                 self.assertEqual(cm.exception.code, 0)
-                self.assertIn("pilfer 2.21.5", fake_out.getvalue())
+                self.assertIn(f"pilfer {pilfer_version}", fake_out.getvalue())
 
     def test_standalone_version(self):
         pilfer_script = os.path.join(os.path.dirname(__file__), "..", "pilfer.py")
@@ -337,7 +338,7 @@ class TestVersion(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("pilfer 2.21.5", result.stdout)
+        self.assertIn(f"pilfer {pilfer_version}", result.stdout)
 
 
 if __name__ == "__main__":
