@@ -293,9 +293,7 @@ def main():
     parser.add_argument(
         "-p", "--vault-password-file", type=str, help="Path to vault password file"
     )
-    parser.add_argument(
-        "--version", action="version", version=f"pilfer {__version__}"
-    )
+    parser.add_argument("--version", action="version", version=f"pilfer {__version__}")
     args = parser.parse_args()
 
     # Open / Close Vault
