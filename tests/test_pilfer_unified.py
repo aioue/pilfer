@@ -313,5 +313,32 @@ class TestCompatibility(unittest.TestCase):
         )
 
 
+class TestVersion(unittest.TestCase):
+    """Verify --version on packaged CLI and standalone script."""
+
+    def test_cli_version(self):
+        from io import StringIO
+        from unittest.mock import patch
+
+        with patch("sys.argv", ["pilfer", "--version"]):
+            with patch("sys.stdout", new=StringIO()) as fake_out:
+                with self.assertRaises(SystemExit) as cm:
+                    pilfer_cli.main()
+                self.assertEqual(cm.exception.code, 0)
+                self.assertIn("pilfer 2.21.5", fake_out.getvalue())
+
+    def test_standalone_version(self):
+        pilfer_script = os.path.join(os.path.dirname(__file__), "..", "pilfer.py")
+        if not os.path.exists(pilfer_script):
+            self.skipTest("Standalone pilfer.py not found")
+        result = subprocess.run(
+            [sys.executable, pilfer_script, "--version"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pilfer 2.21.5", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

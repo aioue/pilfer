@@ -17,6 +17,8 @@ from pathlib import Path
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.parsing.vault import VaultLib, VaultSecret
 
+from pilfer import __version__
+
 temp_vault_file_list_path = "vaultedFileList.json"
 list_of_vault_encrypted_files = []
 temp_hidden_encrypted_copies_directory_path = ".vault"
@@ -290,6 +292,9 @@ def main():
     )
     parser.add_argument(
         "-p", "--vault-password-file", type=str, help="Path to vault password file"
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"pilfer {__version__}"
     )
     args = parser.parse_args()
 

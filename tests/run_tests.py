@@ -46,7 +46,7 @@ def main():
     test_config = [
         (
             "test_pilfer_unified",
-            ["TestPilferCLI", "TestPilferStandalone", "TestCompatibility"],
+            ["TestPilferCLI", "TestPilferStandalone", "TestCompatibility", "TestVersion"],
         ),
     ]
 

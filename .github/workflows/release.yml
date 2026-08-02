@@ -78,6 +78,9 @@ jobs:
       - name: Verify standalone script
         run: python pilfer.py --version
 
+      - name: Verify packaged CLI
+        run: pilfer --version
+
   build:
     name: Build distributions
     needs: validate-and-test
