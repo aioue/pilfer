@@ -22,11 +22,11 @@ Thorough validation for larger changes and pre-release checks.
 - Bandit (`-ll`, fails on medium+; SARIF uploaded to Security)
 - Coverage reports uploaded as artifacts
 
-### `codeql.yml` - Code scanning
+### Code scanning (GitHub default setup)
 
-GitHub CodeQL static analysis for Python.
+CodeQL runs via GitHub's default code scanning setup (managed workflow, not a repo file).
 
-- Runs on push, pull request, and weekly schedule
+- Runs on push, pull request, and schedule
 - Results appear in the repository Security tab
 - Complements Bandit (Python-specific rules) in `test.yml`
 
@@ -58,7 +58,7 @@ Tag pushes publish. Manual `workflow_dispatch` validates and builds only.
 |----------|---------|------|--------|
 | `ci.yml` | main, master | - | - |
 | `test.yml` | main, master | - | yes |
-| `codeql.yml` | main, master | - | - |
+| CodeQL (default setup) | main, master | - | - |
 | `release.yml` | - | `v*` | yes (dry-run) |
 
 ## Releasing
@@ -108,7 +108,7 @@ Trusted publishing uses OIDC (`id-token: write`) - no long-lived PyPI API token 
 - Minimal `permissions` on each workflow
 - PyPI trusted publishing instead of stored API tokens
 - Dependabot alerts, security updates, and grouped security PRs
-- CodeQL code scanning (`codeql.yml`)
+- CodeQL code scanning (GitHub default setup)
 - Bandit in CI with SARIF upload (`test.yml`); config in `pyproject.toml`
 
 ### Performance
@@ -134,7 +134,7 @@ cd tests && python run_tests.py
 ruff check pilfer/ pilfer.py tests/
 
 # Security scanning
-pip install "bandit[toml]"
+pip install "bandit[toml,sarif]"
 bandit -r pilfer/ pilfer.py -c pyproject.toml -ll
 
 # Release dry-run

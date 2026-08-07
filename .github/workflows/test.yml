@@ -113,14 +113,14 @@ jobs:
     - name: Install Bandit
       run: |
         python -m pip install --upgrade pip
-        pip install "bandit[toml]>=1.8,<2"
+        pip install "bandit[toml,sarif]>=1.8,<2"
         
     - name: Run Bandit
       run: bandit -r pilfer/ pilfer.py -c pyproject.toml -ll -f sarif -o bandit.sarif
         
     - name: Upload Bandit SARIF
       uses: github/codeql-action/upload-sarif@v3
-      if: always()
+      if: success()
       with:
         sarif_file: bandit.sarif
         category: bandit
