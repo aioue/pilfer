@@ -105,6 +105,9 @@ jobs:
   security:
     name: Security Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     steps:
     - name: Checkout code
       uses: actions/checkout@v7
@@ -114,27 +117,20 @@ jobs:
       with:
         python-version: "3.12"
         
-    - name: Install security tools
+    - name: Install Bandit
       run: |
         python -m pip install --upgrade pip
-        pip install bandit safety
+        pip install "bandit[toml]>=1.8,<2"
         
-    - name: Run bandit security scan
-      run: bandit -r pilfer/ pilfer.py -f json -o bandit-report.json || true
-      
-    - name: Run safety check
-      run: |
-        pip install ansible  # Install dependencies for safety check
-        safety check --json --output safety-report.json || true
+    - name: Run Bandit
+      run: bandit -r pilfer/ pilfer.py -c pyproject.toml -ll -f sarif -o bandit.sarif
         
-    - name: Upload security reports
-      uses: actions/upload-artifact@v7
+    - name: Upload Bandit SARIF
+      uses: github/codeql-action/upload-sarif@v3
       if: always()
       with:
-        name: security-reports
-        path: |
-          bandit-report.json
-          safety-report.json
+        sarif_file: bandit.sarif
+        category: bandit
 
   test-coverage:
     name: Test Coverage

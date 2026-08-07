@@ -16,10 +16,18 @@ Fast, essential testing on every push and pull request.
 
 Thorough validation for larger changes and pre-release checks.
 
-- Multi-Python matrix (3.8-3.12)
+- Multi-Python matrix (3.10–3.13)
 - Black, isort, and flake8
-- Bandit and safety scans
+- Bandit (`-ll`, fails on medium+; SARIF uploaded to Security)
 - Coverage reports uploaded as artifacts
+
+### `codeql.yml` - Code scanning
+
+GitHub CodeQL static analysis for Python.
+
+- Runs on push, pull request, and weekly schedule
+- Results appear in the repository Security tab
+- Complements Bandit (Python-specific rules) in `test.yml`
 
 ### `release.yml` - Release and PyPI publish
 
@@ -49,6 +57,7 @@ Tag pushes publish. Manual `workflow_dispatch` validates and builds only.
 |----------|---------|------|--------|
 | `ci.yml` | main, master | - | - |
 | `test.yml` | main, master | - | yes |
+| `codeql.yml` | main, master | - | - |
 | `release.yml` | - | `v*` | yes (dry-run) |
 
 ## Releasing
@@ -97,8 +106,9 @@ Trusted publishing uses OIDC (`id-token: write`) - no long-lived PyPI API token 
 
 - Minimal `permissions` on each workflow
 - PyPI trusted publishing instead of stored API tokens
-- Dependency scanning with safety
-- Code security analysis with bandit
+- Dependabot alerts, security updates, and grouped security PRs
+- CodeQL code scanning (`codeql.yml`)
+- Bandit in CI with SARIF upload (`test.yml`); config in `pyproject.toml`
 
 ### Performance
 
@@ -125,8 +135,8 @@ isort --check-only pilfer/ pilfer.py tests/
 flake8 pilfer/ pilfer.py tests/ --max-line-length=100
 
 # Security scanning
-bandit -r pilfer/ pilfer.py
-safety check
+pip install "bandit[toml]"
+bandit -r pilfer/ pilfer.py -c pyproject.toml -ll
 
 # Release dry-run
 python -m pip install build twine

@@ -30,4 +30,8 @@ vaultedFileList.json
 **/*.pilfer-open
 
 # Publishing
-.pypirc 
+.pypirc
+
+# CI-generated security reports
+bandit-report.json
+bandit.sarif
