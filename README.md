@@ -315,7 +315,7 @@ non-zero. It does not invent fixes for ambiguous edits.
 - **Short secrets** can block close if the same bytes appear elsewhere in the file (docs/comments) - fail closed.
 - **Nested git checkouts** are skipped; run pilfer from those roots if needed.
 - **Legacy unbound sessions** can `close` only if the password decrypts the session backups (then pilfer binds a v2 fingerprint); otherwise remove the session list and re-`open`.
-- **Incomplete open** (session list written, crash before decrypt) is cleared automatically on the next `open` so you are not told to `close` ciphertext.
+- **Incomplete open** (session list written, crash before decrypt) is cleared on the next `open` only when listed paths still look like vault ciphertext and there are no backups/sidecars - so you are not told to `close` ciphertext. If the session list remains but files are already plaintext (artifacts deleted), `open` still refuses.
 - **`*.pilfer-open` sidecars** sit beside opened files (whole-file opens have no `# pilfer:vault:` markers).
 
 ### Gitignore

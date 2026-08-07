@@ -16,7 +16,5 @@ echo
 echo "### Summary"
 git log ${range} --pretty=format:'- %s (%h)' --no-merges
 echo
-echo
-if [[ -n "${prev}" ]]; then
-  echo "**Full Changelog**: https://github.com/aioue/pilfer/compare/${prev}...v${version}"
-fi
+# Do not emit a Full Changelog link here: softprops/action-gh-release with
+# generate_release_notes: true appends one already (duplicate otherwise).
