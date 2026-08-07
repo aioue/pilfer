@@ -4,12 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pilfer"
-version = "2.24.0"
+version = "2.24.1"
 authors = [
     {name = "Tom Paine", email = "github@aioue.net"},
 ]
-description = "Decrypt all ansible vault files in a project recursively for search/editing, then re-encrypt when done."
+description = "CLI to bulk decrypt/re-encrypt Ansible vault files in a project tree for editing."
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["PILFER_LICENSE.txt"]
 
 requires-python = ">=3.10"
 classifiers = [
@@ -18,24 +20,26 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
     "Operating System :: OS Independent",
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
     "Topic :: System :: Systems Administration",
     "Topic :: Utilities",
 ]
 dependencies = [
     "ansible>=2.9.0",
 ]
-keywords = ["ansible", "vault", "encryption", "devops", "automation"]
+keywords = ["ansible", "vault", "encryption", "devops", "automation", "secrets", "cli"]
 
 [project.urls]
 Homepage = "https://github.com/aioue/pilfer"
+Documentation = "https://github.com/aioue/pilfer#readme"
 Repository = "https://github.com/aioue/pilfer"
 Issues = "https://github.com/aioue/pilfer/issues"
+Changelog = "https://github.com/aioue/pilfer/releases"
 
 [project.scripts]
 pilfer = "pilfer.cli:main"

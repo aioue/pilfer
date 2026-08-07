@@ -1,17 +1,40 @@
 # pilfer
 
+**Decrypt *all* ansible vault files in a project in-place recursively for viewing/editing, then re-encrypt them all at once when you're done.**
+
+Optionally decrypt/re-encrypt all [encrypted variables](https://docs.ansible.com/projects/ansible/latest/vault_guide/vault_encrypting_content.html) in-place, or re-key an entire tree after a password exposure.
+
+## Quick start
+
+Requires **Python 3.10+** and **Ansible**.
+
+```bash
+pipx install pilfer
+cd your-ansible-project
+pilfer open
+# edit or search plaintext
+pilfer close
+```
+
+Unchanged files are restored to their original ciphertext automatically.
+
+## Install
+
+```bash
+pipx install pilfer   # recommended
+pip install pilfer    # or direct pip
+```
+
+See [Installation](#installation) for standalone script, source install, and `ansible.cfg` setup.
+
+---
+
 [![CI](https://github.com/aioue/pilfer/actions/workflows/ci.yml/badge.svg)](https://github.com/aioue/pilfer/actions/workflows/ci.yml)
 [![Test Suite](https://github.com/aioue/pilfer/actions/workflows/test.yml/badge.svg)](https://github.com/aioue/pilfer/actions/workflows/test.yml)
 [![CodeQL](https://github.com/aioue/pilfer/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/aioue/pilfer/actions/workflows/github-code-scanning/codeql)
 [![Dependabot enabled](https://img.shields.io/badge/dependabot-enabled-025E8C?logo=dependabot&logoColor=white)](https://github.com/aioue/pilfer/network/updates)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-
-**Decrypt *all* ansible vault files in a project in-place recursively for viewing/editing, then re-encrypt them all at once when you're done.**
-
-Optionally decrypt/re-encrypt all [encrypted variables](https://docs.ansible.com/projects/ansible/latest/vault_guide/vault_encrypting_content.html) in-place.
-
-Optionally re-key all vault files and encrypted variables - e.g. if key has been exposed.
 
 ## Features
 
@@ -355,7 +378,7 @@ fi
 
 This project is licensed under the GNU General Public License v3 or later (GPLv3+). See [`PILFER_LICENSE.txt`](PILFER_LICENSE.txt) for the complete license text, or the [official GNU website](https://www.gnu.org/licenses/gpl-3.0.txt).
 
-Due to a compatibility issue between modern setuptools (which supports SPDX license expressions) and PyPI's current metadata validation (which doesn't yet support the new format), the license file is named `PILFER_LICENSE.txt` rather than `LICENSE` to avoid auto-detection issues during packaging.
+The package declares `GPL-3.0-or-later` in metadata; the license file is named `PILFER_LICENSE.txt` to avoid setuptools auto-detection clashes during builds.
 
 ## Credits
 
