@@ -54,6 +54,8 @@ def main():
                 "TestInlineVault",
                 "TestDiscoveryOptimizations",
                 "TestInlineUnit",
+                "TestScanOnce",
+                "TestAllowRemovalsAndRekey",
                 "TestVersion",
             ],
         ),

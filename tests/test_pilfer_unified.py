@@ -13,28 +13,31 @@ import sys
 import tempfile
 import unittest
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.parsing.vault import VaultLib, VaultSecret
 
-from pilfer import __version__ as pilfer_version  # noqa: E402
-from pilfer import cli as pilfer_cli  # noqa: E402
-from pilfer import inline as pilfer_inline  # noqa: E402
+from pilfer import __version__ as pilfer_version
+from pilfer import cli as pilfer_cli
+from pilfer import inline as pilfer_inline
 
 
 def make_vault(password: str = "test_password") -> VaultLib:
-    return VaultLib(
-        [(DEFAULT_VAULT_ID_MATCH, VaultSecret(password.encode("utf-8")))]
-    )
+    return VaultLib([(DEFAULT_VAULT_ID_MATCH, VaultSecret(password.encode("utf-8")))])
 
 
-def encrypt_string_yaml(vault: VaultLib, name: str, value: bytes, indent: str = "          ") -> str:
+def encrypt_string_yaml(
+    vault: VaultLib, name: str, value: bytes, indent: str = "          "
+) -> str:
     """Build YAML matching ansible-vault encrypt_string --name output."""
     enc = vault.encrypt(value).decode("utf-8").strip().splitlines()
     body = "\n".join(indent + line for line in enc)
     return f"{name}: !vault |\n{body}\n"
+
+
 class PilferTestBase(unittest.TestCase, ABC):
     """Shared happy-path tests for CLI function API and standalone script."""
 
@@ -54,9 +57,7 @@ class PilferTestBase(unittest.TestCase, ABC):
         vault = make_vault(self.vault_password)
         self.vault_files = {
             "unix_vault.yml": vault.encrypt(self.vault_content_unix.encode("utf-8")),
-            "windows_vault.yml": vault.encrypt(
-                self.vault_content_windows.encode("utf-8")
-            ),
+            "windows_vault.yml": vault.encrypt(self.vault_content_windows.encode("utf-8")),
             "mixed_vault.yml": vault.encrypt(self.vault_content_mixed.encode("utf-8")),
         }
 
@@ -138,38 +139,37 @@ class TestPilferCLI(PilferTestBase):
         return pilfer_cli.recrypt_vault_files(vault_pass_file)
 
 
-class TestPilferStandalone(PilferTestBase):
-    def setUp(self):
-        super().setUp()
-        self.pilfer_script = os.path.join(os.path.dirname(__file__), "..", "pilfer.py")
-        if not os.path.exists(self.pilfer_script):
-            self.skipTest("Standalone pilfer.py not found")
+class TestPilferStandalone(unittest.TestCase):
+    """Smoke: standalone entry delegates (full matrix covered by TestPilferCLI)."""
 
-    def run_pilfer(self, action, vault_pass_file="vault_pass"):
-        cmd = [sys.executable, self.pilfer_script, action, "-p", vault_pass_file]
-        return subprocess.run(cmd, capture_output=True, text=True)
-
-    def pilfer_open(self, vault_pass_file="vault_pass"):
-        result = self.run_pilfer("open", vault_pass_file)
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"Open failed: stdout={result.stdout!r} stderr={result.stderr!r}",
-        )
-
-    def pilfer_close(self, vault_pass_file="vault_pass"):
-        result = self.run_pilfer("close", vault_pass_file)
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"Close failed: stdout={result.stdout!r} stderr={result.stderr!r}",
-        )
-        import re
-
-        match = re.search(r"(\d+) modified files", result.stdout)
-        if not match:
-            self.fail(f"Could not parse modified count from output: {result.stdout}")
-        return int(match.group(1))
+    def test_standalone_open_close_smoke(self):
+        test_dir = tempfile.mkdtemp()
+        original = os.getcwd()
+        try:
+            os.chdir(test_dir)
+            with open("vault_pass", "w") as f:
+                f.write("test_password")
+            vault = make_vault()
+            with open("secret.yml", "wb") as f:
+                f.write(vault.encrypt(b"a: 1\n"))
+            script = os.path.join(os.path.dirname(__file__), "..", "pilfer.py")
+            opened = subprocess.run(
+                [sys.executable, script, "open", "-p", "vault_pass"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(opened.returncode, 0, opened.stderr)
+            closed = subprocess.run(
+                [sys.executable, script, "close", "-p", "vault_pass"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(closed.returncode, 0, closed.stderr)
+        finally:
+            os.chdir(original)
+            shutil.rmtree(test_dir)
 
 
 class TestSessionSafety(unittest.TestCase):
@@ -195,7 +195,7 @@ class TestSessionSafety(unittest.TestCase):
 
     def _run(self, *args, password_file="vault_pass"):
         cmd = [sys.executable, self.pilfer_script, *args, "-p", password_file]
-        return subprocess.run(cmd, capture_output=True, text=True)
+        return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
     def test_double_open_refused(self):
         first = self._run("open")
@@ -219,9 +219,7 @@ class TestSessionSafety(unittest.TestCase):
     def test_partial_close_keeps_session(self):
         self.assertEqual(self._run("open").returncode, 0)
         hash_path = next(
-            os.path.join(r, "hash")
-            for r, _, files in os.walk(".vault")
-            if "hash" in files
+            os.path.join(r, "hash") for r, _, files in os.walk(".vault") if "hash" in files
         )
         os.remove(hash_path)
         closed = self._run("close")
@@ -237,9 +235,7 @@ class TestSessionSafety(unittest.TestCase):
         self.assertEqual(self._run("open").returncode, 0)
 
         target_hash = next(
-            os.path.join(r, "hash")
-            for r, _, files in os.walk(".vault")
-            if "hash" in files
+            os.path.join(r, "hash") for r, _, files in os.walk(".vault") if "hash" in files
         )
         with open(target_hash) as f:
             saved_hash = f.read()
@@ -357,15 +353,6 @@ class TestSessionSafety(unittest.TestCase):
         mode = stat.S_IMODE(os.stat("secret.yml").st_mode)
         self.assertEqual(mode, 0o600)
 
-    def test_version_flag(self):
-        result = subprocess.run(
-            [sys.executable, self.pilfer_script, "--version"],
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("pilfer", result.stdout.lower())
-
     def test_missing_password_file_exits_nonzero(self):
         result = self._run("open", password_file="does-not-exist")
         self.assertNotEqual(result.returncode, 0)
@@ -410,7 +397,7 @@ class TestSessionSafety(unittest.TestCase):
         """Deleting the session after open must not let a later open exit 0."""
         self.assertEqual(self._run("open").returncode, 0)
         with open("secret.yml", "w") as f:
-            f.write('secret_key: hunter2  # pilfer:vault:0\n')
+            f.write("secret_key: hunter2  # pilfer:vault:0\n")
         os.remove("vaultedFileList.json")
         shutil.rmtree(".vault", ignore_errors=True)
         opened = self._run("open")
@@ -474,15 +461,26 @@ class TestInlineVault(unittest.TestCase):
         os.chdir(self.original_cwd)
         shutil.rmtree(self.test_dir)
 
-    def _run(self, *args, password_file="vault_pass", include_encrypted_vars=None):
+    def _run(
+        self,
+        *args,
+        password_file="vault_pass",
+        include_encrypted_vars=None,
+        allow_removals=False,
+        extra=None,
+    ):
         cmd = [sys.executable, self.pilfer_script, *args]
         # Inline tests default to opening encrypt_string blobs.
         if include_encrypted_vars is None:
             include_encrypted_vars = bool(args) and args[0] == "open"
         if include_encrypted_vars:
             cmd.append("--include-encrypted-vars")
+        if allow_removals:
+            cmd.append("--allow-removals")
+        if extra:
+            cmd.extend(extra)
         cmd.extend(["-p", password_file])
-        return subprocess.run(cmd, capture_output=True, text=True)
+        return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
     def _write_vars_file(self, *pairs):
         """pairs: (name, plaintext_bytes)"""
@@ -604,7 +602,7 @@ class TestInlineVault(unittest.TestCase):
         self._write_vars_file(("db_password", b"super-secret"))
         self.assertEqual(self._run("open").returncode, 0)
         with open("group_vars.yml", "w") as f:
-            f.write("---\nplain_key: visible\ndb_password: \"super-secret\"\n")
+            f.write('---\nplain_key: visible\ndb_password: "super-secret"\n')
         closed = self._run("close")
         self.assertNotEqual(closed.returncode, 0)
         self.assertTrue(os.path.isfile("vaultedFileList.json"))
@@ -621,10 +619,7 @@ class TestInlineVault(unittest.TestCase):
         self._write_vars_file(("db_password", b"super-secret"))
         self.assertEqual(self._run("open").returncode, 0)
         with open("group_vars.yml", "w") as f:
-            f.write(
-                "---\nplain_key: visible\n"
-                'database_password: "super-secret"\n'
-            )
+            f.write("---\nplain_key: visible\n" 'database_password: "super-secret"\n')
         closed = self._run("close")
         self.assertNotEqual(closed.returncode, 0)
         combined = closed.stderr + closed.stdout
@@ -636,84 +631,57 @@ class TestInlineVault(unittest.TestCase):
         with open("group_vars.yml") as f:
             self.assertIn("super-secret", f.read())
 
-    def test_rename_single_quoted_secret_fails(self):
-        """Single-quoted renamed secrets must refuse (not treat as removal)."""
-        self._write_vars_file(("db_password", b"super-secret"))
-        self.assertEqual(self._run("open").returncode, 0)
-        with open("group_vars.yml", "w") as f:
-            f.write(
-                "---\nplain_key: visible\n"
-                "database_password: 'super-secret'\n"
-            )
-        closed = self._run("close")
-        self.assertNotEqual(closed.returncode, 0)
-        combined = closed.stderr + closed.stdout
-        self.assertTrue(
-            "still appears in the file" in combined or "still present" in combined,
-            combined,
-        )
-
-    def test_rename_folded_block_secret_fails(self):
-        """Folded `>` block renamed secrets must refuse."""
-        self._write_vars_file(("db_password", b"super-secret"))
-        self.assertEqual(self._run("open").returncode, 0)
-        with open("group_vars.yml", "w") as f:
-            f.write(
-                "---\nplain_key: visible\n"
-                "database_password: >\n"
-                "  super-secret\n"
-            )
-        closed = self._run("close")
-        self.assertNotEqual(closed.returncode, 0)
-        combined = closed.stderr + closed.stdout
-        self.assertTrue(
-            "still appears in the file" in combined or "still present" in combined,
-            combined,
-        )
-
-    def test_rename_keep_plus_block_secret_fails(self):
-        """Folded `>+` (keep chomp) renamed secrets must refuse."""
-        self._write_vars_file(("db_password", b"super-secret"))
-        self.assertEqual(self._run("open").returncode, 0)
-        with open("group_vars.yml", "w") as f:
-            f.write(
-                "---\nplain_key: visible\n"
-                "database_password: >+\n"
-                "  super-secret\n"
-            )
-        closed = self._run("close")
-        self.assertNotEqual(closed.returncode, 0)
-        combined = closed.stderr + closed.stdout
-        self.assertTrue(
-            "still appears in the file" in combined or "still present" in combined,
-            combined,
-        )
-
-    def test_rename_to_list_item_secret_fails(self):
-        self._write_vars_file(("db_password", b"super-secret"))
-        self.assertEqual(self._run("open").returncode, 0)
-        with open("group_vars.yml", "w") as f:
-            f.write("---\nplain_key: visible\nsecrets:\n  - super-secret\n")
-        closed = self._run("close")
-        self.assertNotEqual(closed.returncode, 0)
-        combined = closed.stderr + closed.stdout
-        self.assertTrue(
-            "still appears in the file" in combined or "still present" in combined,
-            combined,
-        )
-
-    def test_rename_to_flow_mapping_secret_fails(self):
-        self._write_vars_file(("db_password", b"super-secret"))
-        self.assertEqual(self._run("open").returncode, 0)
-        with open("group_vars.yml", "w") as f:
-            f.write("---\nplain_key: visible\ncreds: {database_password: super-secret}\n")
-        closed = self._run("close")
-        self.assertNotEqual(closed.returncode, 0)
-        combined = closed.stderr + closed.stdout
-        self.assertTrue(
-            "still appears in the file" in combined or "still present" in combined,
-            combined,
-        )
+    def test_rename_secret_shapes_fail_closed(self):
+        """Renamed/relocated secrets without markers must not look like removal."""
+        cases = [
+            (
+                "single_quoted",
+                "---\nplain_key: visible\ndatabase_password: 'super-secret'\n",
+            ),
+            (
+                "folded",
+                "---\nplain_key: visible\ndatabase_password: >\n  super-secret\n",
+            ),
+            (
+                "folded_keep",
+                "---\nplain_key: visible\ndatabase_password: >+\n  super-secret\n",
+            ),
+            ("list_item", "---\nplain_key: visible\nsecrets:\n  - super-secret\n"),
+            (
+                "flow_mapping",
+                "---\nplain_key: visible\ncreds: {database_password: super-secret}\n",
+            ),
+            (
+                "flow_sequence",
+                "---\nplain_key: visible\npasswords: [super-secret, backup]\n",
+            ),
+            (
+                "sequence_block",
+                "---\nplain_key: visible\nitems:\n  - |\n    super-secret\n",
+            ),
+        ]
+        for name, body in cases:
+            with self.subTest(shape=name):
+                self._write_vars_file(("db_password", b"super-secret"))
+                self.assertEqual(self._run("open").returncode, 0)
+                with open("group_vars.yml", "w") as f:
+                    f.write(body)
+                closed = self._run("close")
+                self.assertNotEqual(closed.returncode, 0)
+                combined = closed.stderr + closed.stdout
+                self.assertTrue(
+                    "still appears in the file" in combined or "still present" in combined,
+                    combined,
+                )
+                # Reset tree for next subTest
+                for artifact in ("vaultedFileList.json", "group_vars.yml"):
+                    if os.path.isfile(artifact):
+                        os.remove(artifact)
+                if os.path.isdir(".vault"):
+                    shutil.rmtree(".vault", ignore_errors=True)
+                for name in os.listdir("."):
+                    if name.endswith(".pilfer-open"):
+                        os.remove(name)
 
     def test_strip_marker_with_vault_doc_comment_fails(self):
         """A doc mention of !vault must not satisfy the already-encrypted shortcut."""
@@ -733,20 +701,6 @@ class TestInlineVault(unittest.TestCase):
             combined,
         )
 
-
-    def test_rename_to_flow_sequence_secret_fails(self):
-        self._write_vars_file(("db_password", b"super-secret"))
-        self.assertEqual(self._run("open").returncode, 0)
-        with open("group_vars.yml", "w") as f:
-            f.write("---\nplain_key: visible\npasswords: [super-secret, backup]\n")
-        closed = self._run("close")
-        self.assertNotEqual(closed.returncode, 0)
-        combined = closed.stderr + closed.stdout
-        self.assertTrue(
-            "still appears in the file" in combined or "still present" in combined,
-            combined,
-        )
-
     def test_strip_marker_changed_value_same_key_fails(self):
         """Changing the value after stripping markers must not clear the session."""
         self._write_vars_file(("db_password", b"super-secret"))
@@ -758,24 +712,6 @@ class TestInlineVault(unittest.TestCase):
         self.assertTrue(os.path.isfile("vaultedFileList.json"))
         with open("group_vars.yml") as f:
             self.assertIn("new-secret", f.read())
-
-    def test_rename_to_sequence_block_scalar_fails(self):
-        self._write_vars_file(("db_password", b"super-secret"))
-        self.assertEqual(self._run("open").returncode, 0)
-        with open("group_vars.yml", "w") as f:
-            f.write(
-                "---\nplain_key: visible\nitems:\n  - |\n    super-secret\n"
-            )
-        closed = self._run("close")
-        self.assertNotEqual(closed.returncode, 0)
-        combined = closed.stderr + closed.stdout
-        self.assertTrue(
-            "still appears in the file" in combined or "still present" in combined,
-            combined,
-        )
-
-
-
 
     def test_empty_inline_spans_meta_refuses_close(self):
         self._write_vars_file(("db_password", b"super-secret"))
@@ -850,9 +786,8 @@ class TestInlineVault(unittest.TestCase):
             f.write(text)
         # Simulate successful recrypt write before session/backup cleanup: vault
         # ciphertext without markers, differing from the open-time backup.
-        reencrypted = (
-            "---\nplain_key: visible\n"
-            + encrypt_string_yaml(self.vault, "db_password", b"new-secret")
+        reencrypted = "---\nplain_key: visible\n" + encrypt_string_yaml(
+            self.vault, "db_password", b"new-secret"
         )
         with open("group_vars.yml", "w") as f:
             f.write(reencrypted)
@@ -881,7 +816,10 @@ class TestInlineVault(unittest.TestCase):
         with open("group_vars.yml", "w") as f:
             f.writelines(kept)
 
-        closed = self._run("close")
+        refused = self._run("close")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("--allow-removals", refused.stderr + refused.stdout)
+        closed = self._run("close", allow_removals=True)
         self.assertEqual(closed.returncode, 0, closed.stderr)
         self.assertIn("🔍 Detected removal of 1 encrypted vars:", closed.stdout)
         self.assertIn("- db_password", closed.stdout)
@@ -1043,7 +981,9 @@ class TestDiscoveryOptimizations(unittest.TestCase):
         self.assertEqual(pilfer_cli.recrypt_vault_files("vault_pass"), 0)
         with open("bom_secret.yml", "rb") as f:
             after = f.read()
-        self.assertTrue(after.startswith(b"$ANSIBLE_VAULT;") or after.lstrip().startswith(b"$ANSIBLE_VAULT;"))
+        self.assertTrue(
+            after.startswith(b"$ANSIBLE_VAULT;") or after.lstrip().startswith(b"$ANSIBLE_VAULT;")
+        )
 
 
 class TestCompatibility(unittest.TestCase):
@@ -1084,11 +1024,7 @@ class TestInlineUnit(unittest.TestCase):
 
     def test_parse_block_keeps_blank_lines(self):
         content = (
-            b'db_password: |  # pilfer:vault:0\n'
-            b'  line1\n'
-            b'\n'
-            b'  line3\n'
-            b'other: x\n'
+            b"db_password: |  # pilfer:vault:0\n" b"  line1\n" b"\n" b"  line3\n" b"other: x\n"
         )
         match = pilfer_inline.MARKER_RE.search(content)
         self.assertIsNotNone(match)
@@ -1102,6 +1038,279 @@ class TestInlineUnit(unittest.TestCase):
         self.assertTrue(pilfer_inline.is_whole_file_vault(b"\xef\xbb\xbf" + body))
         self.assertTrue(pilfer_inline.is_whole_file_vault(b"\n  " + body))
         self.assertFalse(pilfer_inline.is_whole_file_vault(b"---\nfoo: bar\n"))
+
+
+class TestScanOnce(unittest.TestCase):
+    """Nested git skips must print once per open (single project walk)."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.original_cwd = os.getcwd()
+        os.chdir(self.test_dir)
+        with open("vault_pass", "w") as f:
+            f.write("test_password")
+        self.pilfer_script = os.path.join(os.path.dirname(__file__), "..", "pilfer.py")
+
+    def tearDown(self):
+        os.chdir(self.original_cwd)
+        shutil.rmtree(self.test_dir)
+
+    def test_nested_skip_announced_once(self):
+        for name in ("nested_a", "nested_b"):
+            os.makedirs(name)
+            with open(os.path.join(name, ".git"), "w") as f:
+                f.write("gitdir: ../.git\n")
+        result = subprocess.run(
+            [sys.executable, self.pilfer_script, "open", "-p", "vault_pass"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("nested_a", "nested_b"):
+            needle = f"Skipping nested git repo: {os.path.abspath(name)}"
+            self.assertEqual(result.stdout.count(needle), 1, result.stdout)
+
+
+class TestAllowRemovalsAndRekey(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.original_cwd = os.getcwd()
+        os.chdir(self.test_dir)
+        with open("vault_pass", "w") as f:
+            f.write("test_password")
+        with open("vault_pass_new", "w") as f:
+            f.write("new_password")
+        self.vault = make_vault()
+        self.pilfer_script = os.path.join(os.path.dirname(__file__), "..", "pilfer.py")
+
+    def tearDown(self):
+        os.chdir(self.original_cwd)
+        shutil.rmtree(self.test_dir)
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, self.pilfer_script, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_rekey_dry_run_and_apply(self):
+        with open("secret.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
+        dry = self._run(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--dry-run",
+            "--yes",
+        )
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn("Dry run only", dry.stdout)
+        applied = self._run(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--yes",
+        )
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        new_vault = make_vault("new_password")
+        with open("secret.yml", "rb") as f:
+            body = f.read()
+        self.assertEqual(new_vault.decrypt(body), b"secret_key: hunter2\n")
+
+    def test_rekey_resumes_after_partial_success(self):
+        """Files already on the new password are skipped so rekey can finish."""
+        with open("a.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"a: 1\n"))
+        with open("b.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"b: 2\n"))
+        new_vault = make_vault("new_password")
+        with open("a.yml", "rb") as f:
+            plain_a = self.vault.decrypt(f.read())
+        with open("a.yml", "wb") as f:
+            f.write(new_vault.encrypt(plain_a))
+        resumed = self._run(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--yes",
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn("Already on new password", resumed.stdout)
+        with open("a.yml", "rb") as f:
+            self.assertEqual(new_vault.decrypt(f.read()), b"a: 1\n")
+        with open("b.yml", "rb") as f:
+            self.assertEqual(new_vault.decrypt(f.read()), b"b: 2\n")
+
+    def test_rekey_rotate_refuses_without_inline(self):
+        with open("secret.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
+        result = self._run(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--yes",
+            "--no-include-encrypted-vars",
+            "--rotate-password-file",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--rotate-password-file", result.stderr + result.stdout)
+        self.assertIn("inline", (result.stderr + result.stdout).lower())
+
+    def test_stale_rekey_temp_not_discovered_and_cleaned(self):
+        with open("secret.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
+        # Crash leftover: vault ciphertext under staging name next to target.
+        with open(".pilfer-rekey-deadbeef", "wb") as f:
+            f.write(self.vault.encrypt(b"orphan: true\n"))
+        found = pilfer_cli.scan_project(include_encrypted_vars=True).targets
+        paths = [e["path"] for e in found]
+        self.assertTrue(any(p.endswith("secret.yml") for p in paths))
+        self.assertFalse(any(".pilfer-rekey-" in p for p in paths))
+        dry = self._run(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--dry-run",
+            "--yes",
+        )
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertTrue(
+            os.path.exists(".pilfer-rekey-deadbeef"),
+            "dry-run must not delete rekey temps",
+        )
+        result = self._run(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--yes",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(os.path.exists(".pilfer-rekey-deadbeef"))
+        new_vault = make_vault("new_password")
+        with open("secret.yml", "rb") as f:
+            self.assertEqual(new_vault.decrypt(f.read()), b"secret_key: hunter2\n")
+
+    def test_rekey_temp_prefix_does_not_hide_orphan_sidecar(self):
+        """Renaming a sidecar behind the rekey prefix must still block open."""
+        with open("secret.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
+        opened = subprocess.run(
+            [sys.executable, self.pilfer_script, "open", "-p", "vault_pass"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        # Simulate destroyed session while plaintext + renamed sidecar remain.
+        os.remove("vaultedFileList.json")
+        shutil.rmtree(".vault", ignore_errors=True)
+        os.rename("secret.yml.pilfer-open", ".pilfer-rekey-hidden.pilfer-open")
+        blocked = subprocess.run(
+            [sys.executable, self.pilfer_script, "open", "-p", "vault_pass"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
+        self.assertIn("pilfer-open", (blocked.stderr + blocked.stdout).lower())
+
+    def test_rekey_rotate_already_done_requires_yes(self):
+        with open("secret.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
+        self.assertEqual(
+            self._run(
+                "rekey",
+                "--old-vault-password-file",
+                "vault_pass",
+                "--new-vault-password-file",
+                "vault_pass_new",
+                "--yes",
+            ).returncode,
+            0,
+        )
+        # Resume-only rotate without --yes in non-interactive mode must refuse.
+        refused = self._run(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--rotate-password-file",
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("Confirmation required", refused.stderr + refused.stdout)
+        self.assertTrue(os.path.exists("vault_pass"))
+        self.assertFalse(os.path.exists("vault_pass_old"))
+
+    def test_rekey_rotate_refuses_when_nested_git_skipped(self):
+        with open("secret.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
+        os.makedirs("nested")
+        with open(os.path.join("nested", ".git"), "w") as f:
+            f.write("gitdir: ../.git\n")
+        with open(os.path.join("nested", "nested.yml"), "wb") as f:
+            f.write(self.vault.encrypt(b"nested: 1\n"))
+        result = self._run(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--yes",
+            "--rotate-password-file",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("nested git", (result.stderr + result.stdout).lower())
+        self.assertTrue(os.path.exists("vault_pass"))
+        self.assertFalse(os.path.exists("vault_pass_old"))
+
+    def test_denylisted_extension_still_detects_orphan_markers(self):
+        """Marker orphans renamed to denylisted extensions must still block open."""
+        with open("group_vars.yml", "w") as f:
+            f.write("---\n" 'db_password: "super-secret"  # pilfer:vault:0\n')
+        with open("group_vars.yml.pilfer-open", "w") as f:
+            f.write("lock\n")
+        os.rename("group_vars.yml", "leak.pyc")
+        os.remove("group_vars.yml.pilfer-open")
+        blocked = subprocess.run(
+            [sys.executable, self.pilfer_script, "open", "-p", "vault_pass"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
+        self.assertIn("pilfer:vault", (blocked.stderr + blocked.stdout).lower())
+
+    def test_emoji_messages_have_trailing_space(self):
+        """User-facing emoji prefixes must be followed by a space."""
+        import re
+
+        cli_text = (Path(__file__).resolve().parents[1] / "pilfer" / "cli.py").read_text()
+        vs16 = "️"
+        for emoji in ("🔓", "🔒", "✅", "⏭️", "🔍", "ℹ️", "🔐"):
+            for match in re.finditer(re.escape(emoji), cli_text):
+                rest = cli_text[match.end() :]
+                rest = rest.removeprefix(vs16)
+                self.assertTrue(
+                    rest[:1] == " ",
+                    f"{emoji!r} not followed by space near "
+                    f"{cli_text[match.start() : match.start() + 24]!r}",
+                )
 
 
 class TestVersion(unittest.TestCase):
@@ -1126,6 +1335,7 @@ class TestVersion(unittest.TestCase):
             [sys.executable, pilfer_script, "--version"],
             capture_output=True,
             text=True,
+            check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"pilfer {pilfer_version}", result.stdout)

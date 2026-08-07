@@ -67,8 +67,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ansible build twine
+          pip install ansible build twine ruff
           pip install -e .
+
+      - name: Ruff
+        run: ruff check pilfer/ pilfer.py tests/
 
       - name: Run tests
         run: |
@@ -115,16 +118,30 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: Download distributions
         uses: actions/download-artifact@v8
         with:
           name: release-distributions
           path: dist/
 
+      - name: Build release body
+        id: notes
+        run: |
+          set -euo pipefail
+          BODY_FILE="${RUNNER_TEMP}/release-body.md"
+          ./scripts/release-notes.sh > "${BODY_FILE}"
+          echo "body_file=${BODY_FILE}" >> "${GITHUB_OUTPUT}"
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*
+          body_path: ${{ steps.notes.outputs.body_file }}
           generate_release_notes: true
           fail_on_unmatched_files: true
 

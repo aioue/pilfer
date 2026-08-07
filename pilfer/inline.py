@@ -21,9 +21,7 @@ MARKER_RE = re.compile(
 
 _HEX_LINE = re.compile(rb"^[ \t]*[0-9a-fA-F]+\s*$")
 # Only plain literal block style for now (!vault |). Other styles are skipped.
-_VAULT_TAG_LINE = re.compile(
-    rb"^(?P<prefix>[ \t]*[^:\n#][^:\n]*:\s*)!vault\s*\|\s*\r?\n$"
-)
+_VAULT_TAG_LINE = re.compile(rb"^(?P<prefix>[ \t]*[^:\n#][^:\n]*:\s*)!vault\s*\|\s*\r?\n$")
 
 UTF8_BOM = b"\xef\xbb\xbf"
 VAULT_HEADER_PREFIX = b"$ANSIBLE_VAULT;"
@@ -31,8 +29,7 @@ VAULT_HEADER_PREFIX = b"$ANSIBLE_VAULT;"
 
 def strip_leading_vault_noise(data: bytes) -> bytes:
     """Remove UTF-8 BOM and leading whitespace so vault magic can be detected."""
-    if data.startswith(UTF8_BOM):
-        data = data[len(UTF8_BOM) :]
+    data = data.removeprefix(UTF8_BOM)
     return data.lstrip(b" \t\r\n")
 
 
@@ -83,8 +80,7 @@ def _line_end(content: bytes, index: int) -> int:
 def var_name_from_prefix(line_prefix: str) -> str:
     """Extract YAML key name from a stored line prefix like '  db_password: '."""
     text = line_prefix.rstrip()
-    if text.endswith(":"):
-        text = text[:-1]
+    text = text.removesuffix(":")
     return text.strip().lstrip()
 
 
@@ -202,9 +198,7 @@ def format_open_value(plaintext: bytes, span: InlineSpan) -> bytes:
     try:
         text = plaintext.decode("utf-8")
     except UnicodeDecodeError as exc:
-        name = var_name_from_prefix(
-            span.line_prefix.decode("utf-8", errors="replace")
-        )
+        name = var_name_from_prefix(span.line_prefix.decode("utf-8", errors="replace"))
         raise ValueError(
             f"Inline vault secret {name!r} is not valid UTF-8; "
             "pilfer cannot safely open binary inline secrets"
@@ -342,9 +336,7 @@ def _hash_block_scalar_body(body: bytes) -> str | None:
     if not body:
         return None
     lines = body.splitlines()
-    indents = [
-        len(line) - len(line.lstrip(b" \t")) for line in lines if line.strip()
-    ]
+    indents = [len(line) - len(line.lstrip(b" \t")) for line in lines if line.strip()]
     if not indents:
         return None
     min_indent = min(indents)
@@ -353,9 +345,7 @@ def _hash_block_scalar_body(body: bytes) -> str | None:
         if not line.strip():
             parts.append(b"")
             continue
-        parts.append(
-            line[min_indent:] if len(line) >= min_indent else line.lstrip(b" \t")
-        )
+        parts.append(line[min_indent:] if len(line) >= min_indent else line.lstrip(b" \t"))
     plaintext = b"\n".join(parts)
     return hashlib.sha256(plaintext).hexdigest()
 
@@ -465,9 +455,7 @@ def _plain_hash_still_present(content: bytes, plain_hash: str) -> bool:
         if digest == plain_hash:
             return True
         indents = [
-            len(line) - len(line.lstrip(b" \t"))
-            for line in body.splitlines()
-            if line.strip()
+            len(line) - len(line.lstrip(b" \t")) for line in body.splitlines() if line.strip()
         ]
         if not indents:
             continue
@@ -477,9 +465,7 @@ def _plain_hash_still_present(content: bytes, plain_hash: str) -> bool:
             if not line.strip():
                 parts.append(b"")
                 continue
-            parts.append(
-                line[min_indent:] if len(line) >= min_indent else line.lstrip(b" \t")
-            )
+            parts.append(line[min_indent:] if len(line) >= min_indent else line.lstrip(b" \t"))
         try:
             text = b"\n".join(parts).decode("utf-8")
         except UnicodeDecodeError:
@@ -493,9 +479,7 @@ def _plain_hash_still_present(content: bytes, plain_hash: str) -> bool:
 def _yaml_key_has_vault_value(content: bytes, var_name: str) -> bool:
     """True if `var_name:` is present and its value starts with !vault."""
     pattern = re.compile(
-        rb"^[ \t]*"
-        + re.escape(var_name.encode("utf-8"))
-        + rb"\s*:\s*!vault\b",
+        rb"^[ \t]*" + re.escape(var_name.encode("utf-8")) + rb"\s*:\s*!vault\b",
         re.MULTILINE,
     )
     return pattern.search(content) is not None
@@ -533,9 +517,7 @@ def _original_plaintext_from_record(record: dict, vault: VaultLib) -> bytes | No
         return None
 
 
-def _key_has_decryptable_vault(
-    content: bytes, var_name: str, vault: VaultLib
-) -> bool:
+def _key_has_decryptable_vault(content: bytes, var_name: str, vault: VaultLib) -> bool:
     """True if var_name has a !vault span that decrypts with the session vault."""
     for span in find_inline_vault_spans(content):
         try:
@@ -550,6 +532,16 @@ def _key_has_decryptable_vault(
         except Exception:
             return False
     return False
+
+
+def intentional_removal_candidate_names(content: bytes, span_records: list[dict]) -> list[str]:
+    """Opened var names whose YAML keys are gone (candidate intentional removals)."""
+    names = []
+    for record in span_records:
+        name = var_name_from_prefix(record["line_prefix"])
+        if not _yaml_key_present(content, name):
+            names.append(name)
+    return names
 
 
 def unsafe_missing_marker_names(
@@ -585,13 +577,17 @@ def unsafe_missing_marker_names(
 
 
 def recrypt_inline_content(
-    content: bytes, span_records: list[dict], vault: VaultLib
+    content: bytes,
+    span_records: list[dict],
+    vault: VaultLib,
+    allow_removals: bool = False,
 ) -> RecryptInlineResult:
     """Re-encrypt marked inline values.
 
     Missing markers whose YAML key was also deleted are treated as intentional
-    removals only when the secret value is gone too. Missing markers whose key
-    remains, or whose plaintext still appears under another key, are errors.
+    removals only when allow_removals is True and the secret value is gone too.
+    Missing markers whose key remains, or whose plaintext still appears under
+    another key, are errors.
     """
     records = {int(r["id"]): r for r in span_records}
     if len(records) != len(span_records):
@@ -677,6 +673,12 @@ def recrypt_inline_content(
                 "opened secret value still appears in the file (possibly under a "
                 "renamed key). Restore the marker on the secret, or delete the "
                 "secret value entirely before close."
+            )
+        if not allow_removals:
+            raise ValueError(
+                f"Missing # pilfer:vault:{span_id} marker for {name!r} looks like "
+                "intentional removal of the variable. Pass --allow-removals on "
+                "'pilfer close' to confirm, or restore the marker/line."
             )
         removed_vars.append(name)
 

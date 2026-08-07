@@ -30,7 +30,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ansible
+          pip install ansible ruff
+
+      - name: Ruff
+        run: ruff check pilfer/ pilfer.py tests/
 
       - name: Run tests
         run: |

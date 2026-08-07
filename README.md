@@ -9,6 +9,8 @@ Decrypt *all* ansible vault files in a project in-place recursively for viewing/
 
 Optionally decrypt/re-encrypt all [encrypted variables](https://docs.ansible.com/projects/ansible/latest/vault_guide/vault_encrypting_content.html) in-place.
 
+Optionally re-key all vault files and encrypted variables - e.g. if key has been exposed.
+
 ## Features
 
 - **Python 3 compatible** - Modernized for current Python versions
@@ -22,7 +24,7 @@ Optionally decrypt/re-encrypt all [encrypted variables](https://docs.ansible.com
 
 ## Usage
 ```
-pilfer [open|close] [-p VAULT_PASSWORD_FILE] [--include-encrypted-vars]
+pilfer [open|close|rekey] [-p VAULT_PASSWORD_FILE] [--include-encrypted-vars] [--allow-removals]
 ```
 
 ### Basic Usage
@@ -64,7 +66,13 @@ pilfer close   # no flag needed; re-encrypts everything this session opened
 `--include-encrypted-vars` flag is only meaningful on `open`.
 
 If you delete an entire opened variable line (key + value + marker), `close`
-treats that as intentional removal and prints:
+refuses by default (ambiguous delete vs accident). Confirm with:
+
+```bash
+pilfer close --allow-removals
+```
+
+which then prints:
 
 ```text
 🔍 Detected removal of 1 encrypted vars:
@@ -73,14 +81,8 @@ treats that as intentional removal and prints:
 
 Do not strip only the `# pilfer:vault:N` comment while leaving the key - close
 will refuse so plaintext is not stranded. Renaming the key and dropping the
-marker is also refused if the secret value is still present in the file.
-
-**Safety notes**
-- Never commit while a session is open. Add `vaultedFileList.json` and `.vault/` to your project's `.gitignore`.
-- Never commit files that still contain `# pilfer:vault:N` markers - that means the session is still open.
-- `pilfer open` refuses if a session is already open (prevents destroying encrypted backups).
-- `pilfer close` keeps the session and exits non-zero if any file fails - check the exit code in scripts.
-- Leave `# pilfer:vault:N` markers in place until `close`; removing them makes close fail closed (session kept).
+marker is also refused if the secret value is still present in the file
+(including in comments).
 
 
 ### Vault Password File Detection
@@ -224,7 +226,7 @@ pilfer --help
 
 ### Publishing to PyPI
 
-**Recommended:** bump the version in `pyproject.toml`, `pilfer/__init__.py`, and `pilfer.py`, then commit, push, and tag:
+**Recommended:** use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`) so auto-generated release notes stay readable. Bump the version in `pyproject.toml`, `pilfer/__init__.py`, and `pilfer.py`, then commit, push, and tag:
 
 ```bash
 # Bump version in pyproject.toml, pilfer/__init__.py, and pilfer.py first
@@ -232,9 +234,12 @@ git commit -am "chore(release): X.Y.Z"
 git push origin master
 git tag vX.Y.Z
 git push origin vX.Y.Z
+
+# Optional: preview notes locally before tagging
+./scripts/release-notes.sh
 ```
 
-The [Release workflow](.github/workflows/release.yml) validates versions, runs tests, creates a GitHub release, and publishes to PyPI via trusted publishing. See [.github/workflows/README.md](.github/workflows/README.md) for one-time PyPI setup.
+The [Release workflow](.github/workflows/release.yml) validates versions, runs tests, creates a GitHub release (summary + auto-generated notes since the previous tag), and publishes to PyPI via trusted publishing. See [.github/workflows/README.md](.github/workflows/README.md) for one-time PyPI setup.
 
 **Manual fallback** (TestPyPI or local publish):
 
@@ -250,6 +255,96 @@ The build script will:
 2. Build the package using modern Python packaging
 3. Upload to PyPI/TestPyPI using twine
 4. Provide installation instructions
+
+## Rotating the vault password
+
+`pilfer close` is **not** password rotation - it refuses a different password than
+the one used for `open` (anti re-key). To rotate every vault target in the tree
+(including inline `!vault` spans):
+
+```bash
+# Plan / decrypt-check only
+pilfer rekey \
+  --old-vault-password-file ~/.ansible-vault/.vault-file \
+  --new-vault-password-file /tmp/new-vault-pass \
+  --dry-run
+
+# Re-key ciphertext (prompts: type REKEY). Inline spans included by default.
+pilfer rekey \
+  --old-vault-password-file ~/.ansible-vault/.vault-file \
+  --new-vault-password-file /tmp/new-vault-pass
+
+# After 100% success, optionally archive the old password file and install the new
+# one at the old path (chmod 600):
+pilfer rekey ... --rotate-password-file
+```
+
+Refuse to rekey while a pilfer session is open. Nested git checkouts are skipped
+(run `pilfer rekey` from those directories separately). Prefer `--dry-run` first.
+A mid-run failure can leave a split-password tree; **re-run the same `rekey`
+command to resume** (files already on the new password are skipped).
+`--rotate-password-file` is refused with `--no-include-encrypted-vars`, and also
+when nested git checkouts were skipped, so the live password file is not rotated
+while ciphertext remains on the old password. Stale `.pilfer-rekey-*` staging
+files are ignored as vault targets and removed only after confirmed mutating
+rekey (never on `--dry-run`).
+
+## Safety
+
+Pilfer **fails closed**: if it cannot prove a secret is safely re-encrypted or
+intentionally removed, it keeps the session and `.vault/` backups and exits
+non-zero. It does not invent fixes for ambiguous edits.
+
+### Failure modes this protects against
+
+- Silent re-key on `close` with a different password than `open`
+- Double-`open` destroying encrypted backups under `.vault/`
+- Orphan plaintext after deleting `vaultedFileList.json` (markers, `.vault/`, or `*.pilfer-open` sidecars still block re-open)
+- Stranded plaintext after stripping markers, renaming keys, or relocating secrets (including into comments)
+- Crash mid-decrypt leaving unmarked plaintext (open sidecars are written before plaintext)
+
+### Surprising-by-design behaviors
+
+- **Interrupted close retries:** whole-file targets only count as already done when
+  working bytes match the open backup, or the file is vault ciphertext decryptable
+  with the session password (not an arbitrary foreign vault blob).
+- **`close` is progressive** - files that succeed are encrypted and dropped from the session; failures stay plaintext until you fix and retry. Not an all-or-nothing transaction.
+- **Intentional var removal** requires `pilfer close --allow-removals`.
+- **Short secrets** can block close if the same bytes appear elsewhere in the file (docs/comments) - fail closed.
+- **Nested git checkouts** are skipped; run pilfer from those roots if needed.
+- **Legacy unbound sessions** cannot `close` until you re-`open` with a current pilfer.
+- **`*.pilfer-open` sidecars** sit beside opened files (whole-file opens have no `# pilfer:vault:` markers).
+
+### Gitignore
+
+```gitignore
+vaultedFileList.json
+.vault/
+**/*.pilfer-open
+```
+
+### Pre-commit hook (suggested)
+
+Block commits while a session is open:
+
+```bash
+# .git/hooks/pre-commit (chmod +x)
+if [ -e vaultedFileList.json ] || [ -d .vault ] \
+  || find . -name '*.pilfer-open' -print -quit 2>/dev/null | grep -q .; then
+  echo "pilfer session open (vaultedFileList.json / .vault / *.pilfer-open); run pilfer close first"
+  exit 1
+fi
+# Optional: also refuse # pilfer:vault: markers from --include-encrypted-vars
+if git grep -n '# pilfer:vault:' -- '*.yml' '*.yaml' >/dev/null 2>&1; then
+  echo "files still contain # pilfer:vault: markers; run pilfer close first"
+  exit 1
+fi
+```
+
+### Recovery
+
+- Session present (`vaultedFileList.json`) → fix the reported issue → `pilfer close` again.
+- Session deleted but markers / `.vault` / `*.pilfer-open` remain → restore `vaultedFileList.json` from backup if you have it and `close`, or manually re-encrypt / restore secrets before `open`.
 
 ## License
 

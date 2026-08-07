@@ -27,6 +27,7 @@ Thumbs.db
 # Pilfer working files
 vaultedFileList.json
 .vault/
+**/*.pilfer-open
 
 # Publishing
 .pypirc 

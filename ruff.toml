@@ -1,0 +1,20 @@
+# Ruff config for pilfer
+line-length = 100
+target-version = "py39"
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "EXE"]
+ignore = [
+  "EXE001",
+  "SIM105",  # try/except pass preferred for cleanup paths
+  "SIM117",
+  "E501",
+  "RUF001",  # intentional emoji in CLI/tests
+  "RUF002",
+  "RUF003",
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["S101", "PLW1510"]
+"pilfer/cli.py" = ["BLE001"]
+"pilfer/inline.py" = ["BLE001", "SIM103"]

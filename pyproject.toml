@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pilfer"
-version = "2.22.0"
+version = "2.23.0"
 authors = [
     {name = "Tom Paine", email = "github@aioue.net"},
 ]
@@ -48,4 +48,12 @@ where = ["."]
 include = ["pilfer*"]
 
 [tool.setuptools.package-data]
-pilfer = ["py.typed"] 
+pilfer = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ["py38"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
