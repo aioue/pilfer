@@ -1,4 +1,5 @@
-# Keep GitHub Actions and Python dependencies current.
+# Dependabot version updates for pilfer.
+# Security updates are separate: they are not delayed by schedule, groups, or cooldown.
 # https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
 
 version: 2
@@ -8,6 +9,13 @@ updates:
     schedule:
       interval: weekly
       day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+    labels:
+      - dependencies
+      - github-actions
     groups:
       github-actions:
         patterns:
@@ -21,10 +29,31 @@ updates:
     schedule:
       interval: weekly
       day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+    versioning-strategy: increase-if-necessary
+    labels:
+      - dependencies
+      - python
+    cooldown:
+      default-days: 3
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
     groups:
-      python-dependencies:
+      python-minor-patch:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
+      python-major:
+        patterns:
+          - "*"
+        update-types:
+          - major
     commit-message:
       prefix: chore
       include: scope

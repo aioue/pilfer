@@ -35,10 +35,13 @@ Tag pushes publish. Manual `workflow_dispatch` validates and builds only.
 
 ## Dependabot
 
-`.github/dependabot.yml` opens weekly PRs for:
+`.github/dependabot.yml` opens weekly PRs (Mondays 09:00 UTC) for:
 
-- GitHub Actions updates (grouped)
-- Python dependencies from `pyproject.toml` (grouped)
+- GitHub Actions updates (one grouped PR)
+- Python dependencies from `pyproject.toml` (minor/patch grouped separately from major)
+- Labels: `dependencies`, plus `github-actions` or `python`
+- Cooldown on pip updates (longer wait for major semver bumps)
+- Security updates remain immediate and are not batched with version updates
 
 ## Triggers
 
