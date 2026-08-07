@@ -243,7 +243,9 @@ def decrypt_inline_content(content: bytes, vault: VaultLib) -> tuple[bytes, list
 
     new_content = content
     for span, plaintext in sorted(
-        zip(spans, plaintexts), key=lambda pair: pair[0].start, reverse=True
+        zip(spans, plaintexts, strict=True),
+        key=lambda pair: pair[0].start,
+        reverse=True,
     ):
         replacement = format_open_value(plaintext, span)
         new_content = new_content[: span.start] + replacement + new_content[span.end :]

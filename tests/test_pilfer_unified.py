@@ -367,8 +367,8 @@ class TestSessionSafety(unittest.TestCase):
         with open("secret.yml", "rb") as f:
             self.assertEqual(f.read(), b"secret_key: hunter2\n")
 
-    def test_legacy_v1_session_close_refused(self):
-        """Close must refuse unbound legacy sessions (would silently re-key)."""
+    def test_legacy_v1_session_close_proves_and_succeeds(self):
+        """Unbound legacy sessions close after password is proven against backups."""
         abs_path = os.path.abspath("secret.yml")
         with open("vaultedFileList.json", "w") as f:
             json.dump([abs_path], f)
@@ -376,12 +376,12 @@ class TestSessionSafety(unittest.TestCase):
         # decrypt rewrote a v2 session with binding; simulate legacy by rewriting.
         with open("vaultedFileList.json", "w") as f:
             json.dump([abs_path], f)
-        with self.assertRaises(pilfer_cli.PilferError) as ctx:
-            pilfer_cli.recrypt_vault_files("vault_pass")
-        self.assertIn("Legacy pilfer session", str(ctx.exception))
+        modified = pilfer_cli.recrypt_vault_files("vault_pass")
+        self.assertEqual(modified, 0)
+        self.assertFalse(os.path.isfile("vaultedFileList.json"))
 
-    def test_empty_password_fingerprint_close_refused(self):
-        """v2 session with empty password_sha256 must not close (re-key risk)."""
+    def test_empty_password_fingerprint_close_proves_and_succeeds(self):
+        """Empty password_sha256 can close when backups prove the password."""
         self.assertEqual(self._run("open").returncode, 0)
         with open("vaultedFileList.json") as f:
             data = json.load(f)
@@ -389,9 +389,43 @@ class TestSessionSafety(unittest.TestCase):
         with open("vaultedFileList.json", "w") as f:
             json.dump(data, f)
         closed = self._run("close")
-        self.assertNotEqual(closed.returncode, 0)
-        self.assertIn("password binding", closed.stderr)
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertFalse(os.path.isfile("vaultedFileList.json"))
+
+    def test_incomplete_session_abandoned_on_reopen(self):
+        """Crash after writing session list but before decrypt must not deadlock."""
+        abs_path = os.path.abspath("secret.yml")
+        with open("vaultedFileList.json", "w") as f:
+            json.dump(
+                {
+                    "version": 2,
+                    "password_sha256": "deadbeef",
+                    "entries": [{"kind": "file", "path": abs_path}],
+                },
+                f,
+            )
+        # Still ciphertext, no .vault backups / sidecars -> incomplete open.
+        opened = self._run("open")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertIn("Cleared incomplete session", opened.stdout)
+        with open("secret.yml", "rb") as f:
+            self.assertEqual(f.read(), b"secret_key: hunter2\n")
         self.assertTrue(os.path.isfile("vaultedFileList.json"))
+        self.assertTrue(os.path.isfile("secret.yml.pilfer-open"))
+
+    def test_plaintext_session_without_artifacts_not_abandoned(self):
+        """Deleting backups/sidecars after open must not clear a live session."""
+        self.assertEqual(self._run("open").returncode, 0)
+        shutil.rmtree(".vault", ignore_errors=True)
+        for name in os.listdir("."):
+            if name.endswith(".pilfer-open"):
+                os.remove(name)
+        # Session list remains; file is plaintext - must refuse re-open.
+        blocked = self._run("open")
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("Session already open", blocked.stderr + blocked.stdout)
+        with open("secret.yml", "rb") as f:
+            self.assertEqual(f.read(), b"secret_key: hunter2\n")
 
     def test_orphan_markers_without_session_refuse_open(self):
         """Deleting the session after open must not let a later open exit 0."""
@@ -818,7 +852,11 @@ class TestInlineVault(unittest.TestCase):
 
         refused = self._run("close")
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("--allow-removals", refused.stderr + refused.stdout)
+        combined = refused.stderr + refused.stdout
+        self.assertIn("⚠️", combined)
+        self.assertIn("Failed to process", combined)
+        self.assertIn("'db_password'", combined)
+        self.assertIn("--allow-removals", combined)
         closed = self._run("close", allow_removals=True)
         self.assertEqual(closed.returncode, 0, closed.stderr)
         self.assertIn("🔍 Detected removal of 1 encrypted vars:", closed.stdout)
@@ -1302,7 +1340,7 @@ class TestAllowRemovalsAndRekey(unittest.TestCase):
 
         cli_text = (Path(__file__).resolve().parents[1] / "pilfer" / "cli.py").read_text()
         vs16 = "️"
-        for emoji in ("🔓", "🔒", "✅", "⏭️", "🔍", "ℹ️", "🔐"):
+        for emoji in ("🔓", "🔒", "✅", "⏭️", "🔍", "ℹ️", "🔐", "⚠️"):
             for match in re.finditer(re.escape(emoji), cli_text):
                 rest = cli_text[match.end() :]
                 rest = rest.removeprefix(vs16)

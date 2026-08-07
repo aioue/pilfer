@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pilfer"
-version = "2.23.0"
+version = "2.24.0"
 authors = [
     {name = "Tom Paine", email = "github@aioue.net"},
 ]
 description = "Decrypt all ansible vault files in a project recursively for search/editing, then re-encrypt when done."
 readme = "README.md"
 
-requires-python = ">=3.6"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
@@ -20,13 +20,10 @@ classifiers = [
     "Operating System :: OS Independent",
     "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.6",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: System :: Systems Administration",
     "Topic :: Utilities",
 ]
@@ -52,7 +49,7 @@ pilfer = ["py.typed"]
 
 [tool.black]
 line-length = 100
-target-version = ["py38"]
+target-version = ["py310"]
 
 [tool.isort]
 profile = "black"

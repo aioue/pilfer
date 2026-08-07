@@ -9,6 +9,7 @@ import configparser
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -216,11 +217,6 @@ def _remove_open_sidecar(vaulted_file_path: str) -> None:
         pass
 
 
-def _find_orphan_sidecar_files():
-    """Leftover *.pilfer-open locks from a deleted session."""
-    return scan_project(include_encrypted_vars=False, announce_skips=False).sidecar_files
-
-
 def _session_meta_path() -> str:
     return os.path.join(temp_hidden_encrypted_copies_directory_path, SESSION_META_NAME)
 
@@ -279,29 +275,151 @@ def _load_session():
     return _normalize_entries(data)
 
 
-def _require_session_password_binding(session_password_fp, password_fp, version):
-    """Refuse close when password binding is missing or mismatched."""
-    if version >= 2:
-        if not session_password_fp:
-            raise PilferError(
-                "Session is missing password binding (password_sha256). "
-                "Refuse to close to avoid re-keying secrets. "
-                "Remove vaultedFileList.json / .vault if this is a corrupt session, "
-                "or re-open with a current pilfer."
-            )
+def _quote_names(names) -> str:
+    return ", ".join(repr(n) for n in names)
+
+
+def _emit_warning_block(title: str, detail: str) -> None:
+    """Print a fail-closed warning with ⚠️ prefix and paragraph spacing."""
+    print(f"⚠️  {title}", file=sys.stderr)
+    print(file=sys.stderr)
+    detail = detail.strip()
+    if not detail:
+        return
+    parts = re.split(r"(?<=\.)\s+", detail)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        print(part, file=sys.stderr)
+        print(file=sys.stderr)
+
+
+def _entry_has_open_artifacts(entry) -> bool:
+    path = entry["path"]
+    return (
+        os.path.isfile(_encrypted_backup_path(path))
+        or os.path.isfile(_open_sidecar_path(path))
+        or os.path.isfile(_inline_meta_path(path))
+    )
+
+
+def _path_still_vault_ciphertext(entry, data: bytes) -> bool:
+    """True if path bytes still look like vault ciphertext (open never decrypted)."""
+    if entry.get("kind") == "inline":
+        return bool(find_inline_vault_spans(data)) or is_whole_file_vault(data)
+    return is_whole_file_vault(data)
+
+
+def _session_is_incomplete(entries) -> bool:
+    """True when session list exists but decrypt never produced backups/sidecars.
+
+    Only treat as crash-before-decrypt when listed paths still look encrypted.
+    If artifacts were deleted after a real open (plaintext remains), do NOT
+    abandon - that would let open exit 0 over untracked secrets.
+    """
+    if not entries:
+        return True
+    if any(_entry_has_open_artifacts(e) for e in entries):
+        return False
+    saw_encrypted = False
+    for entry in entries:
+        path = entry["path"]
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            continue
+        if _path_still_vault_ciphertext(entry, data):
+            saw_encrypted = True
+        else:
+            return False
+    return saw_encrypted
+
+
+def _clear_session_list() -> None:
+    try:
+        if os.path.isfile(temp_vault_file_list_path):
+            os.remove(temp_vault_file_list_path)
+    except OSError:
+        pass
+
+
+def _abandon_incomplete_session() -> bool:
+    """If session looks like crash-before-decrypt, clear it and return True."""
+    if not _session_is_open():
+        return False
+    try:
+        entries, _fp, _ver = _load_session()
+    except Exception:
+        return False
+    if not _session_is_incomplete(entries):
+        return False
+    _clear_session_list()
+    print("ℹ️  Cleared incomplete session (no decrypt backups/sidecars found); " "retrying open.")
+    return True
+
+
+def _prove_password_against_backups(entries, password: str) -> bool:
+    """True if password decrypts every available encrypted backup in the session."""
+    vault = _make_vault(password)
+    checked = 0
+    for entry in entries:
+        backup = _encrypted_backup_path(entry["path"])
+        if not os.path.isfile(backup):
+            continue
+        with open(backup, "rb") as handle:
+            data = handle.read()
+        try:
+            if entry.get("kind") == "inline":
+                spans = find_inline_vault_spans(data)
+                if not spans:
+                    vault.decrypt(normalize_whole_file_vault(data))
+                else:
+                    for span in spans:
+                        vault.decrypt(span.ciphertext)
+            else:
+                vault.decrypt(normalize_whole_file_vault(data))
+        except Exception:
+            return False
+        checked += 1
+    return checked > 0
+
+
+def _require_session_password_binding(
+    session_password_fp, password_fp, version, entries=None, password=None
+):
+    """Refuse close when password binding is missing or mismatched.
+
+    Legacy v1 / unbound sessions may proceed only when the password decrypts
+    every available encrypted backup (proves identity without silent re-key).
+    Returns True when the session should be rewritten with a v2 fingerprint.
+    """
+    if version >= 2 and session_password_fp:
         if session_password_fp != password_fp:
             raise PilferError(
                 "Vault password does not match the password used for 'pilfer open'. "
-                "Refusing to close (would re-key modified files under a different password). "
-                "Use the same -p / ansible.cfg password file as open."
+                "Refusing to close (would re-key modified files under a different "
+                "password). Use the same -p / ansible.cfg password file as open."
             )
-        return
+        return False
 
-    # Legacy v1 sessions have no fingerprint - refuse to avoid silent re-key.
-    raise PilferError(
-        "Legacy pilfer session without password binding. "
-        "Re-run 'pilfer open' with this pilfer version, then 'pilfer close'."
-    )
+    if entries is None or password is None:
+        raise PilferError(
+            "Session is missing password binding (password_sha256). "
+            "Refuse to close to avoid re-keying secrets. "
+            "Remove vaultedFileList.json / .vault if this is a corrupt session, "
+            "or re-open with a current pilfer."
+        )
+    if not _prove_password_against_backups(entries, password):
+        raise PilferError(
+            "Session is missing password binding and password could not be proven "
+            "against encrypted backups. Remove vaultedFileList.json if the open "
+            "never finished, or restore .vault backups and retry close."
+        )
+    return True
 
 
 def _write_session(entries, password_sha256: str) -> None:
@@ -325,41 +443,6 @@ def _is_nested_git_checkout(path: str) -> bool:
     """True if path is its own git checkout (.git directory or submodule gitfile)."""
     git_meta = os.path.join(path, ".git")
     return os.path.isdir(git_meta) or os.path.isfile(git_meta)
-
-
-def _classify_file(file_path: str, include_encrypted_vars: bool = False):
-    """Return 'file', 'inline', or None.
-
-    Inline encrypt_string (!vault) targets are only returned when
-    include_encrypted_vars is True (see --include-encrypted-vars on open).
-
-    Whole-file vaults are detected from a small header read. Full file reads
-    happen only when include_encrypted_vars is set and the header is not a
-    whole-file vault (needed to find mid-file !vault spans).
-    """
-    try:
-        if os.path.islink(file_path):
-            return None
-        if file_path.endswith(OPEN_SIDECAR_SUFFIX):
-            return None
-        if _should_skip_by_extension(file_path):
-            return None
-        with open(file_path, "rb") as open_file:
-            header = open_file.read(_VAULT_HEADER_READ_SIZE)
-            if not header:
-                return None
-            if is_whole_file_vault(header):
-                return "file"
-            if not include_encrypted_vars:
-                return None
-            # Inline search requires the rest of the file.
-            data = header + open_file.read()
-    except OSError:
-        return None
-
-    if b"$ANSIBLE_VAULT;" in data and find_inline_vault_spans(data):
-        return "inline"
-    return None
 
 
 def _classify_file_bytes(file_path: str, data: bytes, include_encrypted_vars: bool = False):
@@ -488,41 +571,6 @@ def _cleanup_stale_rekey_temps(root: str | None = None) -> int:
             except OSError:
                 pass
     return removed
-
-
-def _walk_project_files(announce_skips: bool = True):
-    """Yield scannable file paths (compat). Prefer scan_project for open."""
-    # Quiet structural walk without classify - used only by legacy helpers.
-    walk_dir = os.path.abspath(os.getcwd())
-    for dirpath, dirnames, filenames in os.walk(walk_dir):
-        pruned = []
-        for d in dirnames:
-            if d in _SKIP_DIR_NAMES:
-                continue
-            child = os.path.join(dirpath, d)
-            if _is_nested_git_checkout(child):
-                if announce_skips:
-                    print(
-                        f"⏭️  Skipping nested git repo: {child}"
-                        f" (run 'pilfer open' from that directory instead)"
-                    )
-                continue
-            pruned.append(d)
-        dirnames[:] = pruned
-        for name in filenames:
-            file_path = os.path.join(dirpath, name)
-            if os.path.islink(file_path):
-                continue
-            if name.startswith(REKEY_TEMP_PREFIX):
-                continue
-            if _should_skip_by_extension(file_path):
-                continue
-            yield file_path
-
-
-def _find_orphan_marker_files():
-    """Files that still contain # pilfer:vault: markers (open session leftover)."""
-    return scan_project(include_encrypted_vars=False, announce_skips=False).marker_files
 
 
 def _vault_dir_has_artifacts() -> bool:
@@ -869,7 +917,7 @@ def _recrypt_inline_file(
         if unsafe:
             raise PilferError(
                 "Missing # pilfer:vault markers but opened secrets are still "
-                f"present (plaintext or non-vault key) for: {', '.join(unsafe)}. "
+                f"present (plaintext or non-vault key) for: {_quote_names(unsafe)}. "
                 "Restore the markers on the secrets (or delete the secret keys/"
                 "values entirely) before close."
             )
@@ -879,7 +927,7 @@ def _recrypt_inline_file(
         if removed_like and not allow_removals:
             raise PilferError(
                 "Missing # pilfer:vault markers and opened keys are gone for: "
-                f"{', '.join(removed_like)}. Pass --allow-removals on close to "
+                f"{_quote_names(removed_like)}. Pass --allow-removals on close to "
                 "confirm intentional removal, or restore the markers/lines."
             )
         print(f"⏭️  Already re-encrypted inline file (retrying close): " f"{vaulted_file_path}")
@@ -940,7 +988,14 @@ def recrypt_vault_files(vault_password_file_path=None, allow_removals: bool = Fa
     entries, session_password_fp, version = _load_session()
     password, _vault_file = _load_password(vault_password_file_path)
     password_fp = _password_fingerprint(password)
-    _require_session_password_binding(session_password_fp, password_fp, version)
+    if _require_session_password_binding(
+        session_password_fp,
+        password_fp,
+        version,
+        entries=entries,
+        password=password,
+    ):
+        _write_session(entries, password_sha256=password_fp)
 
     vault = _make_vault(password)
     cwd = Path.cwd().resolve()
@@ -965,7 +1020,7 @@ def recrypt_vault_files(vault_password_file_path=None, allow_removals: bool = Fa
             _write_session(remaining, password_sha256=password_fp)
             _cleanup_entry_backups(path)
         except Exception as e:
-            print(f"Failed to process {path}: {e}")
+            _emit_warning_block(f"Failed to process {path}:", str(e))
             failed.append(path)
             _write_session(remaining, password_sha256=password_fp)
             # Continue attempting other files; all failures reported at end.
@@ -1387,7 +1442,7 @@ Never commit while a session is open. Add vaultedFileList.json, .vault/, and
     try:
         if args.action == "open":
             print("🔓 Searching for and decrypting vault files...")
-            if _session_is_open():
+            if _session_is_open() and not _abandon_incomplete_session():
                 raise PilferError(
                     f"Session already open ({temp_vault_file_list_path} exists). "
                     "Run 'pilfer close' first. Re-running open would destroy "
@@ -1422,9 +1477,10 @@ Never commit while a session is open. Add vaultedFileList.json, .vault/, and
                     "--include-encrypted-vars to open them)"
                 )
             decrypt_vault_files(args.vault_password_file)
+            # ANSI bold around the next command (TTY-friendly; harmless in pipes).
             print(
                 "✅ All vault files decrypted. Edit as needed, "
-                "then run 'pilfer close' to re-encrypt."
+                "then run '[1mpilfer close[0m' to re-encrypt."
             )
             return 0
 
@@ -1471,12 +1527,16 @@ Never commit while a session is open. Add vaultedFileList.json, .vault/, and
             return 0
 
     except PilferError as exc:
+        # Blank line after per-file ⚠️ blocks; keep a plain Error: summary line.
+        print(file=sys.stderr)
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     except FileNotFoundError as exc:
+        print(file=sys.stderr)
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
+        print(file=sys.stderr)
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 

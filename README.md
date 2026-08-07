@@ -2,10 +2,10 @@
 
 [![CI](https://github.com/aioue/pilfer/workflows/CI/badge.svg)](https://github.com/aioue/pilfer/actions)
 [![Test Suite](https://github.com/aioue/pilfer/workflows/Test%20Suite/badge.svg)](https://github.com/aioue/pilfer/actions)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-Decrypt *all* ansible vault files in a project in-place recursively for viewing/editing, then re-encrypt them all at once when you're done.
+**Decrypt *all* ansible vault files in a project in-place recursively for viewing/editing, then re-encrypt them all at once when you're done.**
 
 Optionally decrypt/re-encrypt all [encrypted variables](https://docs.ansible.com/projects/ansible/latest/vault_guide/vault_encrypting_content.html) in-place.
 
@@ -13,7 +13,7 @@ Optionally re-key all vault files and encrypted variables - e.g. if key has been
 
 ## Features
 
-- **Python 3 compatible** - Modernized for current Python versions
+- **Python 3.10+** - Typed modern Python; CI covers 3.10–3.13
 - **ansible.cfg integration** - Automatically reads `vault_password_file` from your ansible.cfg
 - **Change detection** - Only re-encrypts files that were actually modified (using SHA256)
 - **Safe operation** - Preserves original encrypted content for unchanged files
@@ -43,6 +43,8 @@ pilfer [open|close|rekey] [-p VAULT_PASSWORD_FILE] [--include-encrypted-vars] [-
 - Run `pilfer close` to re-encrypt any changed files
 
 Any unchanged files will be returned to their original state.
+
+Re-key an entire tree (inline `!vault` included by default): `pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run`.
 
 ### Inline encrypted variables (`encrypt_string` / `!vault`)
 
@@ -150,7 +152,7 @@ python pilfer.py open
 
 ### Option 2: Install via pipx (Recommended for Regular Use)
 
-**Python 3.6+** is required. Install pilfer using pipx for isolated CLI tool management:
+**Python 3.10+** is required. Install pilfer using pipx for isolated CLI tool management:
 
 ```bash
 # Install pilfer via pipx (recommended)
@@ -312,7 +314,8 @@ non-zero. It does not invent fixes for ambiguous edits.
 - **Intentional var removal** requires `pilfer close --allow-removals`.
 - **Short secrets** can block close if the same bytes appear elsewhere in the file (docs/comments) - fail closed.
 - **Nested git checkouts** are skipped; run pilfer from those roots if needed.
-- **Legacy unbound sessions** cannot `close` until you re-`open` with a current pilfer.
+- **Legacy unbound sessions** can `close` only if the password decrypts the session backups (then pilfer binds a v2 fingerprint); otherwise remove the session list and re-`open`.
+- **Incomplete open** (session list written, crash before decrypt) is cleared automatically on the next `open` so you are not told to `close` ciphertext.
 - **`*.pilfer-open` sidecars** sit beside opened files (whole-file opens have no `# pilfer:vault:` markers).
 
 ### Gitignore
