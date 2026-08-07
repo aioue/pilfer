@@ -1,4 +1,4 @@
-# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+# GNU General Public License v3.0+ (see PILFER_LICENSE.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
 """In-place handling of ansible-vault encrypt_string (!vault) blobs."""
 
 from __future__ import annotations

@@ -44,17 +44,6 @@ pilfer = "pilfer.cli:main"
 where = ["."]
 include = ["pilfer*"]
 
-[tool.setuptools.package-data]
-pilfer = ["py.typed"]
-
-[tool.black]
-line-length = 100
-target-version = ["py310"]
-
-[tool.isort]
-profile = "black"
-line_length = 100
-
 [tool.bandit]
 exclude_dirs = ["tests", ".venv", "build", "dist"]
 # Intentional best-effort cleanup paths (same policy as ruff SIM105 ignore).

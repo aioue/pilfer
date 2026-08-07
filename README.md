@@ -353,14 +353,10 @@ fi
 
 ## License
 
-This project is licensed under the GNU General Public License v3 or later (GPLv3+). See the [LICENSE](../LICENSE) file for the complete license text from the [official GNU website](https://www.gnu.org/licenses/gpl-3.0.txt).
+This project is licensed under the GNU General Public License v3 or later (GPLv3+). See [`PILFER_LICENSE.txt`](PILFER_LICENSE.txt) for the complete license text, or the [official GNU website](https://www.gnu.org/licenses/gpl-3.0.txt).
 
-### Packaging Note
+Due to a compatibility issue between modern setuptools (which supports SPDX license expressions) and PyPI's current metadata validation (which doesn't yet support the new format), the license file is named `PILFER_LICENSE.txt` rather than `LICENSE` to avoid auto-detection issues during packaging.
 
-Due to a compatibility issue between modern setuptools (which supports SPDX license expressions) and PyPI's current metadata validation (which doesn't yet support the new format), the license file is renamed to `PILFER_LICENSE.txt` during packaging to avoid auto-detection issues. This is a temporary workaround until PyPI updates its metadata validation to support the newer standards.
+## Credits
 
-This package heavily borrows from the excellent, but no longer supported [Ansible Toolkit](https://github.com/dellis23/ansible-toolkit).
-
-# Credits
-
-- Borrows heavily from the excellent, but no longer supported [Ansible Toolkit](https://github.com/dellis23/ansible-toolkit).
+Borrows heavily from the excellent, but no longer supported [Ansible Toolkit](https://github.com/dellis23/ansible-toolkit).

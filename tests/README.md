@@ -68,7 +68,7 @@ When all tests pass, you should see:
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.10+
 - `ansible` package (for VaultLib)
 - Both `pilfer.py` and `pilfer/cli.py` present in the pilfer directory
 

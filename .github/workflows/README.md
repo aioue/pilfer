@@ -9,6 +9,7 @@ This directory contains automated workflows for the pilfer project.
 Fast, essential testing on every push and pull request.
 
 - Python 3.12 on Ubuntu
+- Ruff lint
 - Unified test suite
 - Standalone `pilfer.py --version` check
 
@@ -17,7 +18,7 @@ Fast, essential testing on every push and pull request.
 Thorough validation for larger changes and pre-release checks.
 
 - Multi-Python matrix (3.10–3.13)
-- Black, isort, and flake8
+- Ruff lint
 - Bandit (`-ll`, fails on medium+; SARIF uploaded to Security)
 - Coverage reports uploaded as artifacts
 
@@ -129,10 +130,8 @@ Trusted publishing uses OIDC (`id-token: write`) - no long-lived PyPI API token 
 # Quick test (same as ci.yml)
 cd tests && python run_tests.py
 
-# Code formatting
-black --check pilfer/ pilfer.py tests/
-isort --check-only pilfer/ pilfer.py tests/
-flake8 pilfer/ pilfer.py tests/ --max-line-length=100
+# Lint (same as ci.yml / test.yml)
+ruff check pilfer/ pilfer.py tests/
 
 # Security scanning
 pip install "bandit[toml]"
