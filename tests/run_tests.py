@@ -50,6 +50,10 @@ def main():
                 "TestPilferCLI",
                 "TestPilferStandalone",
                 "TestCompatibility",
+                "TestSessionSafety",
+                "TestInlineVault",
+                "TestDiscoveryOptimizations",
+                "TestInlineUnit",
                 "TestVersion",
             ],
         ),
@@ -97,6 +101,8 @@ def main():
         print("   ✓ Hash consistency maintained for unchanged files")
         print("   ✓ Line endings preserved during re-encryption")
         print("   ✓ Modified file detection working properly")
+        print("   ✓ Session safety / fail-closed close regressions covered")
+        print("   ✓ Inline encrypt_string (!vault) open/close covered")
         return 0
     else:
         print(f"\n❌ {total_failures + total_errors} test(s) failed!")

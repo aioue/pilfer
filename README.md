@@ -5,13 +5,9 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-Decrypt *all* ansible vault files in a project recursively for search/editing, then re-encrypt them all at once when you're done.
+Decrypt *all* ansible vault files in a project in-place recursively for viewing/editing, then re-encrypt them all at once when you're done.
 
-Borrows heavily from the excellent, but no longer supported [Ansible Toolkit](https://github.com/dellis23/ansible-toolkit).
-
-**Updated for Python 3 compatibility with modern features and ansible.cfg integration.**
-
-Tested with Ansible v2.18.x and Python 3.12.x
+Optionally decrypt/re-encrypt all [encrypted variables](https://docs.ansible.com/projects/ansible/latest/vault_guide/vault_encrypting_content.html) in-place.
 
 ## Features
 
@@ -21,19 +17,22 @@ Tested with Ansible v2.18.x and Python 3.12.x
 - **Safe operation** - Preserves original encrypted content for unchanged files
 - **No third-party dependencies** - Uses Ansible's official vault implementation directly
 - **Binary data preservation** - Preserves exact line endings and formatting (critical for certificates)
+- **Inline `encrypt_string` support** - Opt-in via `pilfer open --include-encrypted-vars`; decrypts YAML `!vault` scalars in place (with `# pilfer:vault:N` markers); `close` always re-encrypts whatever the session opened
+- **Fail-closed sessions** - Refuses double-`open`, keeps session state if `close` partially fails, non-zero exit codes on errors
 
 ## Usage
 ```
-pilfer [open|close] [-p VAULT_PASSWORD_FILE]
+pilfer [open|close] [-p VAULT_PASSWORD_FILE] [--include-encrypted-vars]
 ```
 
 ### Basic Usage
 
-**Option 1: Standalone Script (No Installation)**
-- Download `pilfer.py` and place it in your Ansible project directory
-- Run `python pilfer.py open` to decrypt all vaulted files recursively
+**Option 1: From a clone (no pipx)**
+- Clone this repository (or install editable: `pip install -e .`)
+- From your Ansible project directory, run `python /path/to/pilfer/pilfer.py open`
 - Edit/search plaintext as needed
-- Run `python pilfer.py close` to re-encrypt any changed files
+- Run `python /path/to/pilfer/pilfer.py close` to re-encrypt any changed files
+- `pilfer.py` is a thin entry point; the implementation lives in the `pilfer/` package
 
 **Option 2: Installed via pipx (Recommended)**
 - Install pilfer via pipx: `pipx install pilfer`
@@ -43,15 +42,56 @@ pilfer [open|close] [-p VAULT_PASSWORD_FILE]
 
 Any unchanged files will be returned to their original state.
 
+### Inline encrypted variables (`encrypt_string` / `!vault`)
+
+Whole-file vaults are opened by default. Inline `!vault` scalars are **opt-in**:
+
+```bash
+# Open whole-file vaults AND inline encrypt_string values
+pilfer open --include-encrypted-vars
+
+# Edit values in place. pilfer rewrites each !vault block like:
+#   db_password: "the-secret"  # pilfer:vault:0
+#
+# Do NOT remove the `# pilfer:vault:N` comment - close uses it to find
+# and re-encrypt each value. Do NOT commit while those markers are present
+# (plaintext secrets + session metadata would land in git).
+
+pilfer close   # no flag needed; re-encrypts everything this session opened
+```
+
+`close` always re-encrypts session entries (whole-file and inline). The
+`--include-encrypted-vars` flag is only meaningful on `open`.
+
+If you delete an entire opened variable line (key + value + marker), `close`
+treats that as intentional removal and prints:
+
+```text
+🔍 Detected removal of 1 encrypted vars:
+  - db_password
+```
+
+Do not strip only the `# pilfer:vault:N` comment while leaving the key - close
+will refuse so plaintext is not stranded. Renaming the key and dropping the
+marker is also refused if the secret value is still present in the file.
+
+**Safety notes**
+- Never commit while a session is open. Add `vaultedFileList.json` and `.vault/` to your project's `.gitignore`.
+- Never commit files that still contain `# pilfer:vault:N` markers - that means the session is still open.
+- `pilfer open` refuses if a session is already open (prevents destroying encrypted backups).
+- `pilfer close` keeps the session and exits non-zero if any file fails - check the exit code in scripts.
+- Leave `# pilfer:vault:N` markers in place until `close`; removing them makes close fail closed (session kept).
+
+
 ### Vault Password File Detection
 
 The script automatically detects your vault password file in this order:
 
 1. **Command line argument**: `-p /path/to/vault/file`
 2. **ansible.cfg**: Reads `vault_password_file` from `[defaults]` section
-3. **Common locations**: 
+3. **Common locations**:
    - `~/.ansible-vault/.vault-file`
-   - `../../vault_password_file` 
+   - `../../vault_password_file`
    - `.vault_password`
    - `vault_password_file`
 
@@ -65,7 +105,10 @@ pilfer open
 # Specify custom vault password file
 pilfer open -p ~/.my-vault-password
 
-# Close and re-encrypt modified files
+# Also decrypt inline !vault / encrypt_string values
+pilfer open --include-encrypted-vars
+
+# Close and re-encrypt modified files (and any opened inline vars)
 pilfer close
 ```
 
@@ -76,6 +119,9 @@ python pilfer.py open
 
 # Specify custom vault password file
 python pilfer.py open -p ~/.my-vault-password
+
+# Also decrypt inline !vault / encrypt_string values
+python pilfer.py open --include-encrypted-vars
 
 # Close and re-encrypt modified files
 python pilfer.py close
@@ -214,3 +260,7 @@ This project is licensed under the GNU General Public License v3 or later (GPLv3
 Due to a compatibility issue between modern setuptools (which supports SPDX license expressions) and PyPI's current metadata validation (which doesn't yet support the new format), the license file is renamed to `PILFER_LICENSE.txt` during packaging to avoid auto-detection issues. This is a temporary workaround until PyPI updates its metadata validation to support the newer standards.
 
 This package heavily borrows from the excellent, but no longer supported [Ansible Toolkit](https://github.com/dellis23/ansible-toolkit).
+
+# Credits
+
+- Borrows heavily from the excellent, but no longer supported [Ansible Toolkit](https://github.com/dellis23/ansible-toolkit).
