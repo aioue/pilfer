@@ -15,7 +15,7 @@ Optionally decrypt/re-encrypt all [encrypted variables](https://docs.ansible.com
 
 ## Output
 
-Example session: open with inline vault vars (and `--quiet` to hide nested git repo skips), edit files, then close. GitHub does not render ANSI colours in fenced code blocks, so the screenshot-style SVG below matches a VS Code/Cursor terminal (prompt colours + emoji status lines):
+Example session:
 
 ![Example pilfer open and close session](docs/pilfer-session.svg)
 
