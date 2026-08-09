@@ -4,15 +4,8 @@ name: pilfer CodeQL config
 paths-ignore:
   - tests
 
-# Default setup needs an explicit suite before query-filters apply (paths-ignore alone
-# is picked up without this). Exclude vault-CLI false positives:
-# - session binding SHA-256 digest, not credential storage
-# - rotate success logs file paths only, never password file contents
-queries:
-  - uses: security-and-quality
-
-query-filters:
-  - exclude:
-      id: py/weak-sensitive-data-hashing
-  - exclude:
-      id: py/clear-text-logging-sensitive-data
+# Suppress known vault-CLI false positives in pilfer/cli.py via line-before comments:
+#   # codeql[py/weak-sensitive-data-hashing]
+#   # codeql[py/clear-text-logging-sensitive-data]
+# (Inline/end-of-line codeql[...] is ignored; GitHub default setup does not apply
+# query-filters from this file.)

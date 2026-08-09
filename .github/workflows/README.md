@@ -28,7 +28,7 @@ CodeQL runs via GitHub's default code scanning setup (managed workflow, not a re
 
 - Runs on push, pull request, and schedule
 - Results appear in the repository Security tab
-- Config: [`.github/codeql/codeql-config.yml`](../codeql/codeql-config.yml) (`paths-ignore: tests`; query-filters for vault-CLI false positives)
+- Config: [`.github/codeql/codeql-config.yml`](../codeql/codeql-config.yml) (`paths-ignore: tests`; line-before `# codeql[...]` suppressions in `cli.py`)
 - Complements Bandit (Python-specific rules) in `test.yml`
 
 ### `release.yml` - Release and PyPI publish
