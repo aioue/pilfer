@@ -153,7 +153,7 @@ def _resolve_password_file(vault_password_file_path=None):
 
 def _password_fingerprint(passphrase: str) -> str:
     """SHA-256 fingerprint for open/close session binding (not credential storage)."""
-    return hashlib.sha256(passphrase.encode("utf-8")).hexdigest()
+    return hashlib.sha256(passphrase.encode("utf-8")).hexdigest()  # noqa: session binding only
 
 
 def _load_password(vault_password_file_path=None):
@@ -1326,8 +1326,8 @@ def _log_vault_password_file_rotated(
     install_at: str, backup_path: str, source_path: str
 ) -> None:
     """Log path-only rotate success (never vault password file contents)."""
-    print(
-        f"ℹ️  Vault password file rotated: archived {install_at} as {backup_path}; "
+    print(  # noqa: path-only status line
+        f"ℹ️  Rotated vault passphrase file: archived {install_at} as {backup_path}; "
         f"installed contents from {source_path} to {install_at}"
     )
 
