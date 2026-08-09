@@ -13,6 +13,29 @@ Walkthrough: [Bulk edit Ansible vault files with pilfer](https://aioue.net/2026/
 
 Optionally decrypt/re-encrypt all [encrypted variables](https://docs.ansible.com/projects/ansible/latest/vault_guide/vault_encrypting_content.html) in-place, or re-key an entire tree after a password exposure.
 
+## Output
+
+Example session: open with inline vault vars (and `--quiet` to hide nested git repo skips), edit files, then close. GitHub does not render ANSI colours in fenced code blocks, so the screenshot-style SVG below matches a VS Code/Cursor terminal (prompt colours + emoji status lines):
+
+![Example pilfer open and close session](docs/pilfer-session.svg)
+
+<details>
+<summary>Plain-text transcript</summary>
+
+```text
+$ pilfer open --include-encrypted-vars --quiet
+🔓 Searching for and decrypting vault files...
+ℹ️  Found 4 vault target(s) (3 whole-file, 1 with inline encrypt_string)
+✅ All vault files decrypted. Edit as needed, then run 'pilfer close' to re-encrypt.
+$ pilfer close
+🔒 Re-encrypting vault files...
+ℹ️  Re-encrypting modified file: inventory/group_vars/all/secrets.yml
+ℹ️  Re-encrypting modified inline vault string(s) in: inventory/group_vars/all/all.yml (1 changed)
+✅ Vault files re-encrypted. 2 modified files have been updated.
+```
+
+</details>
+
 ## Quick start
 
 Requires **Python 3.10+** and **Ansible** on `PATH`.

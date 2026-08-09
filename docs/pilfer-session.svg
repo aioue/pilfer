@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="228" viewBox="0 0 920 228" role="img" aria-label="Example pilfer open and close terminal session">
+  <title>Example pilfer open and close session</title>
+  <rect width="100%" height="100%" fill="#1e1e1e"/>
+  <style>
+    .mono { font-family: ui-monospace, 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace; font-size: 13px; }
+    .prompt-user { fill: #4ec9b0; }
+    .prompt-arrow { fill: #89d185; }
+    .prompt-path { fill: #569cd6; }
+    .prompt-branch { fill: #dcdcaa; }
+    .prompt-rest { fill: #d4d4d4; }
+    .output { fill: #d4d4d4; }
+    .bold { font-weight: 700; }
+  </style>
+  <text class="mono" x="12" y="22">
+    <tspan class="prompt-user">vscode</tspan><tspan class="prompt-rest"> </tspan><tspan class="prompt-arrow">➜</tspan><tspan class="prompt-rest"> </tspan><tspan class="prompt-path">your-ansible-project</tspan><tspan class="prompt-rest"> </tspan><tspan class="prompt-branch">(main)</tspan><tspan class="prompt-rest"> $ pilfer open --include-encrypted-vars --quiet</tspan>
+  </text>
+  <text class="mono output" x="12" y="46">🔓 Searching for and decrypting vault files...</text>
+  <text class="mono output" x="12" y="70">ℹ️  Found 4 vault target(s) (3 whole-file, 1 with inline encrypt_string)</text>
+  <text class="mono output" x="12" y="94">
+    <tspan>✅ All vault files decrypted. Edit as needed, then run '</tspan>
+    <tspan class="bold">pilfer close</tspan>
+    <tspan>' to re-encrypt.</tspan>
+  </text>
+  <text class="mono" x="12" y="118">
+    <tspan class="prompt-user">vscode</tspan><tspan class="prompt-rest"> </tspan><tspan class="prompt-arrow">➜</tspan><tspan class="prompt-rest"> </tspan><tspan class="prompt-path">your-ansible-project</tspan><tspan class="prompt-rest"> </tspan><tspan class="prompt-branch">(main)</tspan><tspan class="prompt-rest"> $ pilfer close</tspan>
+  </text>
+  <text class="mono output" x="12" y="142">🔒 Re-encrypting vault files...</text>
+  <text class="mono output" x="12" y="166">ℹ️  Re-encrypting modified file: inventory/group_vars/all/secrets.yml</text>
+  <text class="mono output" x="12" y="190">ℹ️  Re-encrypting modified inline vault string(s) in: inventory/group_vars/all/all.yml (1 changed)</text>
+  <text class="mono output" x="12" y="214">✅ Vault files re-encrypted. 2 modified files have been updated.</text>
+</svg>

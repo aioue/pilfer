@@ -859,7 +859,7 @@ def _recrypt_whole_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> b
             print(f"ℹ️  Already re-encrypted (retrying close): {vaulted_file_path}")
             return True
         new_encrypted_data = vault.encrypt(new_data_bytes)
-        print(f"Re-encrypting modified file: {vaulted_file_path}")
+        print(f"ℹ️  Re-encrypting modified file: {vaulted_file_path}")
         modified = True
     else:
         new_encrypted_data = old_encrypted_data
@@ -959,7 +959,7 @@ def _recrypt_inline_file(
     if result.modified_count > len(result.removed_vars):
         changed = result.modified_count - len(result.removed_vars)
         print(
-            f"Re-encrypting modified inline vault string(s) in: {vaulted_file_path}"
+            f"ℹ️  Re-encrypting modified inline vault string(s) in: {vaulted_file_path}"
             f" ({changed} changed)"
         )
 
