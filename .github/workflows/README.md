@@ -127,9 +127,16 @@ Trusted publishing uses OIDC (`id-token: write`) - no long-lived PyPI API token 
 ## Local Development
 
 ```bash
+git clone https://github.com/aioue/pilfer.git
+cd pilfer
+pip install -e .
+pilfer --help
+
 # Quick test (same as ci.yml)
 cd tests && python run_tests.py
+```
 
+```bash
 # Lint (same as ci.yml / test.yml)
 ruff check pilfer/ pilfer.py tests/
 
@@ -137,8 +144,19 @@ ruff check pilfer/ pilfer.py tests/
 pip install "bandit[toml,sarif]"
 bandit -r pilfer/ pilfer.py -c pyproject.toml -ll
 
-# Release dry-run
+# Release dry-run (build only)
 python -m pip install build twine
 python -m build
 python -m twine check dist/*
+```
+
+Use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`) so release notes stay readable. Optional: `./scripts/release-notes.sh` before tagging.
+
+Manual publish when trusted publishing is unavailable:
+
+```bash
+pip install build twine
+chmod +x build_and_publish.sh
+./build_and_publish.sh test   # TestPyPI
+./build_and_publish.sh prod   # production PyPI
 ```

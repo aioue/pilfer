@@ -13,7 +13,7 @@ Optionally decrypt/re-encrypt all [encrypted variables](https://docs.ansible.com
 
 ## Quick start
 
-Requires **Python 3.10+** and **Ansible**.
+Requires **Python 3.10+** and **Ansible** on `PATH`.
 
 ```bash
 pipx install pilfer
@@ -25,18 +25,15 @@ pilfer close
 
 Unchanged files are restored to their original ciphertext automatically.
 
-## Install
+Add to `ansible.cfg` so you do not need `-p` on every run:
 
-```bash
-pipx install pilfer   # recommended
-pip install pilfer    # or direct pip
+```ini
+[defaults]
+vault_password_file = ~/.ansible-vault/.vault-file
 ```
-
-See [Installation](#installation) for standalone script, source install, and `ansible.cfg` setup.
 
 ## Features
 
-- **Python 3.10+** - Typed modern Python; CI covers 3.10–3.13
 - **ansible.cfg integration** - Automatically reads `vault_password_file` from your ansible.cfg
 - **Change detection** - Only re-encrypts files that were actually modified (using SHA256)
 - **Safe operation** - Preserves original encrypted content for unchanged files
@@ -46,26 +43,10 @@ See [Installation](#installation) for standalone script, source install, and `an
 - **Fail-closed sessions** - Refuses double-`open`, keeps session state if `close` partially fails, non-zero exit codes on errors
 
 ## Usage
+
 ```
 pilfer [open|close|rekey] [-p VAULT_PASSWORD_FILE] [--include-encrypted-vars] [--allow-removals]
 ```
-
-### Basic Usage
-
-**Option 1: From a clone (no pipx)**
-- Clone this repository (or install editable: `pip install -e .`)
-- From your Ansible project directory, run `python /path/to/pilfer/pilfer.py open`
-- Edit/search plaintext as needed
-- Run `python /path/to/pilfer/pilfer.py close` to re-encrypt any changed files
-- `pilfer.py` is a thin entry point; the implementation lives in the `pilfer/` package
-
-**Option 2: Installed via pipx (Recommended)**
-- Install pilfer via pipx: `pipx install pilfer`
-- Run `pilfer open` to decrypt all vaulted files recursively
-- Edit/search plaintext as needed
-- Run `pilfer close` to re-encrypt any changed files
-
-Any unchanged files will be returned to their original state.
 
 Re-key an entire tree (inline `!vault` included by default): `pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run`.
 
@@ -109,177 +90,18 @@ will refuse so plaintext is not stranded. Renaming the key and dropping the
 marker is also refused if the secret value is still present in the file
 (including in comments).
 
+### Vault password file
 
-### Vault Password File Detection
-
-The script automatically detects your vault password file in this order:
-
-1. **Command line argument**: `-p /path/to/vault/file`
-2. **ansible.cfg**: Reads `vault_password_file` from `[defaults]` section
-3. **Common locations**:
-   - `~/.ansible-vault/.vault-file`
-   - `../../vault_password_file`
-   - `.vault_password`
-   - `vault_password_file`
+Pilfer finds the vault password in this order: `-p`, then `vault_password_file` in `ansible.cfg`, then common paths (`~/.ansible-vault/.vault-file`, `.vault_password`, and others).
 
 ### Examples
 
-**Using the installed version:**
 ```bash
-# Use ansible.cfg vault_password_file setting (recommended)
 pilfer open
-
-# Specify custom vault password file
 pilfer open -p ~/.my-vault-password
-
-# Also decrypt inline !vault / encrypt_string values
 pilfer open --include-encrypted-vars
-
-# Close and re-encrypt modified files (and any opened inline vars)
 pilfer close
 ```
-
-**Using the standalone script:**
-```bash
-# Use ansible.cfg vault_password_file setting (recommended)
-python pilfer.py open
-
-# Specify custom vault password file
-python pilfer.py open -p ~/.my-vault-password
-
-# Also decrypt inline !vault / encrypt_string values
-python pilfer.py open --include-encrypted-vars
-
-# Close and re-encrypt modified files
-python pilfer.py close
-```
-
-## Installation
-
-### Option 1: Standalone Script (No Installation Required)
-
-Download and use the standalone script directly:
-
-```bash
-# Download the standalone script
-curl -O https://raw.githubusercontent.com/aioue/pilfer/main/pilfer.py
-
-# Make it executable (required for ./pilfer.py usage)
-chmod +x pilfer.py
-
-# Use it directly
-./pilfer.py open
-# OR
-python pilfer.py open
-```
-
-### Option 2: Install via pipx (Recommended for Regular Use)
-
-**Python 3.10+** is required. Install pilfer using pipx for isolated CLI tool management:
-
-```bash
-# Install pilfer via pipx (recommended)
-pipx install pilfer
-
-# Verify installation
-pilfer --help
-```
-
-### Alternative Installation Methods
-
-If you prefer other installation methods:
-
-```bash
-# Install from source (in development mode)
-git clone https://github.com/aioue/pilfer.git
-cd pilfer
-pip install -e .
-
-# Direct pip installation (not recommended for CLI tools)
-pip install pilfer
-```
-
-### Requirements
-
-Pilfer requires **Ansible** to be available. If not already installed:
-
-```bash
-# Using pipx (recommended for CLI tools)
-pipx install ansible
-
-# Using pip
-pip install ansible
-
-# System package manager
-# Ubuntu/Debian:
-sudo apt update && sudo apt install ansible
-
-# RHEL/CentOS/Fedora:
-sudo dnf install ansible
-
-# macOS:
-brew install ansible
-```
-
-### ansible.cfg Setup (Recommended)
-
-Add to your `ansible.cfg`:
-```ini
-[defaults]
-vault_password_file = ~/.ansible-vault/.vault-file
-```
-
-This eliminates the need to manually configure vault password paths.
-
-## Development and Publishing
-
-### For Developers
-
-To set up for development:
-
-```bash
-# Clone the repository
-git clone https://github.com/aioue/pilfer.git
-cd pilfer
-
-# Install in development mode
-pip install -e .
-
-# Make changes and test
-pilfer --help
-```
-
-### Publishing to PyPI
-
-**Recommended:** use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`) so auto-generated release notes stay readable. Bump the version in `pyproject.toml`, `pilfer/__init__.py`, and `pilfer.py`, then commit, push, and tag:
-
-```bash
-# Bump version in pyproject.toml, pilfer/__init__.py, and pilfer.py first
-git commit -am "chore(release): X.Y.Z"
-git push origin master
-git tag vX.Y.Z
-git push origin vX.Y.Z
-
-# Optional: preview notes locally before tagging
-./scripts/release-notes.sh
-```
-
-The [Release workflow](.github/workflows/release.yml) validates versions, runs tests, creates a GitHub release (summary + auto-generated notes since the previous tag), and publishes to PyPI via trusted publishing. See [.github/workflows/README.md](.github/workflows/README.md) for one-time PyPI setup.
-
-**Manual fallback** (TestPyPI or local publish):
-
-```bash
-pip install build twine
-chmod +x build_and_publish.sh
-./build_and_publish.sh test   # TestPyPI
-./build_and_publish.sh prod   # production PyPI
-```
-
-The build script will:
-1. Clean previous builds
-2. Build the package using modern Python packaging
-3. Upload to PyPI/TestPyPI using twine
-4. Provide installation instructions
 
 ## Rotating the vault password
 
@@ -374,10 +196,10 @@ fi
 
 ## License
 
-This project is licensed under the GNU General Public License v3 or later (GPLv3+). See [`PILFER_LICENSE.txt`](PILFER_LICENSE.txt) for the complete license text, or the [official GNU website](https://www.gnu.org/licenses/gpl-3.0.txt).
-
-The package declares `GPL-3.0-or-later` in metadata; the license file is named `PILFER_LICENSE.txt` to avoid setuptools auto-detection clashes during builds.
+GPLv3+. See [`PILFER_LICENSE.txt`](PILFER_LICENSE.txt).
 
 ## Credits
 
 Borrows heavily from the excellent, but no longer supported [Ansible Toolkit](https://github.com/dellis23/ansible-toolkit).
+
+Maintainers: development setup, releases, and CI details in [`.github/workflows/README.md`](.github/workflows/README.md).
