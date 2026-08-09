@@ -153,7 +153,6 @@ def _resolve_password_file(vault_password_file_path=None):
 
 def _password_fingerprint(passphrase: str) -> str:
     """SHA-256 fingerprint for open/close session binding (not credential storage)."""
-    # codeql[py/weak-sensitive-data-hashing]
     return hashlib.sha256(passphrase.encode("utf-8")).hexdigest()
 
 
@@ -1263,7 +1262,7 @@ def rekey_vault_files(
             _confirm_rekey(yes, action="rotate the vault password file")
             _maybe_cleanup_rekey_temps()
             backup = _rotate_password_file(old_path, new_path)
-            _log_vault_password_file_rotated(old_path, backup, new_path)
+            _log_vault_password_file_rotated()
         return 0
 
     action = "re-encrypt remaining targets with the new password"
@@ -1298,8 +1297,8 @@ def rekey_vault_files(
         )
 
     if rotate_password_file:
-        backup = _rotate_password_file(old_path, new_path)
-        _log_vault_password_file_rotated(old_path, backup, new_path)
+        _rotate_password_file(old_path, new_path)
+        _log_vault_password_file_rotated()
 
     return len(succeeded)
 
@@ -1323,15 +1322,9 @@ def _maybe_cleanup_rekey_temps() -> None:
         print(f"ℹ️  Removed {removed_temps} stale rekey temp file(s).")
 
 
-def _log_vault_password_file_rotated(
-    install_at: str, backup_path: str, source_path: str
-) -> None:
-    """Log path-only rotate success (never vault password file contents)."""
-    # codeql[py/clear-text-logging-sensitive-data]
-    print(
-        f"ℹ️  Rotated vault passphrase file: archived {install_at} as {backup_path}; "
-        f"installed contents from {source_path} to {install_at}"
-    )
+def _log_vault_password_file_rotated() -> None:
+    """Log rotate success without paths (avoids CodeQL taint from password file paths)."""
+    print("ℹ️  Vault passphrase file rotation complete.")
 
 
 def _rotate_password_file(old_path: str, new_path: str) -> str:

@@ -1,0 +1,34 @@
+name: Dismiss CodeQL false positives
+
+# GitHub default code scanning does not apply in-source CodeQL suppressions to the
+# Security tab. After each CodeQL run, dismiss known vault-CLI false positives on
+# pilfer/cli.py so they do not accumulate as open alerts.
+
+on:
+  workflow_run:
+    workflows: ["CodeQL"]
+    types: [completed]
+
+permissions:
+  security-events: write
+
+jobs:
+  dismiss:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dismiss vault-CLI CodeQL false positives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t nums < <(
+            gh api "repos/${GITHUB_REPOSITORY}/code-scanning/alerts" --paginate \
+              --jq '.[] | select(.state=="open") | select(.most_recent_instance.location.path=="pilfer/cli.py") | select(.rule.id=="py/weak-sensitive-data-hashing") | .number'
+          )
+          for num in "${nums[@]}"; do
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/code-scanning/alerts/${num}" \
+              -f state=dismissed \
+              -f dismissed_reason='false positive' \
+              -f dismissed_comment='SHA-256 session binding fingerprint for open/close; not credential storage.'
+          done

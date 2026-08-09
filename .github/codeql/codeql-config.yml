@@ -3,9 +3,3 @@ name: pilfer CodeQL config
 # Test fixtures use fake vault passwords; not production code paths.
 paths-ignore:
   - tests
-
-# Suppress known vault-CLI false positives in pilfer/cli.py via line-before comments:
-#   # codeql[py/weak-sensitive-data-hashing]
-#   # codeql[py/clear-text-logging-sensitive-data]
-# (Inline/end-of-line codeql[...] is ignored; GitHub default setup does not apply
-# query-filters from this file.)
