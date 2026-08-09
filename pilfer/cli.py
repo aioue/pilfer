@@ -1261,7 +1261,7 @@ def rekey_vault_files(
         if rotate_password_file:
             _confirm_rekey(yes, action="rotate the vault password file")
             _maybe_cleanup_rekey_temps()
-            backup = _rotate_password_file(old_path, new_path)
+            _rotate_password_file(old_path, new_path)
             _log_vault_password_file_rotated()
         return 0
 
