@@ -70,8 +70,16 @@ vault_password_file = ~/.ansible-vault/.vault-file
 ## Usage
 
 ```
-pilfer [open|close|rekey] [-p VAULT_PASSWORD_FILE] [--include-encrypted-vars] [--allow-removals] [-q] [--version]
+pilfer [--version] COMMAND ...
+
+Commands: open | close | rekey
+
+pilfer open [--include-encrypted-vars] [-q] [-p VAULT_PASSWORD_FILE]
+pilfer close [--allow-removals] [-p VAULT_PASSWORD_FILE]
+pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW [options]
 ```
+
+Run `pilfer --help` or `pilfer COMMAND --help` for full options and examples.
 
 Re-key an entire tree (inline `!vault` included by default): `pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run`.
 

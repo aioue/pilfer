@@ -1367,103 +1367,177 @@ def _rotate_password_file(old_path: str, new_path: str) -> str:
     return backup
 
 
-def main(argv=None):
-    """Main CLI entry point for pilfer"""
-    parser = argparse.ArgumentParser(
-        prog="pilfer",
-        description=(
-            "Decrypt all ansible vault files in a project recursively for "
-            "search/editing, then re-encrypt when done. Optionally also open "
-            "inline encrypt_string (!vault) scalars, or rekey the tree."
-        ),
-        epilog="""
-Examples:
-  pilfer open                           # Whole-file vaults only
-  pilfer open --include-encrypted-vars  # Also decrypt inline !vault strings
-  pilfer open -p ~/.vault-pass
-  pilfer close                          # Re-encrypt everything the session opened
-  pilfer close --allow-removals         # Confirm intentional var deletions
-  pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run
+_HELP_FORMATTER = argparse.RawDescriptionHelpFormatter
 
-Inline !vault strings (with --include-encrypted-vars) are replaced with quoted
-plaintext plus a `# pilfer:vault:N` marker - leave the marker until close.
-Close always re-encrypts every entry recorded in the session (no flag needed).
+_HELP_EPILOG = """
+Vault password: -p PATH, else vault_password_file in ansible.cfg, else common
+default paths (~/.ansible-vault/.vault-file, .vault_password, and others).
 
 Never commit while a session is open. Add vaultedFileList.json, .vault/, and
-**/*.pilfer-open to your project's .gitignore. Check the exit code of close.
-        """,
-    )
-    parser.add_argument(
-        "action",
-        choices=["open", "close", "rekey"],
-        help=(
-            "'open' to decrypt, 'close' to re-encrypt session entries, "
-            "'rekey' to rotate vault password across the tree"
+*.pilfer-open sidecars to your project's .gitignore. Check the exit code of close.
+
+Run 'pilfer COMMAND --help' for command-specific options and examples.
+"""
+
+_OPEN_EPILOG = """
+Examples:
+  pilfer open
+  pilfer open --include-encrypted-vars
+  pilfer open --include-encrypted-vars --quiet
+  pilfer open -p ~/.ansible-vault/.vault-file
+
+Whole-file vault YAML is opened by default. With --include-encrypted-vars, inline
+!vault / encrypt_string scalars become quoted plaintext plus a # pilfer:vault:N
+marker (leave the marker until close).
+"""
+
+_CLOSE_EPILOG = """
+Examples:
+  pilfer close
+  pilfer close --allow-removals
+  pilfer close -p ~/.ansible-vault/.vault-file
+
+Re-encrypts every entry recorded in the open session (whole-file and inline).
+No --include-encrypted-vars flag is needed on close.
+"""
+
+_REKEY_EPILOG = """
+Examples:
+  pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run
+  pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --yes
+  pilfer rekey ... --quiet
+
+Inline !vault spans are included by default; pass --no-include-encrypted-vars for
+whole-file vault YAML only.
+"""
+
+
+def _build_argument_parser():
+    """Build the pilfer CLI parser (subcommands: open, close, rekey)."""
+    parser = argparse.ArgumentParser(
+        prog="pilfer",
+        formatter_class=_HELP_FORMATTER,
+        description=(
+            "Bulk decrypt Ansible vault files in a project tree for editing, then "
+            "re-encrypt when done."
         ),
+        epilog=_HELP_EPILOG,
     )
-    parser.add_argument(
+    parser.add_argument("--version", action="version", version=f"pilfer {__version__}")
+
+    subparsers = parser.add_subparsers(
+        dest="action",
+        metavar="COMMAND",
+        required=True,
+        title="commands",
+        description="valid commands",
+    )
+
+    open_parser = subparsers.add_parser(
+        "open",
+        formatter_class=_HELP_FORMATTER,
+        help="decrypt vault targets for editing",
+        description="Decrypt whole-file vault YAML (and optionally inline !vault scalars).",
+        epilog=_OPEN_EPILOG,
+    )
+    open_parser.add_argument(
         "-p",
         "--vault-password-file",
         type=str,
-        help="Path to vault password file (open/close)",
+        help="Path to vault password file (default: ansible.cfg or common paths)",
     )
-    parser.add_argument(
+    open_parser.add_argument(
         "--include-encrypted-vars",
         action="store_true",
-        help=(
-            "On open: also decrypt inline !vault / encrypt_string scalars. "
-            "On rekey: included by default; pass --no-include-encrypted-vars to skip. "
-            "Ignored on close."
-        ),
+        help="Also decrypt inline !vault / encrypt_string scalars",
     )
-    parser.add_argument(
-        "--no-include-encrypted-vars",
-        action="store_true",
-        help="On rekey: only whole-file vaults (skip inline !vault spans).",
-    )
-    parser.add_argument(
-        "--allow-removals",
-        action="store_true",
-        help=(
-            "On close: allow intentional deletion of opened inline vars "
-            "(missing marker + key + secret)."
-        ),
-    )
-    parser.add_argument(
-        "--old-vault-password-file",
-        type=str,
-        help="Rekey: path to current vault password file",
-    )
-    parser.add_argument(
-        "--new-vault-password-file",
-        type=str,
-        help="Rekey: path to new vault password file",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Rekey: decrypt-check and print plan without writing",
-    )
-    parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="Rekey: skip interactive REKEY confirmation",
-    )
-    parser.add_argument(
-        "--rotate-password-file",
-        action="store_true",
-        help=(
-            "Rekey: after 100%% success, move old password file to *_old and "
-            "write the new password at the old path"
-        ),
-    )
-    parser.add_argument(
+    open_parser.add_argument(
         "-q",
         "--quiet",
         action="store_true",
-        help="Suppress nested git repo skip messages during open/rekey scans",
+        help="Suppress nested git repo skip messages during discovery",
     )
-    parser.add_argument("--version", action="version", version=f"pilfer {__version__}")
+
+    close_parser = subparsers.add_parser(
+        "close",
+        formatter_class=_HELP_FORMATTER,
+        help="re-encrypt everything this session opened",
+        description="Re-encrypt session entries (whole-file and inline).",
+        epilog=_CLOSE_EPILOG,
+    )
+    close_parser.add_argument(
+        "-p",
+        "--vault-password-file",
+        type=str,
+        help="Path to vault password file (must match the password used for open)",
+    )
+    close_parser.add_argument(
+        "--allow-removals",
+        action="store_true",
+        help=(
+            "Allow intentional deletion of opened inline vars "
+            "(missing marker + key + secret)"
+        ),
+    )
+
+    rekey_parser = subparsers.add_parser(
+        "rekey",
+        formatter_class=_HELP_FORMATTER,
+        help="rotate vault password across the tree",
+        description="Re-key whole-file and inline vault targets without an open session.",
+        epilog=_REKEY_EPILOG,
+    )
+    rekey_parser.add_argument(
+        "--old-vault-password-file",
+        required=True,
+        help="Path to current vault password file",
+    )
+    rekey_parser.add_argument(
+        "--new-vault-password-file",
+        required=True,
+        help="Path to new vault password file",
+    )
+    rekey_parser.add_argument(
+        "--include-encrypted-vars",
+        action="store_true",
+        help="Include inline !vault spans (default; same as omitting --no-include-encrypted-vars)",
+    )
+    rekey_parser.add_argument(
+        "--no-include-encrypted-vars",
+        action="store_true",
+        help="Only whole-file vault YAML (skip inline !vault spans)",
+    )
+    rekey_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Decrypt-check and print plan without writing",
+    )
+    rekey_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip interactive REKEY confirmation",
+    )
+    rekey_parser.add_argument(
+        "--rotate-password-file",
+        action="store_true",
+        help=(
+            "After 100%% success, move old password file to *_old and write the "
+            "new password at the old path"
+        ),
+    )
+    rekey_parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress nested git repo skip messages during discovery",
+    )
+
+    return parser
+
+
+def main(argv=None):
+    """Main CLI entry point for pilfer"""
+    parser = _build_argument_parser()
     args = parser.parse_args(argv)
 
     try:
@@ -1512,11 +1586,6 @@ Never commit while a session is open. Add vaultedFileList.json, .vault/, and
             return 0
 
         if args.action == "close":
-            if args.include_encrypted_vars:
-                print(
-                    "Note: --include-encrypted-vars is only used on open/rekey; "
-                    "close always re-encrypts session entries."
-                )
             print("🔒 Re-encrypting vault files...")
             if not _session_is_open():
                 print("No vault file list found. Run 'pilfer open' first.")
@@ -1532,10 +1601,6 @@ Never commit while a session is open. Add vaultedFileList.json, .vault/, and
             return 0
 
         if args.action == "rekey":
-            if not args.old_vault_password_file or not args.new_vault_password_file:
-                raise PilferError(
-                    "rekey requires --old-vault-password-file and " "--new-vault-password-file"
-                )
             include = not args.no_include_encrypted_vars
             # Allow explicit --include-encrypted-vars to win; default on.
             if args.include_encrypted_vars:
