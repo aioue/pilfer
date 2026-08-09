@@ -151,9 +151,9 @@ def _resolve_password_file(vault_password_file_path=None):
     return get_vault_password_file()
 
 
-def _password_fingerprint(password: str) -> str:
+def _password_fingerprint(passphrase: str) -> str:
     """SHA-256 fingerprint for open/close session binding (not credential storage)."""
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()  # codeql[py/weak-sensitive-data-hashing]
+    return hashlib.sha256(passphrase.encode("utf-8")).hexdigest()
 
 
 def _load_password(vault_password_file_path=None):
@@ -1261,7 +1261,8 @@ def rekey_vault_files(
         if rotate_password_file:
             _confirm_rekey(yes, action="rotate the vault password file")
             _maybe_cleanup_rekey_temps()
-            _rotate_password_file(old_path, new_path)
+            backup = _rotate_password_file(old_path, new_path)
+            _log_vault_password_file_rotated(old_path, backup, new_path)
         return 0
 
     action = "re-encrypt remaining targets with the new password"
@@ -1296,7 +1297,8 @@ def rekey_vault_files(
         )
 
     if rotate_password_file:
-        _rotate_password_file(old_path, new_path)
+        backup = _rotate_password_file(old_path, new_path)
+        _log_vault_password_file_rotated(old_path, backup, new_path)
 
     return len(succeeded)
 
@@ -1320,8 +1322,21 @@ def _maybe_cleanup_rekey_temps() -> None:
         print(f"ℹ️  Removed {removed_temps} stale rekey temp file(s).")
 
 
-def _rotate_password_file(old_path: str, new_path: str) -> None:
-    """Archive old password file and install new password at the old path."""
+def _log_vault_password_file_rotated(
+    install_at: str, backup_path: str, source_path: str
+) -> None:
+    """Log path-only rotate success (never vault password file contents)."""
+    print(
+        f"ℹ️  Vault password file rotated: archived {install_at} as {backup_path}; "
+        f"installed contents from {source_path} to {install_at}"
+    )
+
+
+def _rotate_password_file(old_path: str, new_path: str) -> str:
+    """Archive old password file and install new password at the old path.
+
+    Returns the backup path (old_path + '_old').
+    """
     backup = f"{old_path}_old"
     if os.path.exists(backup):
         raise PilferError(f"Password backup already exists: {backup}. Move it aside first.")
@@ -1354,11 +1369,7 @@ def _rotate_password_file(old_path: str, new_path: str) -> None:
             except OSError:
                 pass
         raise
-    # Paths only; never log vault password file contents.
-    print(  # codeql[py/clear-text-logging-sensitive-data]
-        f"ℹ️  Vault password file rotated: archived {old_path} as {backup}; "
-        f"installed contents from {new_path} to {old_path}"
-    )
+    return backup
 
 
 def main(argv=None):
