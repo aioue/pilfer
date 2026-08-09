@@ -50,8 +50,8 @@ keywords = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/aioue/pilfer"
-Documentation = "https://github.com/aioue/pilfer#readme"
+Homepage = "https://aioue.net/2026/08/07/pilfer-bulk-ansible-vault-edit/"
+Documentation = "https://aioue.net/2026/08/07/pilfer-bulk-ansible-vault-edit/"
 Repository = "https://github.com/aioue/pilfer"
 Issues = "https://github.com/aioue/pilfer/issues"
 Changelog = "https://github.com/aioue/pilfer/releases"
