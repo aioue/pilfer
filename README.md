@@ -45,7 +45,7 @@ vault_password_file = ~/.ansible-vault/.vault-file
 ## Usage
 
 ```
-pilfer [open|close|rekey] [-p VAULT_PASSWORD_FILE] [--include-encrypted-vars] [--allow-removals]
+pilfer [open|close|rekey] [-p VAULT_PASSWORD_FILE] [--include-encrypted-vars] [--allow-removals] [-q] [--version]
 ```
 
 Re-key an entire tree (inline `!vault` included by default): `pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run`.

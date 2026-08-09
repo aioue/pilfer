@@ -628,13 +628,20 @@ def assert_no_orphaned_open_state(scan: ProjectScan | None = None):
     )
 
 
-def discover_vaulted_files(include_encrypted_vars: bool = False):
+def discover_vaulted_files(
+    include_encrypted_vars: bool = False, *, announce_skips: bool = True
+):
     """Find vault targets without writing a session."""
-    return scan_project(include_encrypted_vars=include_encrypted_vars, announce_skips=True).targets
+    return scan_project(
+        include_encrypted_vars=include_encrypted_vars, announce_skips=announce_skips
+    ).targets
 
 
 def write_vaulted_file_list(
-    include_encrypted_vars: bool = False, password_sha256: str | None = None
+    include_encrypted_vars: bool = False,
+    password_sha256: str | None = None,
+    *,
+    announce_skips: bool = True,
 ):
     """Find vault targets and write the session list.
 
@@ -647,7 +654,9 @@ def write_vaulted_file_list(
     an unbound v2 session. Discovery-only callers may omit it (decrypt then
     rewrites the session with the fingerprint).
     """
-    found = discover_vaulted_files(include_encrypted_vars=include_encrypted_vars)
+    found = discover_vaulted_files(
+        include_encrypted_vars=include_encrypted_vars, announce_skips=announce_skips
+    )
     _write_session(found, password_sha256=password_sha256 or "")
     return found
 
@@ -1174,6 +1183,7 @@ def rekey_vault_files(
     dry_run: bool = False,
     yes: bool = False,
     rotate_password_file: bool = False,
+    announce_skips: bool = True,
 ) -> int:
     """Re-key whole-file and inline vault targets from old password to new.
 
@@ -1200,7 +1210,9 @@ def rekey_vault_files(
     if _password_fingerprint(old_password) == _password_fingerprint(new_password):
         raise PilferError("Old and new vault passwords are identical.")
 
-    scan = scan_project(include_encrypted_vars=include_encrypted_vars, announce_skips=True)
+    scan = scan_project(
+        include_encrypted_vars=include_encrypted_vars, announce_skips=announce_skips
+    )
     targets = scan.targets
     if not targets:
         print("No vault files found in current directory tree.")
@@ -1436,6 +1448,12 @@ Never commit while a session is open. Add vaultedFileList.json, .vault/, and
             "write the new password at the old path"
         ),
     )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress nested git repo skip messages during open/rekey scans",
+    )
     parser.add_argument("--version", action="version", version=f"pilfer {__version__}")
     args = parser.parse_args(argv)
 
@@ -1452,7 +1470,7 @@ Never commit while a session is open. Add vaultedFileList.json, .vault/, and
             # Single walk: orphan detection + discovery (nested skips once).
             scan = scan_project(
                 include_encrypted_vars=args.include_encrypted_vars,
-                announce_skips=True,
+                announce_skips=not args.quiet,
             )
             assert_no_orphaned_open_state(scan)
 
@@ -1521,6 +1539,7 @@ Never commit while a session is open. Add vaultedFileList.json, .vault/, and
                 dry_run=args.dry_run,
                 yes=args.yes,
                 rotate_password_file=args.rotate_password_file,
+                announce_skips=not args.quiet,
             )
             if not args.dry_run:
                 print(f"✅  Rekeyed {count} file(s).")

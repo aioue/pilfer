@@ -1109,6 +1109,28 @@ class TestScanOnce(unittest.TestCase):
             needle = f"Skipping nested git repo: {os.path.abspath(name)}"
             self.assertEqual(result.stdout.count(needle), 1, result.stdout)
 
+    def test_quiet_suppresses_nested_skip_messages(self):
+        for name in ("nested_a", "nested_b"):
+            os.makedirs(name)
+            with open(os.path.join(name, ".git"), "w") as f:
+                f.write("gitdir: ../.git\n")
+        result = subprocess.run(
+            [
+                sys.executable,
+                self.pilfer_script,
+                "open",
+                "-p",
+                "vault_pass",
+                "--quiet",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        combined = result.stdout + result.stderr
+        self.assertNotIn("Skipping nested git repo:", combined)
+
 
 class TestAllowRemovalsAndRekey(unittest.TestCase):
     def setUp(self):
