@@ -67,6 +67,26 @@ class RecryptInlineResult:
     removed_vars: list[str] = field(default_factory=list)
 
 
+class InlineCloseRefusal(Exception):
+    """Structured inline close failure for formatted CLI output."""
+
+
+@dataclass
+class MarkerMissingSecretPresent(InlineCloseRefusal):
+    """Opened marker gone but the secret is still present in the file."""
+
+    var_name: str
+    span_id: int
+
+
+@dataclass
+class SecretLineDeleted(InlineCloseRefusal):
+    """Opened secret line appears intentionally deleted."""
+
+    var_name: str
+    span_id: int
+
+
 def _line_start(content: bytes, index: int) -> int:
     nl = content.rfind(b"\n", 0, index)
     return 0 if nl < 0 else nl + 1
@@ -582,12 +602,12 @@ def recrypt_inline_content(
     content: bytes,
     span_records: list[dict],
     vault: VaultLib,
-    allow_removals: bool = False,
+    confirm_delete: bool = False,
 ) -> RecryptInlineResult:
     """Re-encrypt marked inline values.
 
     Missing markers whose YAML key was also deleted are treated as intentional
-    removals only when allow_removals is True and the secret value is gone too.
+    deletes only when confirm_delete is True and the secret value is gone too.
     Missing markers whose key remains, or whose plaintext still appears under
     another key, are errors.
     """
@@ -649,11 +669,7 @@ def recrypt_inline_content(
         record = records[span_id]
         name = var_name_from_prefix(record["line_prefix"])
         if _yaml_key_present(content, name):
-            raise ValueError(
-                f"Missing # pilfer:vault:{span_id} marker for {name!r}, but the key "
-                "is still present. Restore the marker comment (do not strip it) "
-                "before close."
-            )
+            raise MarkerMissingSecretPresent(name, span_id)
         plaintext = _original_plaintext_from_record(record, vault)
         if plaintext is None:
             raise ValueError(
@@ -663,25 +679,11 @@ def recrypt_inline_content(
                 "marker before close."
             )
         if plaintext_still_in_content(content, plaintext):
-            raise ValueError(
-                f"Missing # pilfer:vault:{span_id} marker for {name!r}, but the "
-                "opened secret value still appears in the file (possibly under a "
-                "renamed key, comment, or other YAML shape). Restore the marker on "
-                "the secret, or delete the secret value entirely before close."
-            )
+            raise MarkerMissingSecretPresent(name, span_id)
         if _plain_hash_still_present(content, record["plain_hash"]):
-            raise ValueError(
-                f"Missing # pilfer:vault:{span_id} marker for {name!r}, but the "
-                "opened secret value still appears in the file (possibly under a "
-                "renamed key). Restore the marker on the secret, or delete the "
-                "secret value entirely before close."
-            )
-        if not allow_removals:
-            raise ValueError(
-                f"Missing # pilfer:vault:{span_id} marker for {name!r} looks like "
-                "intentional removal of the variable. Pass --allow-removals on "
-                "'pilfer close' to confirm, or restore the marker/line."
-            )
+            raise MarkerMissingSecretPresent(name, span_id)
+        if not confirm_delete:
+            raise SecretLineDeleted(name, span_id)
         removed_vars.append(name)
 
     new_content = content

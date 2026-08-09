@@ -22,12 +22,17 @@ from ansible.parsing.vault import VaultLib, VaultSecret
 from pilfer import __version__
 from pilfer.inline import (
     MARKER_PREFIX,
+    InlineCloseRefusal,
+    MarkerMissingSecretPresent,
+    SecretLineDeleted,
     decrypt_inline_content,
     find_inline_vault_spans,
+    intentional_removal_candidate_names,
     is_whole_file_vault,
     normalize_whole_file_vault,
     recrypt_inline_content,
     unsafe_missing_marker_names,
+    var_name_from_prefix,
 )
 
 temp_vault_file_list_path = "vaultedFileList.json"
@@ -294,6 +299,46 @@ def _emit_warning_block(title: str, detail: str) -> None:
             continue
         print(part, file=sys.stderr)
         print(file=sys.stderr)
+
+
+def _emit_inline_close_refusal(file_path: str, exc: InlineCloseRefusal) -> None:
+    """Print structured inline close errors (marker missing vs secret line deleted)."""
+    if isinstance(exc, MarkerMissingSecretPresent):
+        print(f"⚠️  {file_path} — cannot close (marker missing)", file=sys.stderr)
+        print(f"  Variable:     {exc.var_name}", file=sys.stderr)
+        print(
+            f"  Problem:      # pilfer:vault:{exc.span_id} marker was removed but the "
+            "secret is still in the file.",
+            file=sys.stderr,
+        )
+        print(file=sys.stderr)
+        print(
+            "  Fix:          restore the marker comment on the value line, "
+            "then pilfer close",
+            file=sys.stderr,
+        )
+        return
+    if isinstance(exc, SecretLineDeleted):
+        print(f"⚠️  {file_path} — cannot close (secret line deleted)", file=sys.stderr)
+        print(
+            f"  Variable:     {exc.var_name}  (# pilfer:vault:{exc.span_id})",
+            file=sys.stderr,
+        )
+        print("  Problem:      opened inline secret was removed from the file.", file=sys.stderr)
+        print(file=sys.stderr)
+        print("  Confirm delete:  pilfer close --confirm-delete", file=sys.stderr)
+        print("  Undo:            restore the line, then pilfer close", file=sys.stderr)
+        return
+    raise TypeError(f"Unhandled inline close refusal: {exc!r}")
+
+
+def _inline_close_refusal_for_name(
+    var_name: str, span_records: list[dict]
+) -> InlineCloseRefusal | None:
+    for record in span_records:
+        if var_name_from_prefix(record["line_prefix"]) == var_name:
+            return SecretLineDeleted(var_name, int(record["id"]))
+    return None
 
 
 def _entry_has_open_artifacts(entry) -> bool:
@@ -871,11 +916,18 @@ def _recrypt_whole_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> b
     return modified
 
 
+def _marker_missing_refusal(var_name: str, span_records: list[dict]) -> MarkerMissingSecretPresent:
+    for record in span_records:
+        if var_name_from_prefix(record["line_prefix"]) == var_name:
+            return MarkerMissingSecretPresent(var_name, int(record["id"]))
+    return MarkerMissingSecretPresent(var_name, 0)
+
+
 def _recrypt_inline_file(
     vaulted_file_path: str,
     password: str,
     cwd: Path,
-    allow_removals: bool = False,
+    confirm_delete: bool = False,
 ) -> bool:
     """Re-encrypt inline spans. Returns True if any span was modified/removed.
 
@@ -925,21 +977,12 @@ def _recrypt_inline_file(
         check_vault = _make_vault(password, vault_ids)
         unsafe = unsafe_missing_marker_names(current, spans, check_vault)
         if unsafe:
-            raise PilferError(
-                "Missing # pilfer:vault markers but opened secrets are still "
-                f"present (plaintext or non-vault key) for: {_quote_names(unsafe)}. "
-                "Restore the markers on the secrets (or delete the secret keys/"
-                "values entirely) before close."
-            )
-        from pilfer.inline import intentional_removal_candidate_names
-
+            raise _marker_missing_refusal(unsafe[0], spans)
         removed_like = intentional_removal_candidate_names(current, spans)
-        if removed_like and not allow_removals:
-            raise PilferError(
-                "Missing # pilfer:vault markers and opened keys are gone for: "
-                f"{_quote_names(removed_like)}. Pass --allow-removals on close to "
-                "confirm intentional removal, or restore the markers/lines."
-            )
+        if removed_like and not confirm_delete:
+            refusal = _inline_close_refusal_for_name(removed_like[0], spans)
+            if refusal:
+                raise refusal
         print(f"⏭️  Already re-encrypted inline file (retrying close): " f"{vaulted_file_path}")
         return True
 
@@ -947,7 +990,7 @@ def _recrypt_inline_file(
         meta = json.load(f)
     vault_ids = [s.get("vault_id") for s in meta.get("spans", [])]
     vault = _make_vault(password, vault_ids)
-    result = recrypt_inline_content(current, meta["spans"], vault, allow_removals=allow_removals)
+    result = recrypt_inline_content(current, meta["spans"], vault, confirm_delete=confirm_delete)
     with open(vaulted_file_path, "wb") as f:
         f.write(result.content)
 
@@ -983,7 +1026,7 @@ def _cleanup_entry_backups(vaulted_file_path: str) -> None:
     _remove_open_sidecar(vaulted_file_path)
 
 
-def recrypt_vault_files(vault_password_file_path=None, allow_removals: bool = False):
+def recrypt_vault_files(vault_password_file_path=None, confirm_delete: bool = False):
     """Re-encrypt vault entries. Only clears the session if every file succeeds.
 
     Successfully closed entries are removed from the session immediately so a
@@ -1019,7 +1062,7 @@ def recrypt_vault_files(vault_password_file_path=None, allow_removals: bool = Fa
         kind = entry.get("kind", "file")
         try:
             if kind == "inline":
-                if _recrypt_inline_file(path, password, cwd, allow_removals=allow_removals):
+                if _recrypt_inline_file(path, password, cwd, confirm_delete=confirm_delete):
                     modified_count += 1
             else:
                 if _recrypt_whole_file(path, vault, cwd):
@@ -1029,6 +1072,10 @@ def recrypt_vault_files(vault_password_file_path=None, allow_removals: bool = Fa
             remaining = [e for e in remaining if e["path"] != path]
             _write_session(remaining, password_sha256=password_fp)
             _cleanup_entry_backups(path)
+        except InlineCloseRefusal as exc:
+            _emit_inline_close_refusal(path, exc)
+            failed.append(path)
+            _write_session(remaining, password_sha256=password_fp)
         except Exception as e:
             _emit_warning_block(f"Failed to process {path}:", str(e))
             failed.append(path)
@@ -1394,7 +1441,7 @@ marker (leave the marker until close).
 _CLOSE_EPILOG = """
 Examples:
   pilfer close
-  pilfer close --allow-removals
+  pilfer close --confirm-delete
   pilfer close -p ~/.ansible-vault/.vault-file
 
 Re-encrypts every entry recorded in the open session (whole-file and inline).
@@ -1472,11 +1519,12 @@ def _build_argument_parser():
         help="Path to vault password file (must match the password used for open)",
     )
     close_parser.add_argument(
-        "--allow-removals",
+        "--confirm-delete",
         action="store_true",
+        dest="confirm_delete",
         help=(
-            "Allow intentional deletion of opened inline vars "
-            "(missing marker + key + secret)"
+            "Confirm intentional deletion of opened inline vars "
+            "(marker and secret line removed)"
         ),
     )
 
@@ -1592,7 +1640,7 @@ def main(argv=None):
                 return 1
             modified_count = recrypt_vault_files(
                 args.vault_password_file,
-                allow_removals=args.allow_removals,
+                confirm_delete=args.confirm_delete,
             )
             print(
                 f"✅ Vault files re-encrypted. "

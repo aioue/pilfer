@@ -75,7 +75,7 @@ pilfer [--version] COMMAND ...
 Commands: open | close | rekey
 
 pilfer open [--include-encrypted-vars] [-q] [-p VAULT_PASSWORD_FILE]
-pilfer close [--allow-removals] [-p VAULT_PASSWORD_FILE]
+pilfer close [--confirm-delete] [-p VAULT_PASSWORD_FILE]
 pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW [options]
 ```
 
@@ -108,7 +108,7 @@ If you delete an entire opened variable line (key + value + marker), `close`
 refuses by default (ambiguous delete vs accident). Confirm with:
 
 ```bash
-pilfer close --allow-removals
+pilfer close --confirm-delete
 ```
 
 which then prints:
@@ -118,10 +118,31 @@ which then prints:
   - db_password
 ```
 
-Do not strip only the `# pilfer:vault:N` comment while leaving the key - close
-will refuse so plaintext is not stranded. Renaming the key and dropping the
-marker is also refused if the secret value is still present in the file
-(including in comments).
+If you strip only the `# pilfer:vault:N` comment while leaving the secret,
+`close` refuses with:
+
+```text
+⚠️  inventory/group_vars/all/all.yml — cannot close (marker missing)
+  Variable:     db_password
+  Problem:      # pilfer:vault:0 marker was removed but the secret is still in the file.
+
+  Fix:          restore the marker comment on the value line, then pilfer close
+```
+
+If you delete the whole opened variable line (key + value + marker), `close`
+refuses by default (ambiguous delete vs accident):
+
+```text
+⚠️  inventory/group_vars/all/all.yml — cannot close (secret line deleted)
+  Variable:     db_password  (# pilfer:vault:0)
+  Problem:      opened inline secret was removed from the file.
+
+  Confirm delete:  pilfer close --confirm-delete
+  Undo:            restore the line, then pilfer close
+```
+
+Renaming the key and dropping the marker is also refused if the secret value is
+still present in the file (including in comments).
 
 ### Vault password file
 
@@ -189,7 +210,7 @@ non-zero. It does not invent fixes for ambiguous edits.
   working bytes match the open backup, or the file is vault ciphertext decryptable
   with the session password (not an arbitrary foreign vault blob).
 - **`close` is progressive** - files that succeed are encrypted and dropped from the session; failures stay plaintext until you fix and retry. Not an all-or-nothing transaction.
-- **Intentional var removal** requires `pilfer close --allow-removals`.
+- **Intentional var removal** requires `pilfer close --confirm-delete`.
 - **Short secrets** can block close if the same bytes appear elsewhere in the file (docs/comments) - fail closed.
 - **Nested git checkouts** are skipped; run pilfer from those roots if needed.
 - **Legacy unbound sessions** can `close` only if the password decrypts the session backups (then pilfer binds a v2 fingerprint); otherwise remove the session list and re-`open`.

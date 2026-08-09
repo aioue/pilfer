@@ -500,7 +500,7 @@ class TestInlineVault(unittest.TestCase):
         *args,
         password_file="vault_pass",
         include_encrypted_vars=None,
-        allow_removals=False,
+        confirm_delete=False,
         extra=None,
     ):
         cmd = [sys.executable, self.pilfer_script, *args]
@@ -509,8 +509,8 @@ class TestInlineVault(unittest.TestCase):
             include_encrypted_vars = bool(args) and args[0] == "open"
         if include_encrypted_vars:
             cmd.append("--include-encrypted-vars")
-        if allow_removals:
-            cmd.append("--allow-removals")
+        if confirm_delete:
+            cmd.append("--confirm-delete")
         if extra:
             cmd.extend(extra)
         cmd.extend(["-p", password_file])
@@ -641,12 +641,9 @@ class TestInlineVault(unittest.TestCase):
         self.assertNotEqual(closed.returncode, 0)
         self.assertTrue(os.path.isfile("vaultedFileList.json"))
         combined = closed.stderr + closed.stdout
-        self.assertTrue(
-            "Missing # pilfer:vault" in combined
-            or "still appears in the file" in combined
-            or "still present" in combined,
-            combined,
-        )
+        self.assertIn("cannot close (marker missing)", combined)
+        self.assertIn("Variable:     db_password", combined)
+        self.assertIn("marker was removed but the secret is still", combined)
 
     def test_rename_key_and_strip_marker_fails(self):
         """Renaming the key and dropping the marker must not look like removal."""
@@ -657,10 +654,7 @@ class TestInlineVault(unittest.TestCase):
         closed = self._run("close")
         self.assertNotEqual(closed.returncode, 0)
         combined = closed.stderr + closed.stdout
-        self.assertTrue(
-            "still appears in the file" in combined or "still present" in combined,
-            combined,
-        )
+        self.assertIn("cannot close (marker missing)", combined)
         self.assertTrue(os.path.isfile("vaultedFileList.json"))
         with open("group_vars.yml") as f:
             self.assertIn("super-secret", f.read())
@@ -703,10 +697,7 @@ class TestInlineVault(unittest.TestCase):
                 closed = self._run("close")
                 self.assertNotEqual(closed.returncode, 0)
                 combined = closed.stderr + closed.stdout
-                self.assertTrue(
-                    "still appears in the file" in combined or "still present" in combined,
-                    combined,
-                )
+                self.assertIn("cannot close (marker missing)", combined)
                 # Reset tree for next subTest
                 for artifact in ("vaultedFileList.json", "group_vars.yml"):
                     if os.path.isfile(artifact):
@@ -730,10 +721,7 @@ class TestInlineVault(unittest.TestCase):
         closed = self._run("close")
         self.assertNotEqual(closed.returncode, 0)
         combined = closed.stderr + closed.stdout
-        self.assertTrue(
-            "still appears in the file" in combined or "still present" in combined,
-            combined,
-        )
+        self.assertIn("cannot close (marker missing)", combined)
 
     def test_strip_marker_changed_value_same_key_fails(self):
         """Changing the value after stripping markers must not clear the session."""
@@ -854,10 +842,11 @@ class TestInlineVault(unittest.TestCase):
         self.assertNotEqual(refused.returncode, 0)
         combined = refused.stderr + refused.stdout
         self.assertIn("⚠️", combined)
-        self.assertIn("Failed to process", combined)
-        self.assertIn("'db_password'", combined)
-        self.assertIn("--allow-removals", combined)
-        closed = self._run("close", allow_removals=True)
+        self.assertIn("cannot close (secret line deleted)", combined)
+        self.assertIn("Variable:     db_password", combined)
+        self.assertIn("--confirm-delete", combined)
+        self.assertNotIn("Failed to process", combined)
+        closed = self._run("close", confirm_delete=True)
         self.assertEqual(closed.returncode, 0, closed.stderr)
         self.assertIn("🔍 Detected removal of 1 encrypted vars:", closed.stdout)
         self.assertIn("- db_password", closed.stdout)
