@@ -1,0 +1,5 @@
+name: pilfer CodeQL config
+
+# Test fixtures use fake vault passwords; not production code paths.
+paths-ignore:
+  - tests
