@@ -9,8 +9,6 @@
 
 **Decrypt *all* ansible vault files in a project in-place recursively for viewing/editing, then re-encrypt them all at once when you're done.**
 
-Walkthrough: [Bulk edit Ansible vault files with pilfer](https://aioue.net/2026/08/07/pilfer-bulk-ansible-vault-edit/)
-
 Optionally decrypt/re-encrypt all [encrypted variables](https://docs.ansible.com/projects/ansible/latest/vault_guide/vault_encrypting_content.html) in-place, or re-key an entire tree after a password exposure.
 
 ## Output
