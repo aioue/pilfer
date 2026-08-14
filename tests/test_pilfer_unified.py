@@ -440,6 +440,15 @@ class TestSessionSafety(unittest.TestCase):
         with open("secret.yml") as f:
             self.assertIn("hunter2", f.read())
 
+    def test_marker_mention_in_docs_does_not_block_open(self):
+        """Quoting the marker prefix in non-YAML files must not look like orphan state."""
+        with open("README.md", "w") as f:
+            f.write("Refuse staged # pilfer:vault: markers in YAML.\n")
+        with open("hook.sh", "w") as f:
+            f.write("grep --cached -l '# pilfer:vault:'\n")
+        opened = self._run("open")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+
     def test_orphan_vault_dir_without_session_refuse_open(self):
         self.assertEqual(self._run("open").returncode, 0)
         os.remove("vaultedFileList.json")

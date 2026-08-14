@@ -561,7 +561,13 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
             if not data:
                 continue
             if marker in data:
-                result.marker_files.append(file_path)
+                # Inline markers only exist in YAML. Docs/scripts that quote the
+                # prefix must not look orphaned, but denylisted renames (.pyc, .db)
+                # must still block open (see test_denylisted_extension_still_detects_orphan_markers).
+                _, ext = os.path.splitext(name)
+                ext_lc = ext.lower()
+                if ext_lc in (".yml", ".yaml") or denylisted:
+                    result.marker_files.append(file_path)
             if denylisted:
                 continue
             # Staging leftovers are never vault targets, but may still carry
