@@ -270,13 +270,62 @@ class TestSessionSafety(unittest.TestCase):
             f.write("wrong")
         result = self._run("open", password_file="bad_pass")
         self.assertNotEqual(result.returncode, 0)
-        # Should not leave a successful open claiming plaintext secrets without session.
-        # File may stay encrypted if decrypt failed before write.
+        self.assertIn("Session cleared", result.stderr)
         with open("secret.yml", "rb") as f:
-            data = f.read()
-        self.assertTrue(
-            data.startswith(b"$ANSIBLE_VAULT;") or os.path.isfile("vaultedFileList.json")
-        )
+            self.assertTrue(f.read().startswith(b"$ANSIBLE_VAULT;"))
+        self.assertFalse(os.path.isfile("vaultedFileList.json"))
+        self.assertFalse(os.path.isdir(".vault"))
+        self.assertFalse(os.path.isfile("secret.yml.pilfer-open"))
+
+    def test_session_symlink_refused(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        victim = os.path.join(outside, "victim.json")
+        with open(victim, "w") as handle:
+            handle.write("keep-me")
+        os.symlink(victim, "vaultedFileList.json")
+        opened = self._run("open")
+        self.assertNotEqual(opened.returncode, 0)
+        self.assertIn("symlink", (opened.stderr + opened.stdout).lower())
+        with open(victim) as handle:
+            self.assertEqual(handle.read(), "keep-me")
+        with open("secret.yml", "rb") as handle:
+            self.assertTrue(handle.read().startswith(b"$ANSIBLE_VAULT;"))
+
+    def test_dangling_session_symlink_does_not_create_target(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        victim = os.path.join(outside, "created-by-pilfer")
+        os.symlink(victim, "vaultedFileList.json")
+        opened = self._run("open")
+        self.assertNotEqual(opened.returncode, 0)
+        self.assertFalse(os.path.lexists(victim))
+
+    def test_vault_dir_symlink_refused(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        os.symlink(outside, ".vault")
+        opened = self._run("open")
+        self.assertNotEqual(opened.returncode, 0)
+        self.assertIn("symlink", (opened.stderr + opened.stdout).lower())
+        self.assertEqual(os.listdir(outside), [])
+        with open("secret.yml", "rb") as handle:
+            self.assertTrue(handle.read().startswith(b"$ANSIBLE_VAULT;"))
+
+    def test_open_sidecar_symlink_refused(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        victim = os.path.join(outside, "victim")
+        with open(victim, "w") as handle:
+            handle.write("keep-me")
+        os.symlink(victim, "secret.yml.pilfer-open")
+        opened = self._run("open")
+        self.assertNotEqual(opened.returncode, 0)
+        self.assertIn("symlink", (opened.stderr + opened.stdout).lower())
+        with open(victim) as handle:
+            self.assertEqual(handle.read(), "keep-me")
+        with open("secret.yml", "rb") as handle:
+            self.assertTrue(handle.read().startswith(b"$ANSIBLE_VAULT;"))
 
     def test_symlink_vault_target_refused(self):
         outside_dir = tempfile.mkdtemp()
@@ -439,6 +488,31 @@ class TestSessionSafety(unittest.TestCase):
         self.assertIn("Orphaned open state", opened.stderr)
         with open("secret.yml") as f:
             self.assertIn("hunter2", f.read())
+
+    def test_extensionless_marker_blocks_open(self):
+        """group_vars/all style files are opened, so a leftover marker must block."""
+        with open("group_vars_all", "w") as handle:
+            handle.write('db_password: "secret"  # pilfer:vault:0\n')
+        opened = self._run("open")
+        self.assertNotEqual(opened.returncode, 0)
+        self.assertIn("Orphaned open state", opened.stderr)
+        self.assertTrue(os.path.isfile("group_vars_all"))
+
+    def test_cancelled_open_staging_file_is_removed(self):
+        """Extensionless .pilfer-rekey-* temps can hold decrypted inline text."""
+        with open(".pilfer-rekey-cancelled", "w") as handle:
+            handle.write('db_password: "secret"  # pilfer:vault:0\n')
+        opened = self._run("open")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertFalse(os.path.exists(".pilfer-rekey-cancelled"))
+
+    def test_renamed_yaml_under_rekey_prefix_still_blocks(self):
+        with open(".pilfer-rekey-hidden.yml", "w") as handle:
+            handle.write('db_password: "secret"  # pilfer:vault:0\n')
+        opened = self._run("open")
+        self.assertNotEqual(opened.returncode, 0)
+        self.assertIn("Orphaned open state", opened.stderr)
+        self.assertTrue(os.path.isfile(".pilfer-rekey-hidden.yml"))
 
     def test_marker_mention_in_docs_does_not_block_open(self):
         """Quoting the marker prefix in non-YAML files must not look like orphan state."""
@@ -625,6 +699,75 @@ class TestInlineVault(unittest.TestCase):
             opened = f.read()
         self.assertIn("pass-one", opened)
         self.assertIn("token-CHANGED", opened)
+
+    def test_neighbor_edit_preserves_lossy_inline_secrets(self):
+        """Editing another key must not re-encrypt an unedited inline secret.
+
+        The opened form drops a trailing newline and CRLF, and a quoted
+        backslash-n used to parse as a real newline once close left the
+        whole-file shortcut.
+        """
+        chunks = ["---\n", "plain_key: visible\n"]
+        chunks.append(encrypt_string_yaml(self.vault, "token", b"a\\nb"))
+        chunks.append(encrypt_string_yaml(self.vault, "note", b"hello\n"))
+        chunks.append(encrypt_string_yaml(self.vault, "win", b"line1\r\nline2\r\n"))
+        chunks.append("\n")
+        chunks.append(encrypt_string_yaml(self.vault, "second", b"line1\nline2"))
+        with open("group_vars.yml", "w") as handle:
+            handle.write("".join(chunks))
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml") as handle:
+            text = handle.read()
+        text = text.replace("plain_key: visible", "plain_key: edited")
+        with open("group_vars.yml", "w") as handle:
+            handle.write(text)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        with open("group_vars.yml", "rb") as handle:
+            data = handle.read()
+        spans = pilfer_inline.find_inline_vault_spans(data)
+        got = [self.vault.decrypt(span.ciphertext) for span in spans]
+        self.assertEqual(
+            got,
+            [b"a\\nb", b"hello\n", b"line1\r\nline2\r\n", b"line1\nline2"],
+        )
+        self.assertIn(b"plain_key: edited", data)
+
+    def test_edited_quoted_backslash_n_round_trips(self):
+        self._write_vars_file(("token", b"a\\nb"))
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml") as handle:
+            text = handle.read()
+        self.assertIn('"a\\\\nb"', text)
+        text = text.replace('"a\\\\nb"', '"a\\\\nc"')
+        with open("group_vars.yml", "w") as handle:
+            handle.write(text)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        with open("group_vars.yml", "rb") as handle:
+            data = handle.read()
+        spans = pilfer_inline.find_inline_vault_spans(data)
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(self.vault.decrypt(spans[0].ciphertext), b"a\\nc")
+
+    def test_neighbor_edit_preserves_indented_and_newline_secrets(self):
+        self._write_vars_file(
+            ("code", b"  return 1;\n"),
+            ("blank", b"\n"),
+        )
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml") as handle:
+            text = handle.read()
+        text = text.replace("plain_key: visible", "plain_key: edited")
+        with open("group_vars.yml", "w") as handle:
+            handle.write(text)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        with open("group_vars.yml", "rb") as handle:
+            data = handle.read()
+        spans = pilfer_inline.find_inline_vault_spans(data)
+        got = [self.vault.decrypt(span.ciphertext) for span in spans]
+        self.assertEqual(got, [b"  return 1;\n", b"\n"])
 
     def test_mixed_whole_file_and_inline(self):
         with open("whole.yml", "wb") as f:
@@ -949,6 +1092,21 @@ class TestDiscoveryOptimizations(unittest.TestCase):
 
     def test_extension_gate_skips_db_even_with_vault_bytes(self):
         with open("noise.db", "wb") as f:
+            f.write(self.vault.encrypt(b"should-not-open\n"))
+        with open("real.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"ok: 1\n"))
+        found = pilfer_cli.write_vaulted_file_list(include_encrypted_vars=True)
+        os.remove("vaultedFileList.json")
+        paths = [os.path.basename(e["path"]) for e in found]
+        self.assertEqual(paths, ["real.yml"])
+
+    def test_compound_archive_suffix_is_denylisted(self):
+        """backup.tar.zst must not be a vault target. splitext only sees .zst."""
+        self.assertTrue(pilfer_cli._should_skip_by_extension("backup.tar.zst"))
+        self.assertTrue(pilfer_cli._should_skip_by_extension("dump.zst"))
+        self.assertFalse(pilfer_cli._should_skip_by_extension("group_vars.yml"))
+        self.assertFalse(pilfer_cli._should_skip_by_extension("weirdname"))
+        with open("backup.tar.zst", "wb") as f:
             f.write(self.vault.encrypt(b"should-not-open\n"))
         with open("real.yml", "wb") as f:
             f.write(self.vault.encrypt(b"ok: 1\n"))

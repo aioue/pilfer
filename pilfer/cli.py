@@ -78,6 +78,9 @@ _SKIP_FILE_EXTENSIONS = frozenset(
         ".tgz",
         ".bz2",
         ".xz",
+        ".zst",
+        ".zstd",
+        ".lz4",
         ".7z",
         ".whl",
         ".egg",
@@ -209,9 +212,12 @@ def _open_sidecar_path(vaulted_file_path: str) -> str:
 def _write_open_sidecar(vaulted_file_path: str, kind: str) -> None:
     """Mark an opened target so orphan scans work without session/.vault."""
     sidecar = _open_sidecar_path(vaulted_file_path)
-    with open(sidecar, "w") as f:
-        json.dump({"kind": kind, "path": vaulted_file_path}, f)
-    _restrict_private(sidecar)
+    # Atomic replace refuses a pre-planted sidecar symlink instead of truncating
+    # whatever it points at.
+    _atomic_write_bytes(
+        sidecar,
+        json.dumps({"kind": kind, "path": vaulted_file_path}).encode("utf-8"),
+    )
 
 
 def _remove_open_sidecar(vaulted_file_path: str) -> None:
@@ -255,6 +261,59 @@ def _restrict_private(path: str) -> None:
         pass
 
 
+def _refuse_if_symlink(path: str) -> None:
+    """Refuse a symlink leaf.
+
+    open() follows the link, so a dangling vaultedFileList.json, .vault, or
+    *.pilfer-open planted in the tree truncates or creates the target.
+    os.replace does not follow, but the open() writers below would.
+    """
+    if os.path.islink(path):
+        raise PilferError(f"Refusing to operate on symlink (write would follow it): {path}")
+
+
+def _refuse_planted_session_links() -> None:
+    _refuse_if_symlink(temp_vault_file_list_path)
+    _refuse_if_symlink(temp_hidden_encrypted_copies_directory_path)
+
+
+def _ensure_private_dir(path: str) -> None:
+    """Create a real directory. os.makedirs follows a symlink leaf, so a planted
+    .vault link would store ciphertext backups outside the project.
+    """
+    normalized = os.path.normpath(path)
+    existing = normalized
+    missing = []
+    while existing not in ("", ".", os.sep) and not os.path.lexists(existing):
+        missing.append(existing)
+        parent = os.path.dirname(existing)
+        if parent == existing:
+            break
+        existing = parent
+    # dirname("relpath") is "" — that parent is the cwd, which already exists.
+    if existing not in ("", ".", os.sep):
+        if os.path.islink(existing):
+            raise PilferError(
+                f"Refusing to use symlink as a directory (writes would follow it): {existing}"
+            )
+        if os.path.lexists(existing) and not os.path.isdir(existing):
+            raise PilferError(f"Refusing to use non-directory path: {existing}")
+    for directory in reversed(missing):
+        if directory in ("", ".", os.sep):
+            continue
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            if os.path.islink(directory) or not os.path.isdir(directory):
+                raise PilferError(
+                    f"Refusing to use symlink as a directory (writes would follow it): {directory}"
+                ) from None
+    try:
+        os.chmod(normalized, 0o700)
+    except OSError:
+        pass
+
+
 def _normalize_entries(data):
     """Return (entries, password_sha256, version) from session JSON (v1 or v2)."""
     if isinstance(data, list):
@@ -279,10 +338,6 @@ def _load_session():
     with open(temp_vault_file_list_path) as vault_list_file:
         data = json.load(vault_list_file)
     return _normalize_entries(data)
-
-
-def _quote_names(names) -> str:
-    return ", ".join(repr(n) for n in names)
 
 
 def _emit_warning_block(title: str, detail: str) -> None:
@@ -474,15 +529,21 @@ def _write_session(entries, password_sha256: str) -> None:
         "password_sha256": password_sha256,
         "entries": entries,
     }
-    with open(temp_vault_file_list_path, "w") as open_file:
-        json.dump(payload, open_file, indent=2)
-    _restrict_private(temp_vault_file_list_path)
+    # Temp-and-replace: a crash cannot leave truncated JSON, and a symlink
+    # session path is refused instead of followed.
+    _atomic_write_bytes(
+        temp_vault_file_list_path,
+        json.dumps(payload, indent=2).encode("utf-8"),
+    )
 
 
 def _should_skip_by_extension(file_path: str) -> bool:
-    """True for known binary / non-text extensions we never treat as vault YAML."""
-    _, ext = os.path.splitext(os.path.basename(file_path))
-    return ext.lower() in _SKIP_FILE_EXTENSIONS
+    """True for known binary / non-text extensions we never treat as vault YAML.
+
+    Every suffix counts. splitext('backup.tar.zst') is only '.zst', so a last-
+    suffix check read those archives in full (hundreds of MB on this homelab).
+    """
+    return any(suffix.lower() in _SKIP_FILE_EXTENSIONS for suffix in Path(file_path).suffixes)
 
 
 def _is_nested_git_checkout(path: str) -> bool:
@@ -561,12 +622,12 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
             if not data:
                 continue
             if marker in data:
-                # Inline markers only exist in YAML. Docs/scripts that quote the
-                # prefix must not look orphaned, but denylisted renames (.pyc, .db)
-                # must still block open (see test_denylisted_extension_still_detects_orphan_markers).
+                # Markers in YAML and in extensionless Ansible files (group_vars/all)
+                # are orphan evidence. Docs and scripts that quote the prefix are
+                # not. Denylisted renames (.pyc, .db) must still block open.
                 _, ext = os.path.splitext(name)
                 ext_lc = ext.lower()
-                if ext_lc in (".yml", ".yaml") or denylisted:
+                if ext_lc in (".yml", ".yaml", "") or denylisted:
                     result.marker_files.append(file_path)
             if denylisted:
                 continue
@@ -595,12 +656,14 @@ def _prune_walk_dirnames(dirpath: str, dirnames: list) -> list:
     return pruned
 
 
-def _cleanup_stale_rekey_temps(root: str | None = None) -> int:
-    """Remove crash leftovers from atomic rekey staging (sibling .pilfer-rekey-*).
+def _cleanup_stale_rekey_temps(root: str | None = None, *, include_open_markers: bool = False) -> int:
+    """Remove crash leftovers from atomic staging (sibling .pilfer-rekey-*).
 
-    Never deletes *.pilfer-open sidecars or files that still contain open markers
-    (those are orphan evidence, not staging temps). Skips nested git checkouts
-    the same way discovery does.
+    Never deletes *.pilfer-open sidecars. A renamed YAML file that still has an
+    open marker is orphan evidence and is kept. Extensionless names are mkstemp
+    leftovers: when include_open_markers is set, those are removed even if they
+    hold decrypted inline text, because close would otherwise succeed and leave
+    the plaintext beside the restored ciphertext. Skips nested git checkouts.
     """
     walk_dir = os.path.abspath(root or os.getcwd())
     marker = MARKER_PREFIX.encode("utf-8")
@@ -616,7 +679,15 @@ def _cleanup_stale_rekey_temps(root: str | None = None) -> int:
             try:
                 with open(path, "rb") as handle:
                     data = handle.read()
+                suffix = os.path.splitext(name)[1].lower()
                 if marker in data:
+                    # Only extensionless mkstemp leftovers are safe to remove.
+                    # A .yml/.yaml rename is orphan evidence.
+                    if not (include_open_markers and suffix == ""):
+                        continue
+                elif include_open_markers:
+                    # Leave ciphertext staging for the confirmed-rekey sweep.
+                    # Dry-run must not delete those files.
                     continue
                 os.unlink(path)
                 removed += 1
@@ -730,36 +801,29 @@ def _decrypt_whole_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> N
     decrypted_bytes = vault.decrypt(encrypted_data)
 
     backup_dir = _backup_dir_for(vaulted_file_path)
-    os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+    _ensure_private_dir(backup_dir)
 
     encrypted_backup = _encrypted_backup_path(vaulted_file_path)
-    with open(encrypted_backup, "wb") as f:
-        f.write(encrypted_data)
-    _restrict_private(encrypted_backup)
+    _atomic_write_bytes(encrypted_backup, encrypted_data)
 
     file_hash = hashlib.sha256(decrypted_bytes).hexdigest()
     hash_path = _hash_backup_path(vaulted_file_path)
-    with open(hash_path, "w") as decrypted_vault_file_hash:
-        decrypted_vault_file_hash.write(file_hash)
-    _restrict_private(hash_path)
+    _atomic_write_bytes(hash_path, file_hash.encode("utf-8"))
 
     # Sidecar before plaintext so a crash/failure never leaves unmarked plaintext.
+    # The plaintext replace is atomic: a crash keeps the original ciphertext
+    # until the decrypted bytes are complete, so failure cleanup must not
+    # rewrite the target (that rewrite was itself a truncate window).
     _write_open_sidecar(vaulted_file_path, "file")
     try:
-        with open(vaulted_file_path, "wb") as decrypted_vault_file:
-            decrypted_vault_file.write(decrypted_bytes)
-        _restrict_private(vaulted_file_path)
+        _atomic_write_bytes(vaulted_file_path, decrypted_bytes)
     except Exception:
-        try:
-            with open(vaulted_file_path, "wb") as f:
-                f.write(encrypted_data)
-        finally:
-            _remove_open_sidecar(vaulted_file_path)
-            for path in (encrypted_backup, hash_path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+        _remove_open_sidecar(vaulted_file_path)
+        for path in (encrypted_backup, hash_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         raise
 
 
@@ -775,41 +839,32 @@ def _decrypt_inline_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> 
         raise PilferError(f"No inline vault spans found in {vaulted_file_path}")
 
     backup_dir = _backup_dir_for(vaulted_file_path)
-    os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+    _ensure_private_dir(backup_dir)
 
     # Full original backup for unchanged whole-file restore shortcut.
     encrypted_backup = _encrypted_backup_path(vaulted_file_path)
-    with open(encrypted_backup, "wb") as f:
-        f.write(original)
-    _restrict_private(encrypted_backup)
+    _atomic_write_bytes(encrypted_backup, original)
 
     file_hash = hashlib.sha256(new_content).hexdigest()
     hash_path = _hash_backup_path(vaulted_file_path)
-    with open(hash_path, "w") as f:
-        f.write(file_hash)
-    _restrict_private(hash_path)
+    _atomic_write_bytes(hash_path, file_hash.encode("utf-8"))
 
     meta_path = _inline_meta_path(vaulted_file_path)
-    with open(meta_path, "w") as f:
-        json.dump({"spans": records}, f, indent=2)
-    _restrict_private(meta_path)
+    _atomic_write_bytes(
+        meta_path,
+        json.dumps({"spans": records}, indent=2).encode("utf-8"),
+    )
 
     _write_open_sidecar(vaulted_file_path, "inline")
     try:
-        with open(vaulted_file_path, "wb") as f:
-            f.write(new_content)
-        _restrict_private(vaulted_file_path)
+        _atomic_write_bytes(vaulted_file_path, new_content)
     except Exception:
-        try:
-            with open(vaulted_file_path, "wb") as f:
-                f.write(original)
-        finally:
-            _remove_open_sidecar(vaulted_file_path)
-            for path in (encrypted_backup, hash_path, meta_path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+        _remove_open_sidecar(vaulted_file_path)
+        for path in (encrypted_backup, hash_path, meta_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         raise
 
     return len(records)
@@ -821,17 +876,14 @@ def decrypt_vault_files(vault_password_file_path=None):
     Returns the number of successfully decrypted entries.
     Raises PilferError if any entry fails (session list retained for recovery).
     """
+    _refuse_planted_session_links()
     entries, _existing_fp, _version = _load_session()
     password, _vault_file = _load_password(vault_password_file_path)
     password_fp = _password_fingerprint(password)
     vault = _make_vault(password)
     cwd = Path.cwd().resolve()
 
-    os.makedirs(temp_hidden_encrypted_copies_directory_path, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(temp_hidden_encrypted_copies_directory_path, 0o700)
-    except OSError:
-        pass
+    _ensure_private_dir(temp_hidden_encrypted_copies_directory_path)
 
     failed = []
     succeeded = []
@@ -863,6 +915,10 @@ def decrypt_vault_files(vault_password_file_path=None):
                 shutil.rmtree(temp_hidden_encrypted_copies_directory_path, ignore_errors=True)
             except OSError:
                 pass
+            raise PilferError(
+                f"Failed to decrypt all {len(entries)} file(s). "
+                "Session cleared; no files were decrypted. Fix errors and retry 'pilfer open'."
+            )
         raise PilferError(
             f"Failed to decrypt {len(failed)} of {len(entries)} file(s). "
             f"Session kept for {len(succeeded)} decrypted file(s); "
@@ -916,8 +972,16 @@ def _recrypt_whole_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> b
         new_encrypted_data = old_encrypted_data
         modified = False
 
-    with open(vaulted_file_path, "wb") as f:
-        f.write(new_encrypted_data)
+    # Prove the bytes decrypt before replace. open('wb') would truncate the
+    # live file first; a crash or short write then left garbage that a retry
+    # re-encrypted, and the .vault backup was deleted on the way out.
+    try:
+        vault.decrypt(normalize_whole_file_vault(new_encrypted_data))
+    except Exception as exc:
+        raise PilferError(
+            f"Refusing to replace {vaulted_file_path}: new ciphertext does not decrypt"
+        ) from exc
+    _atomic_write_bytes(vaulted_file_path, new_encrypted_data)
 
     return modified
 
@@ -957,8 +1021,7 @@ def _recrypt_inline_file(
     if old_hash == new_hash:
         with open(encrypted_backup, "rb") as f:
             original = f.read()
-        with open(vaulted_file_path, "wb") as f:
-            f.write(original)
+        _atomic_write_bytes(vaulted_file_path, original)
         return False
 
     # Interrupted close: working copy already matches backup ciphertext.
@@ -997,8 +1060,15 @@ def _recrypt_inline_file(
     vault_ids = [s.get("vault_id") for s in meta.get("spans", [])]
     vault = _make_vault(password, vault_ids)
     result = recrypt_inline_content(current, meta["spans"], vault, confirm_delete=confirm_delete)
-    with open(vaulted_file_path, "wb") as f:
-        f.write(result.content)
+    for span in find_inline_vault_spans(result.content):
+        try:
+            vault.decrypt(span.ciphertext)
+        except Exception as exc:
+            raise PilferError(
+                f"Refusing to replace {vaulted_file_path}: "
+                "re-encrypted inline span does not decrypt"
+            ) from exc
+    _atomic_write_bytes(vaulted_file_path, result.content)
 
     if result.removed_vars:
         print(f"🔍 Detected removal of {len(result.removed_vars)} encrypted vars:")
@@ -1041,6 +1111,7 @@ def recrypt_vault_files(vault_password_file_path=None, confirm_delete: bool = Fa
     Returns the number of modified files (whole-file or inline with changes).
     Raises PilferError on any failure without deleting remaining session artifacts.
     """
+    _refuse_planted_session_links()
     if not _session_is_open():
         raise PilferError("No vault file list found. Run 'pilfer open' first.")
 
@@ -1115,9 +1186,15 @@ def recrypt_vault_files(vault_password_file_path=None, confirm_delete: bool = Fa
 
 
 def _atomic_write_bytes(path: str, data: bytes) -> None:
-    """Write bytes via temp file + os.replace (same directory for atomicity)."""
+    """Write bytes via temp file + os.replace (same directory for atomicity).
+
+    Refuses a symlink destination. open('wb') would follow it and truncate the
+    target; replace would swap the link itself, which is still the wrong file.
+    """
+    _refuse_if_symlink(path)
     directory = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(prefix=REKEY_TEMP_PREFIX, dir=directory)
+    replaced = False
     try:
         try:
             os.fchmod(fd, 0o600)
@@ -1126,13 +1203,16 @@ def _atomic_write_bytes(path: str, data: bytes) -> None:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
         os.replace(tmp, path)
+        replaced = True
         _restrict_private(path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    finally:
+        # KeyboardInterrupt is BaseException, not Exception. A temp that still
+        # exists holds the bytes we were about to publish, including plaintext.
+        if not replaced:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _rekey_probe_file(
@@ -1245,12 +1325,16 @@ def rekey_vault_files(
     Resumable: files already decryptable with the new password are skipped.
     Returns number of files rewritten (0 on dry-run / already complete).
     """
+    _refuse_planted_session_links()
+    # Extensionless staging files can hold decrypted inline text from a
+    # cancelled open. Remove those before the orphan check. Ciphertext
+    # leftovers stay until a confirmed rekey, so dry-run does not delete them.
+    _cleanup_stale_rekey_temps(include_open_markers=True)
     if _session_is_open():
         raise PilferError(
             f"Session already open ({temp_vault_file_list_path}). "
             "Run 'pilfer close' before rekey."
         )
-    assert_no_orphaned_open_state()
 
     if rotate_password_file and not include_encrypted_vars:
         raise PilferError(
@@ -1264,9 +1348,12 @@ def rekey_vault_files(
     if _password_fingerprint(old_password) == _password_fingerprint(new_password):
         raise PilferError("Old and new vault passwords are identical.")
 
+    # One walk: orphan signals and rekey targets. A second scan_project here
+    # used to re-read every file in the tree.
     scan = scan_project(
         include_encrypted_vars=include_encrypted_vars, announce_skips=announce_skips
     )
+    assert_no_orphaned_open_state(scan)
     targets = scan.targets
     if not targets:
         print("No vault files found in current directory tree.")
@@ -1390,12 +1477,12 @@ def _rotate_password_file(old_path: str, new_path: str) -> str:
         raise PilferError(f"Password backup already exists: {backup}. Move it aside first.")
     with open(new_path) as handle:
         new_contents = handle.read()
-    # Archive old first, then install new via temp+replace so a crash cannot
-    # leave ansible pointing at an empty/truncated password file.
-    os.replace(old_path, backup)
-    _restrict_private(backup)
+    # Write the new password beside the live file first. Renaming the live
+    # path away before that write left Ansible with no password file if the
+    # process was cancelled in between.
     directory = os.path.dirname(old_path) or "."
     fd, tmp = tempfile.mkstemp(prefix=".pilfer-pass-", dir=directory)
+    installed = False
     try:
         try:
             os.fchmod(fd, 0o600)
@@ -1403,20 +1490,24 @@ def _rotate_password_file(old_path: str, new_path: str) -> str:
             pass
         with os.fdopen(fd, "w") as handle:
             handle.write(new_contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        shutil.copy2(old_path, backup)
+        _restrict_private(backup)
         os.replace(tmp, old_path)
+        installed = True
         _restrict_private(old_path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        # Best effort: restore archived password if install failed.
-        if not os.path.exists(old_path) and os.path.exists(backup):
+    finally:
+        if not installed:
             try:
-                os.replace(backup, old_path)
+                os.unlink(tmp)
             except OSError:
                 pass
-        raise
+            if os.path.exists(old_path) and os.path.exists(backup):
+                try:
+                    os.remove(backup)
+                except OSError:
+                    pass
     return backup
 
 
@@ -1597,6 +1688,8 @@ def main(argv=None):
     try:
         if args.action == "open":
             print("🔓 Searching for and decrypting vault files...")
+            _refuse_planted_session_links()
+            _cleanup_stale_rekey_temps(include_open_markers=True)
             if _session_is_open() and not _abandon_incomplete_session():
                 raise PilferError(
                     f"Session already open ({temp_vault_file_list_path} exists). "
@@ -1641,6 +1734,8 @@ def main(argv=None):
 
         if args.action == "close":
             print("🔒 Re-encrypting vault files...")
+            _refuse_planted_session_links()
+            _cleanup_stale_rekey_temps(include_open_markers=True)
             if not _session_is_open():
                 print("No vault file list found. Run 'pilfer open' first.")
                 return 1

@@ -288,7 +288,22 @@ def _parse_marked_value(content: bytes, match: re.Match) -> tuple[bytes, int, in
             next_end = _line_end(content, cursor)
             line = content[cursor:next_end]
             if not line.strip():
-                # Blank lines are part of YAML literal block scalars - keep them.
+                # Interior blank lines belong to the block. A blank run that is
+                # followed by a dedented key (or EOF) is the separator before the
+                # next key; consuming it makes an unedited secret look modified.
+                look = next_end
+                separator = True
+                while look < len(content):
+                    look_end = _line_end(content, look)
+                    look_line = content[look:look_end]
+                    if not look_line.strip():
+                        look = look_end
+                        continue
+                    look_indent = len(look_line) - len(look_line.lstrip(b" \t"))
+                    separator = look_indent <= base_indent_len
+                    break
+                if separator:
+                    break
                 body_lines.append(b"")
                 cursor = next_end
                 continue
@@ -302,15 +317,7 @@ def _parse_marked_value(content: bytes, match: re.Match) -> tuple[bytes, int, in
 
     raw = value
     if raw.startswith(b'"') and raw.endswith(b'"') and len(raw) >= 2:
-        text = raw[1:-1].decode("utf-8")
-        text = (
-            text.replace("\\n", "\n")
-            .replace("\\r", "\r")
-            .replace("\\t", "\t")
-            .replace('\\"', '"')
-            .replace("\\\\", "\\")
-        )
-        plaintext = text.encode("utf-8")
+        plaintext = _yaml_unescape_double(raw[1:-1].decode("utf-8")).encode("utf-8")
     else:
         plaintext = raw
 
@@ -340,13 +347,23 @@ def _yaml_key_present(content: bytes, var_name: str) -> bool:
 
 
 def _yaml_unescape_double(text: str) -> str:
-    return (
-        text.replace("\\n", "\n")
-        .replace("\\r", "\r")
-        .replace("\\t", "\t")
-        .replace('\\"', '"')
-        .replace("\\\\", "\\")
-    )
+    """Decode a YAML double-quoted body. A backslash is consumed before \\n/\\r/\\t.
+
+    Replacing ``\\n`` first turns the two characters backslash, n inside ``\\\\n``
+    (an escaped backslash followed by n) into a real newline.
+    """
+    out = []
+    index = 0
+    escapes = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"'}
+    while index < len(text):
+        if text[index] == "\\" and index + 1 < len(text):
+            nxt = text[index + 1]
+            out.append(escapes.get(nxt, "\\" + nxt))
+            index += 2
+            continue
+        out.append(text[index])
+        index += 1
+    return "".join(out)
 
 
 def _yaml_unescape_single(text: str) -> str:
@@ -523,6 +540,29 @@ def plaintext_still_in_content(content: bytes, plaintext: bytes) -> bool:
     return False
 
 
+def _opened_form_unchanged(parsed_current: bytes, record: dict, vault: VaultLib) -> bool:
+    """True when the opened rendering of the stored secret parses to these bytes."""
+    original = _original_plaintext_from_record(record, vault)
+    if original is None:
+        return False
+    span = InlineSpan(
+        span_id=int(record["id"]),
+        start=0,
+        end=0,
+        encrypted=b"",
+        ciphertext=b"",
+        line_prefix=record["line_prefix"].encode("utf-8", errors="surrogateescape"),
+        body_indent=record["body_indent"].encode("utf-8", errors="surrogateescape"),
+        vault_id=record.get("vault_id"),
+    )
+    opened = format_open_value(original, span)
+    match = MARKER_RE.search(opened)
+    if match is None:
+        return False
+    parsed_opened, _, _ = _parse_marked_value(opened, match)
+    return parsed_current == parsed_opened
+
+
 def _original_plaintext_from_record(record: dict, vault: VaultLib) -> bytes | None:
     """Recover opened plaintext from session meta (ciphertext or full !vault block)."""
     try:
@@ -644,7 +684,12 @@ def recrypt_inline_content(
         plain_hash = hashlib.sha256(plaintext).hexdigest()
         original_encrypted = base64.b64decode(record["encrypted_b64"])
 
-        if plain_hash == record["plain_hash"]:
+        # Hash match means the parsed bytes are the original secret. The opened
+        # rendering is lossy for a trailing newline and CRLF, so an unedited span
+        # can fail that hash after any other edit in the file forces this path.
+        # If the current text parses the same as format(original), the user did
+        # not change the span: put the original ciphertext back.
+        if plain_hash == record["plain_hash"] or _opened_form_unchanged(plaintext, record, vault):
             replacements.append((region_start, region_end, original_encrypted))
         else:
             vault_id = record.get("vault_id") or None

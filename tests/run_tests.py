@@ -62,10 +62,16 @@ def main():
     ]
 
     results = []
+    failed_to_load = False
     for module_name, test_classes in test_config:
         result = run_test_classes(module_name, test_classes)
-        if result:
-            results.append((module_name, result))
+        # A load error returns None. An empty suite is also a green CI run
+        # today, because the summary only counts results that were appended.
+        if result is None or result.testsRun == 0:
+            print(f"Failed to run {module_name}")
+            failed_to_load = True
+            continue
+        results.append((module_name, result))
 
     # Summary
     print(f"\n{'=' * 60}")
@@ -96,6 +102,10 @@ def main():
         f"{'TOTAL':<20} {total_tests:>3} tests  "
         f"{total_failures:>3} failures  {total_errors:>3} errors"
     )
+
+    if failed_to_load or total_tests == 0:
+        print("\n❌ Test suite did not run.")
+        return 1
 
     if total_failures == 0 and total_errors == 0:
         print("\n✅ All tests passed! Both pilfer versions work correctly.")
