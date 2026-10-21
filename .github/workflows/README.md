@@ -9,7 +9,7 @@ This directory contains automated workflows for the pilfer project.
 Fast, essential testing on every push and pull request.
 
 - Python 3.12 on Ubuntu
-- Ruff lint
+- Ruff lint (`requirements-dev.txt` pin)
 - Unified test suite
 - Standalone `pilfer.py --version` check
 
@@ -18,7 +18,7 @@ Fast, essential testing on every push and pull request.
 Thorough validation for larger changes and pre-release checks.
 
 - Multi-Python matrix (3.10–3.13)
-- Ruff lint
+- Ruff lint (`requirements-dev.txt` pin)
 - Bandit (`-ll`, fails on medium+; SARIF uploaded to Security)
 - Coverage reports uploaded as artifacts
 
@@ -31,6 +31,10 @@ CodeQL runs via GitHub's default code scanning setup (managed workflow, not a re
 - Config: [`.github/codeql/codeql-config.yml`](../codeql/codeql-config.yml) (`paths-ignore: tests`)
 - [`dismiss-codeql-fp.yml`](dismiss-codeql-fp.yml) dismisses the vault session-binding SHA-256 false positive after each CodeQL run (default setup ignores in-source `# codeql[...]` suppressions)
 - Complements Bandit (Python-specific rules) in `test.yml`
+
+### `auto-merge.yml` - Dependabot and CodeQL action bumps
+
+Enables auto-merge on Dependabot pull requests for minor and patch updates after required checks pass. Major version bumps stay for review. A pip release note that says "breaking change" also stays for review. The same phrase on a GitHub Action pin does not, including `codeql-action`: the pin is the whole diff, and a pin that breaks CI never satisfies the required checks.
 
 ### `release.yml` - Release and PyPI publish
 
@@ -49,7 +53,7 @@ Tag pushes publish. Manual `workflow_dispatch` validates and builds only.
 `.github/dependabot.yml` opens weekly PRs (Mondays 09:00 UTC) for:
 
 - GitHub Actions updates (one grouped PR)
-- Python dependencies from `pyproject.toml` (minor/patch grouped separately from major)
+- Python dependencies from `pyproject.toml` and `requirements-dev.txt` (minor/patch grouped separately from major)
 - Labels: `dependencies`, plus `github-actions` or `python`
 - Cooldown on pip updates (longer wait for major semver bumps)
 - Security updates remain immediate and are not batched with version updates
@@ -60,6 +64,7 @@ Tag pushes publish. Manual `workflow_dispatch` validates and builds only.
 |----------|---------|------|--------|
 | `ci.yml` | main, master | - | - |
 | `test.yml` | main, master | - | yes |
+| `auto-merge.yml` | Dependabot PRs | - | - |
 | CodeQL (default setup) | main, master | - | - |
 | `release.yml` | - | `v*` | yes (dry-run) |
 
@@ -139,7 +144,8 @@ cd tests && python run_tests.py
 ```
 
 ```bash
-# Lint (same as ci.yml / test.yml)
+# Lint (same pin as ci.yml / test.yml)
+pip install -r requirements-dev.txt
 ruff check pilfer/ pilfer.py tests/
 
 # Security scanning

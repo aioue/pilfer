@@ -15,6 +15,4 @@ ignore = [
 ]
 
 [lint.per-file-ignores]
-"tests/*" = ["S101", "PLW1510"]
-"pilfer/cli.py" = ["BLE001"]
-"pilfer/inline.py" = ["BLE001", "SIM103"]
+"pilfer/inline.py" = ["SIM103"]
