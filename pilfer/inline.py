@@ -273,8 +273,19 @@ def decrypt_inline_content(content: bytes, vault: VaultLib) -> tuple[bytes, list
     return new_content, records
 
 
-def _parse_marked_value(content: bytes, match: re.Match) -> tuple[bytes, int, int]:
-    """Return (plaintext_bytes, region_start, region_end) for an open marker match."""
+def _parse_marked_value(
+    content: bytes,
+    match: re.Match,
+    *,
+    block_indent: bytes | None = None,
+) -> tuple[bytes, int, int]:
+    """Return (plaintext_bytes, region_start, region_end) for an open marker match.
+
+    block_indent is the prefix format_open_value added to each body line. Strip
+    that prefix only, so spaces that belong to the secret survive an edit.
+    Without it, each line is fully dedented (callers that did not record the
+    open indent).
+    """
     indent = match.group("indent")
     value = match.group("value")
     region_start = match.start()
@@ -310,7 +321,12 @@ def _parse_marked_value(content: bytes, match: re.Match) -> tuple[bytes, int, in
             line_indent = len(line) - len(line.lstrip(b" \t"))
             if line_indent <= base_indent_len:
                 break
-            body_lines.append(line.lstrip(b" \t").rstrip(b"\r\n"))
+            body = line.rstrip(b"\r\n")
+            if block_indent and body.startswith(block_indent):
+                body = body[len(block_indent) :]
+            else:
+                body = body.lstrip(b" \t")
+            body_lines.append(body)
             cursor = next_end
         plaintext = b"\n".join(body_lines)
         return plaintext, region_start, cursor
@@ -559,7 +575,9 @@ def _opened_form_unchanged(parsed_current: bytes, record: dict, vault: VaultLib)
     match = MARKER_RE.search(opened)
     if match is None:
         return False
-    parsed_opened, _, _ = _parse_marked_value(opened, match)
+    parsed_opened, _, _ = _parse_marked_value(
+        opened, match, block_indent=span.body_indent
+    )
     return parsed_current == parsed_opened
 
 
@@ -680,7 +698,10 @@ def recrypt_inline_content(
                 f"{stored_name!r} (or restore the line) before close."
             )
 
-        plaintext, region_start, region_end = _parse_marked_value(content, match)
+        block_indent = record["body_indent"].encode("utf-8", errors="surrogateescape")
+        plaintext, region_start, region_end = _parse_marked_value(
+            content, match, block_indent=block_indent
+        )
         plain_hash = hashlib.sha256(plaintext).hexdigest()
         original_encrypted = base64.b64decode(record["encrypted_b64"])
 

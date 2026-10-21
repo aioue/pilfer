@@ -661,9 +661,10 @@ def _cleanup_stale_rekey_temps(root: str | None = None, *, include_open_markers:
 
     Never deletes *.pilfer-open sidecars. A renamed YAML file that still has an
     open marker is orphan evidence and is kept. Extensionless names are mkstemp
-    leftovers: when include_open_markers is set, those are removed even if they
-    hold decrypted inline text, because close would otherwise succeed and leave
-    the plaintext beside the restored ciphertext. Skips nested git checkouts.
+    leftovers. When include_open_markers is set, those are removed when they
+    hold decrypted text (inline marker, or whole-file plaintext with no marker).
+    Vault ciphertext stays, so rekey --dry-run does not delete .pilfer-rekey-*
+    staging. A confirmed rekey deletes that ciphertext. Skips nested git checkouts.
     """
     walk_dir = os.path.abspath(root or os.getcwd())
     marker = MARKER_PREFIX.encode("utf-8")
@@ -685,9 +686,11 @@ def _cleanup_stale_rekey_temps(root: str | None = None, *, include_open_markers:
                     # A .yml/.yaml rename is orphan evidence.
                     if not (include_open_markers and suffix == ""):
                         continue
-                elif include_open_markers:
-                    # Leave ciphertext staging for the confirmed-rekey sweep.
-                    # Dry-run must not delete those files.
+                elif include_open_markers and (suffix != "" or is_whole_file_vault(data)):
+                    # No inline marker. A suffixed rename stays. Extensionless
+                    # vault ciphertext stays so rekey --dry-run does not delete
+                    # it. Extensionless non-vault bytes are whole-file plaintext
+                    # from a killed open and fall through to unlink.
                     continue
                 os.unlink(path)
                 removed += 1
@@ -1326,9 +1329,9 @@ def rekey_vault_files(
     Returns number of files rewritten (0 on dry-run / already complete).
     """
     _refuse_planted_session_links()
-    # Extensionless staging files can hold decrypted inline text from a
-    # cancelled open. Remove those before the orphan check. Ciphertext
-    # leftovers stay until a confirmed rekey, so dry-run does not delete them.
+    # Extensionless staging files can hold decrypted text from a cancelled
+    # open. Remove those before the orphan check. Vault ciphertext leftovers
+    # stay until a confirmed rekey, so dry-run does not delete them.
     _cleanup_stale_rekey_temps(include_open_markers=True)
     if _session_is_open():
         raise PilferError(

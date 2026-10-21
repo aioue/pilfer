@@ -506,6 +506,22 @@ class TestSessionSafety(unittest.TestCase):
         self.assertEqual(opened.returncode, 0, opened.stderr)
         self.assertFalse(os.path.exists(".pilfer-rekey-cancelled"))
 
+    def test_killed_whole_file_plaintext_temp_removed_on_open(self):
+        """SIGKILL skips finally. Whole-file plaintext has no inline marker."""
+        with open(".pilfer-rekey-killed", "w") as handle:
+            handle.write("secret_key: hunter2\n")
+        opened = self._run("open")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertFalse(os.path.exists(".pilfer-rekey-killed"))
+
+    def test_vault_ciphertext_temp_survives_open(self):
+        """Rekey dry-run must still find ciphertext left under the staging prefix."""
+        with open(".pilfer-rekey-deadbeef", "wb") as handle:
+            handle.write(self.vault.encrypt(b"orphan: true\n"))
+        opened = self._run("open")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertTrue(os.path.isfile(".pilfer-rekey-deadbeef"))
+
     def test_renamed_yaml_under_rekey_prefix_still_blocks(self):
         with open(".pilfer-rekey-hidden.yml", "w") as handle:
             handle.write('db_password: "secret"  # pilfer:vault:0\n')
@@ -768,6 +784,24 @@ class TestInlineVault(unittest.TestCase):
         spans = pilfer_inline.find_inline_vault_spans(data)
         got = [self.vault.decrypt(span.ciphertext) for span in spans]
         self.assertEqual(got, [b"  return 1;\n", b"\n"])
+
+    def test_edited_indented_multiline_secret_keeps_relative_indent(self):
+        secret = b"  return 1;\n    return 2;\n"
+        self._write_vars_file(("code", secret))
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml") as handle:
+            text = handle.read()
+        self.assertIn("return 1;", text)
+        text = text.replace("return 1;", "return 9;", 1)
+        with open("group_vars.yml", "w") as handle:
+            handle.write(text)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        with open("group_vars.yml", "rb") as handle:
+            data = handle.read()
+        spans = pilfer_inline.find_inline_vault_spans(data)
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(self.vault.decrypt(spans[0].ciphertext), b"  return 9;\n    return 2;")
 
     def test_mixed_whole_file_and_inline(self):
         with open("whole.yml", "wb") as f:
