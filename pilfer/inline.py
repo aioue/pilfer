@@ -299,6 +299,18 @@ def _parse_marked_value(
             next_end = _line_end(content, cursor)
             line = content[cursor:next_end]
             if not line.strip():
+                body = line.rstrip(b"\r\n")
+                if (
+                    block_indent
+                    and body.startswith(block_indent)
+                    and len(body) > len(block_indent)
+                ):
+                    # Spaces past the opened indent are secret content. Treating
+                    # them as a blank makes an edit of that line parse the same
+                    # as the original, so close restores the old ciphertext.
+                    body_lines.append(body[len(block_indent) :])
+                    cursor = next_end
+                    continue
                 # Interior blank lines belong to the block. A blank run that is
                 # followed by a dedented key (or EOF) is the separator before the
                 # next key; consuming it makes an unedited secret look modified.

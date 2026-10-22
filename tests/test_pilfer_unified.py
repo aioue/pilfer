@@ -803,6 +803,48 @@ class TestInlineVault(unittest.TestCase):
         self.assertEqual(len(spans), 1)
         self.assertEqual(self.vault.decrypt(spans[0].ciphertext), b"  return 9;\n    return 2;")
 
+    def test_edited_whitespace_only_line_is_kept(self):
+        secret = b"line1\n   \nline3\n"
+        self._write_vars_file(("code", secret))
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml") as handle:
+            text = handle.read()
+        content_indent = None
+        for line in text.splitlines():
+            if line.endswith("line1"):
+                content_indent = line[: line.index("line1")]
+                break
+        self.assertIsNotNone(content_indent)
+        old_mid = content_indent + "   "
+        new_mid = content_indent + " "
+        self.assertIn(old_mid, text)
+        text = text.replace(old_mid, new_mid, 1)
+        with open("group_vars.yml", "w") as handle:
+            handle.write(text)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        with open("group_vars.yml", "rb") as handle:
+            data = handle.read()
+        spans = pilfer_inline.find_inline_vault_spans(data)
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(self.vault.decrypt(spans[0].ciphertext), b"line1\n \nline3")
+
+    def test_neighbor_edit_preserves_whitespace_only_line(self):
+        secret = b"line1\n   \nline3\n"
+        self._write_vars_file(("code", secret))
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml") as handle:
+            text = handle.read()
+        text = text.replace("plain_key: visible", "plain_key: edited")
+        with open("group_vars.yml", "w") as handle:
+            handle.write(text)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        with open("group_vars.yml", "rb") as handle:
+            data = handle.read()
+        spans = pilfer_inline.find_inline_vault_spans(data)
+        self.assertEqual(self.vault.decrypt(spans[0].ciphertext), secret)
+
     def test_mixed_whole_file_and_inline(self):
         with open("whole.yml", "wb") as f:
             f.write(self.vault.encrypt(b"whole: file\n"))
@@ -1259,6 +1301,28 @@ class TestInlineUnit(unittest.TestCase):
         plaintext, _start, end = pilfer_inline._parse_marked_value(content, match)
         self.assertEqual(plaintext, b"line1\n\nline3")
         self.assertTrue(content[end:].startswith(b"other:"))
+
+    def test_parse_block_keeps_spaces_past_recorded_indent(self):
+        content = (
+            b"db_password: |  # pilfer:vault:0\n"
+            b"  line1\n"
+            b"     \n"
+            b"  line3\n"
+            b"other: x\n"
+        )
+        match = pilfer_inline.MARKER_RE.search(content)
+        self.assertIsNotNone(match)
+        plaintext, _start, end = pilfer_inline._parse_marked_value(
+            content, match, block_indent=b"  "
+        )
+        self.assertEqual(plaintext, b"line1\n   \nline3")
+        self.assertTrue(content[end:].startswith(b"other:"))
+        blank = content.replace(b"     \n", b"  \n", 1)
+        match = pilfer_inline.MARKER_RE.search(blank)
+        plaintext, _start, _end = pilfer_inline._parse_marked_value(
+            blank, match, block_indent=b"  "
+        )
+        self.assertEqual(plaintext, b"line1\n\nline3")
 
     def test_is_whole_file_vault_tolerates_bom_and_whitespace(self):
         body = b"$ANSIBLE_VAULT;1.1;AES256\naabb\n"
