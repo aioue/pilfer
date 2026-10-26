@@ -1,2 +1,2 @@
 # CI lint pin. Dependabot bumps this file. A ruff release that fails CI stays open.
-ruff==0.17.1
+ruff==0.17.2
