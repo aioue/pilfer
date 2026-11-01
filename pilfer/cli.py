@@ -1428,8 +1428,13 @@ def _rotate_password_file(old_path: str, new_path: str) -> str:
         installed = True
     finally:
         if not installed:
-            # The live file still holds the old password; the backup is a spare copy.
-            _remove_file(backup)
+            # The live file still holds the old password; the backup is a spare
+            # copy. Not _remove_file: its warning would print a password-file
+            # path, which CodeQL reports as logging sensitive data.
+            try:
+                os.remove(backup)
+            except OSError:
+                pass
     return backup
 
 

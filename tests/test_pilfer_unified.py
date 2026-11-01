@@ -12,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from abc import ABC, abstractmethod
 from pathlib import Path
 from unittest import mock
 
@@ -74,8 +73,8 @@ class ProjectDirTest(unittest.TestCase):
         )
 
 
-class PilferTestBase(ProjectDirTest, ABC):
-    """Shared happy-path tests for CLI function API and standalone script."""
+class TestPilferCLI(ProjectDirTest):
+    """Open/close happy paths through the pilfer.cli functions."""
 
     def setUp(self):
         super().setUp()
@@ -101,13 +100,11 @@ class PilferTestBase(ProjectDirTest, ABC):
             with open(filename, "rb") as f:
                 self.original_hashes[filename] = hashlib.sha256(f.read()).hexdigest()
 
-    @abstractmethod
     def pilfer_open(self, vault_pass_file="vault_pass"):
-        pass
+        pilfer_cli.open_vault_files(vault_pass_file)
 
-    @abstractmethod
     def pilfer_close(self, vault_pass_file="vault_pass"):
-        pass
+        return pilfer_cli.recrypt_vault_files(vault_pass_file)
 
     def test_unchanged_files_same_hash(self):
         self.pilfer_open()
@@ -155,14 +152,6 @@ class PilferTestBase(ProjectDirTest, ABC):
         with open("windows_vault.yml", "w") as f:
             f.write("modified_secret2: new_value2\r\n")
         self.assertEqual(self.pilfer_close(), 2)
-
-
-class TestPilferCLI(PilferTestBase):
-    def pilfer_open(self, vault_pass_file="vault_pass"):
-        pilfer_cli.open_vault_files(vault_pass_file)
-
-    def pilfer_close(self, vault_pass_file="vault_pass"):
-        return pilfer_cli.recrypt_vault_files(vault_pass_file)
 
 
 class TestPilferStandalone(ProjectDirTest):
