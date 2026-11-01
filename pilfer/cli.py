@@ -1556,13 +1556,20 @@ No --include-encrypted-vars flag is needed on close.
 
 _SET_EPILOG = """
 Examples:
-  pilfer set inventory/group_vars/all/secrets.yml db_password 'new value'
+  pilfer set inventory/group_vars/all/secrets.yml db_password
+      (prompts for the value without echoing it)
+  printf '%s' "$TOKEN" | pilfer set secrets.yml api_token
   pilfer set secrets.yml api_token -- '-starts-with-a-dash'
 
 Sets one top-level key in a closed whole-file vault without writing plaintext to
 disk. A new key is appended; an existing scalar is replaced in place, keeping an
 inline comment. The value is stored as a JSON-quoted string, so yes/no/0123 stay
-strings. Refuses plaintext and files open in a pilfer session.
+strings. A value containing {{, {% or {# is stored as !unsafe so Ansible does
+not template it. Refuses plaintext and files open in a pilfer session.
+
+Leave VALUE out to read it from stdin: a hidden prompt on a terminal, otherwise
+the whole input with one trailing newline dropped. A VALUE argument is visible
+in ps and saved in shell history.
 """
 
 _REKEY_EPILOG = """
@@ -1706,7 +1713,12 @@ def _build_argument_parser():
     )
     set_parser.add_argument("file", help="Whole-file vault YAML")
     set_parser.add_argument("key", help="Top-level key to add or replace")
-    set_parser.add_argument("value", help="New string value (use -- before a leading dash)")
+    set_parser.add_argument(
+        "value",
+        nargs="?",
+        help="New string value. Omit it to read stdin or get a hidden prompt "
+        "(use -- before a value with a leading dash)",
+    )
     set_parser.add_argument(
         "-p",
         "--vault-password-file",
@@ -1807,9 +1819,19 @@ def main(argv=None):
 
         if args.action == "set":
             # Imported here: vault_set imports helpers from this module.
-            from pilfer.vault_set import set_keys
+            from pilfer.vault_set import read_value, set_keys
 
-            actions = set_keys(args.file, {args.key: args.value}, args.vault_password_file)
+            value = args.value
+            if value is None:
+                # Refuse before asking for the secret, not after someone has pasted it.
+                set_keys(
+                    args.file,
+                    {args.key: "pilfer-set-check-placeholder"},
+                    args.vault_password_file,
+                    check_only=True,
+                )
+                value = read_value(args.key)
+            actions = set_keys(args.file, {args.key: value}, args.vault_password_file)
             print(f"{actions[args.key]} {args.key} in {args.file}")
             return 0
 

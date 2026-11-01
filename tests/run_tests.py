@@ -59,7 +59,10 @@ def main():
                 "TestVersion",
             ],
         ),
-        ("test_vault_set", ["TestVaultSet", "TestVaultSetCLI"]),
+        (
+            "test_vault_set",
+            ["TestVaultSet", "TestVaultSetUnsafe", "TestReadValue", "TestVaultSetCLI"],
+        ),
     ]
 
     results = []

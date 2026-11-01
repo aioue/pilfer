@@ -271,9 +271,29 @@ class TestVaultSet(VaultSetBase):
         self._assert_untouched()
 
     def test_encrypt_failure(self) -> None:
+        # Script callers catch PilferError only; an Ansible error must not escape raw.
         with (
-            mock.patch.object(VaultLib, "encrypt", side_effect=RuntimeError("boom")),
-            self.assertRaises(RuntimeError),
+            mock.patch.object(VaultLib, "encrypt", side_effect=RuntimeError(SENTINEL)),
+            self.assertRaises(PilferError) as caught,
+        ):
+            self._set("target", SENTINEL)
+        self.assertNotIn(SENTINEL, str(caught.exception))
+        self.assertIn("RuntimeError", str(caught.exception))
+        self._assert_untouched()
+
+    def test_round_trip_decrypt_failure(self) -> None:
+        real = VaultLib.decrypt
+        calls = []
+
+        def decrypt_then_fail(vault, data, *args, **kwargs):
+            calls.append(data)
+            if len(calls) > 1:
+                raise AnsibleError("round-trip boom")
+            return real(vault, data, *args, **kwargs)
+
+        with (
+            mock.patch.object(VaultLib, "decrypt", autospec=True, side_effect=decrypt_then_fail),
+            self.assertRaises(PilferError),
         ):
             self._set("target", SENTINEL)
         self._assert_untouched()
@@ -351,7 +371,7 @@ class TestVaultSet(VaultSetBase):
             "duplicate": "target: one\ntarget: two\n",
             "block scalar": "target: |\n  line\n",
             "list root": "- target\n",
-            "unknown tag": "target: !unsafe '{{ x }}'\n",
+            "unknown tag": "target: !custom 'x'\n",
         }
         for label, text in cases.items():
             with self.subTest(label):
@@ -360,6 +380,42 @@ class TestVaultSet(VaultSetBase):
                 with self.assertRaises(PilferError):
                     set_keys(path, {"target": SENTINEL}, str(self.password), check_only=True)
                 self._assert_untouched(path, before)
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes to mode-555 directories")
+    def test_check_only_refuses_a_read_only_directory(self) -> None:
+        # The real write needs a temp next to the vault. check_only must hit the same
+        # refusal, or a caller mints a token the write then cannot store.
+        os.chmod(self.directory, 0o555)
+        try:
+            for check_only in (True, False):
+                with self.subTest(check_only=check_only):
+                    with self.assertRaises(PilferError):
+                        set_keys(
+                            self.vault,
+                            {"target": SENTINEL},
+                            str(self.password),
+                            check_only=check_only,
+                        )
+                    self._assert_untouched()
+        finally:
+            # tearDown removes the directory before addCleanup callbacks run.
+            os.chmod(self.directory, 0o755)
+
+    def test_check_only_sees_a_concurrent_change(self) -> None:
+        concurrent = _vault().encrypt(b"alpha: concurrent\n")
+        real_encrypt = VaultLib.encrypt
+
+        def encrypt_then_race(vault, *args, **kwargs):
+            out = real_encrypt(vault, *args, **kwargs)
+            self.vault.write_bytes(concurrent)
+            return out
+
+        with (
+            mock.patch.object(VaultLib, "encrypt", autospec=True, side_effect=encrypt_then_race),
+            self.assertRaises(PilferError),
+        ):
+            set_keys(self.vault, {"target": SENTINEL}, str(self.password), check_only=True)
+        self._assert_untouched(before=concurrent)
 
     def test_check_only_refuses_an_open_session(self) -> None:
         (self.directory / "secrets.yml.pilfer-open").touch()
@@ -398,6 +454,16 @@ class TestVaultSet(VaultSetBase):
                     self._set("alpha", SENTINEL, vault)
                 self._assert_untouched(vault, before)
 
+    def test_refuses_keys_yaml_reads_as_bool_or_null(self) -> None:
+        for key in ("yes", "No", "on", "OFF", "true", "null", "Null"):
+            with self.subTest(key=key):
+                with self.assertRaises(PilferError) as caught:
+                    self._set(key, SENTINEL)
+                self.assertIn("bool or null", str(caught.exception))
+        self._assert_untouched()
+        # Look-alikes YAML 1.1 keeps as strings still work.
+        self.assertEqual(self._set("y", SENTINEL), "added")
+
     def test_refuses_plaintext_symlink_and_pilfer_sidecar(self) -> None:
         plain = self.directory / "plain.yml"
         plain.write_text("alpha: one\n", encoding="utf-8")
@@ -420,14 +486,158 @@ class TestVaultSet(VaultSetBase):
         self._assert_untouched()
 
 
+class TestVaultSetUnsafe(VaultSetBase):
+    """Ansible templates vaulted strings; a value with a Jinja delimiter must stay literal."""
+
+    JINJA = "ab{{ 7*6 }}cd{% x %}{# y #}"
+
+    def _template(self, path: Path, key: str) -> str:
+        """What a play sees for key, through ansible-playbook and the vault password."""
+        playbook = self.directory / "show.yml"
+        playbook.write_text(
+            "- hosts: localhost\n"
+            "  gather_facts: false\n"
+            f"  vars_files: [{path.name}]\n"
+            "  tasks:\n"
+            f"    - copy: {{content: '{{{{ {key} }}}}', dest: ./rendered.txt}}\n",
+            encoding="utf-8",
+        )
+        ansible_playbook = shutil.which("ansible-playbook")
+        assert ansible_playbook, "ansible-playbook not on PATH"
+        subprocess.run(
+            [
+                ansible_playbook,
+                "-i",
+                "localhost,",
+                "-c",
+                "local",
+                "--vault-password-file",
+                str(self.password),
+                str(playbook),
+            ],
+            check=True,
+            capture_output=True,
+            cwd=self.directory,
+        )
+        return (self.directory / "rendered.txt").read_text(encoding="utf-8")
+
+    def test_jinja_value_is_written_unsafe_and_reaches_ansible_as_typed(self) -> None:
+        self.assertEqual(self._set("target", self.JINJA), "updated")
+        rendered = f"!unsafe {json.dumps(self.JINJA)}"
+        self.assertEqual(self._view(), FIXTURE.replace('"old-value"', rendered))
+        self.assertEqual(self._template(self.vault, "target"), self.JINJA)
+
+    def test_plain_value_without_delimiters_is_not_tagged(self) -> None:
+        # Single braces are not Jinja; homelab's line readers expect key: "...".
+        for value in ("{a: 1}", "a{b}c", "%{x}", "{ {x} }"):
+            with self.subTest(value=value):
+                self._set("target", value)
+                self.assertEqual(self._view(), _expected_target(value))
+
+    def test_vault_with_unsafe_values_can_be_edited_and_they_stay_byte_exact(self) -> None:
+        text = "keep: !unsafe 'x{{ y }}'  # note\nitems: !unsafe ['{{ a }}', b]\ntarget: old\n"
+        vault = self._encrypt(text, name="unsafe.yml")
+        self.assertEqual(self._set("target", SENTINEL, vault), "updated")
+        self.assertEqual(self._view(vault), text.replace("target: old", f'target: "{SENTINEL}"'))
+
+    def test_existing_unsafe_tag_is_kept_on_replace(self) -> None:
+        vault = self._encrypt("target: !unsafe 'x{{ y }}'  # note\n", name="tagged.yml")
+        self.assertEqual(self._set("target", SENTINEL, vault), "updated")
+        self.assertEqual(self._view(vault), f'target: !unsafe "{SENTINEL}"  # note\n')
+        self.assertEqual(self._set("target", SENTINEL, vault), "unchanged")
+
+    def test_same_jinja_value_gains_the_tag(self) -> None:
+        # Stored untagged, Ansible would template it; the same value is not "unchanged".
+        vault = self._encrypt(f"target: {json.dumps(self.JINJA)}\n", name="untagged.yml")
+        self.assertEqual(self._set("target", self.JINJA, vault), "updated")
+        self.assertEqual(self._view(vault), f"target: !unsafe {json.dumps(self.JINJA)}\n")
+        self.assertEqual(self._set("target", self.JINJA, vault), "unchanged")
+
+    def test_new_key_with_jinja_is_added_unsafe(self) -> None:
+        self.assertEqual(self._set("beta", self.JINJA), "added")
+        self.assertEqual(self._view(), FIXTURE + f"beta: !unsafe {json.dumps(self.JINJA)}\n")
+        self.assertEqual(self._template(self.vault, "beta"), self.JINJA)
+
+    def test_safe_load_is_not_patched(self) -> None:
+        # The !unsafe constructor lives on pilfer's own loader only.
+        with self.assertRaises(yaml.constructor.ConstructorError):
+            yaml.safe_load("a: !unsafe x\n")
+
+
+class TestReadValue(unittest.TestCase):
+    """The CLI value source when VALUE is left out."""
+
+    def _stdin(self, data: bytes, tty: bool = False):
+        stream = mock.Mock()
+        stream.isatty.return_value = tty
+        stream.buffer.read.side_effect = lambda n=-1: data if n < 0 else data[:n]
+        return mock.patch.object(sys, "stdin", stream)
+
+    def test_pipe_drops_one_trailing_line_ending(self) -> None:
+        for data, expected in (
+            (b"tok\n", "tok"),
+            (b"tok\r\n", "tok"),
+            (b"tok", "tok"),
+            (b"tok\n\n", "tok\n"),
+            (b"multi\nline\n", "multi\nline"),
+            ("ünï\n".encode(), "ünï"),
+        ):
+            with self.subTest(data=data), self._stdin(data):
+                self.assertEqual(vault_set.read_value("k"), expected)
+
+    def test_pipe_refuses_non_utf8_without_echoing_it(self) -> None:
+        with self._stdin(b"pass\xffword"), self.assertRaises(PilferError) as caught:
+            vault_set.read_value("k")
+        self.assertNotIn("xff", str(caught.exception))
+
+    def test_pipe_refuses_oversized_input(self) -> None:
+        with self._stdin(b"x" * (vault_set.MAX_STDIN_VALUE_BYTES + 1)):
+            with self.assertRaises(PilferError):
+                vault_set.read_value("k")
+
+    def test_terminal_prompts_without_echo(self) -> None:
+        with (
+            self._stdin(b"", tty=True),
+            mock.patch.object(vault_set.getpass, "getpass", return_value="typed") as prompt,
+        ):
+            self.assertEqual(vault_set.read_value("k"), "typed")
+        self.assertIn("k", prompt.call_args.args[0])
+
+
 class TestVaultSetCLI(VaultSetBase):
-    def _run(self, *args: str) -> subprocess.CompletedProcess:
+    def _run(self, *args: str, stdin: bytes = b"") -> subprocess.CompletedProcess:
         return subprocess.run(
             [sys.executable, str(PILFER_SCRIPT), "set", *args],
             capture_output=True,
             check=False,
             cwd=self.directory,
+            input=stdin,
         )
+
+    def test_cli_reads_value_from_stdin(self) -> None:
+        result = self._run(
+            "-p", str(self.password), str(self.vault), "target", stdin=TRICKY.encode() + b"\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertNotIn(TRICKY.strip().encode(), result.stdout + result.stderr)
+        self.assertEqual(self._view(), _expected_target(TRICKY))
+
+    def test_cli_empty_stdin_is_refused(self) -> None:
+        for stdin in (b"", b"\n"):
+            with self.subTest(stdin=stdin):
+                result = self._run("-p", str(self.password), str(self.vault), "target", stdin=stdin)
+                self.assertEqual(result.returncode, 1)
+                self._assert_untouched()
+
+    def test_cli_refuses_before_reading_stdin(self) -> None:
+        # A refusal must come before the secret is typed or pasted, not after.
+        (self.directory / "secrets.yml.pilfer-open").touch()
+        with mock.patch.object(vault_set, "read_value") as read_value:
+            from pilfer.cli import main
+
+            self.assertEqual(main(["set", "-p", str(self.password), str(self.vault), "target"]), 1)
+        read_value.assert_not_called()
+        self._assert_untouched()
 
     def test_cli_sets_exact_value_and_does_not_print_it(self) -> None:
         result = self._run("-p", str(self.password), str(self.vault), "target", TRICKY)

@@ -16,13 +16,21 @@ both rather than walking vaultedFileList.json.
 A `$ANSIBLE_VAULT;1.2;AES256;<label>` header keeps its label: VaultLib.encrypt
 writes 1.1 unless it is given the vault_id, and a dropped label changes which
 --vault-id ansible-vault later matches.
+
+Ansible runs Jinja over vaulted strings: a vaulted "ab{{ 7*6 }}cd" reaches a play
+as ab42cd (checked on ansible-core 2.21). A value that contains a Jinja delimiter
+is therefore written as `!unsafe "..."`, which Ansible leaves literal. Other
+values stay plain double-quoted scalars, the form line readers such as homelab's
+ha_token.py parse. An existing !unsafe value keeps its tag when it is replaced.
 """
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import re
+import sys
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -43,6 +51,38 @@ from pilfer.inline import (
 )
 
 KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+UNSAFE_TAG = "!unsafe"
+# Jinja's default block, variable and comment openers, which Ansible uses.
+JINJA_DELIMITERS = ("{{", "{%", "{#")
+# Large enough for a certificate or key bundle; small enough that a mistaken
+# `< /dev/zero` or a pasted log is refused instead of read into memory.
+MAX_STDIN_VALUE_BYTES = 1024 * 1024
+
+
+class _Unsafe(str):
+    """A string read from an !unsafe scalar, so the round-trip check can see the tag."""
+
+
+class _SetLoader(yaml.SafeLoader):
+    """SafeLoader that also reads Ansible's !unsafe, so vaults that use it can be edited.
+
+    Pure Python, not CSafeLoader: the edit slices the text at the composer's marks,
+    and the check below must parse with the same rules that produced them.
+    """
+
+
+def _construct_unsafe(loader: yaml.SafeLoader, node: yaml.Node):
+    if isinstance(node, yaml.ScalarNode):
+        return _Unsafe(loader.construct_scalar(node))
+    # Ansible also accepts !unsafe on a list or mapping. Its items are left as
+    # they are by set, so building them plainly is enough for the comparison.
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node, deep=True)
+    return loader.construct_mapping(node, deep=True)
+
+
+# add_constructor on the subclass copies the table; yaml.SafeLoader is untouched.
+_SetLoader.add_constructor(UNSAFE_TAG, _construct_unsafe)
 
 
 def set_keys(
@@ -57,19 +97,21 @@ def set_keys(
     All keys land in one write, so a crash cannot leave some of them set. A new
     key is appended at the end. If nothing changes, the file bytes are left alone
     so git does not see a new vault blob. Error messages never contain a value or
-    a decrypted line.
+    a decrypted line. Every refusal and failure is a PilferError.
 
-    check_only runs every step except the replace, encrypt and round-trip included,
-    so a caller can learn before an irreversible action (minting a token) whether
-    the write will be refused. Pass a placeholder shaped like the real value. A
-    concurrent change between the check and the real call is still refused then.
+    check_only runs every step except the final os.replace: the edit, the encrypt
+    and round-trip, and writing the ciphertext to a temp file in the vault's
+    directory, which is then removed. A caller can learn before an irreversible
+    action (minting a token) whether the write will be refused, including for a
+    read-only directory or a full disk. Pass a placeholder shaped like the real
+    value. A concurrent change between the check and the real call is still
+    refused then.
     """
     path = Path(path)
     if not values:
         raise PilferError("no keys to set")
     for key, value in values.items():
-        if not KEY_RE.fullmatch(key):
-            raise PilferError(f"refusing key {key!r}; use a single YAML identifier")
+        _check_key(key)
         if not isinstance(value, str) or value == "":
             raise PilferError(f"refusing an empty value for {key}")
         if "\0" in value:
@@ -88,6 +130,15 @@ def set_keys(
         else:
             detail = f"{exc.strerror}: {exc.filename}"
         raise PilferError(detail) from None
+
+
+def _check_key(key: str) -> None:
+    if not isinstance(key, str) or not KEY_RE.fullmatch(key):
+        raise PilferError(f"refusing key {key!r}; use a single YAML identifier")
+    # YAML 1.1 reads yes/no/on/off/true/false/null keys as bools or None, so
+    # `yes: x` would never be the key "yes" a playbook asks for.
+    if yaml.safe_load(key) != key:
+        raise PilferError(f"refusing key {key!r}; YAML reads it as a bool or null, not a name")
 
 
 def _set_keys(
@@ -119,12 +170,17 @@ def _set_keys(
         return actions
 
     plaintext = edited.encode("utf-8")
-    ciphertext = vault.encrypt(plaintext, vault_id=vault_id)
+    try:
+        ciphertext = vault.encrypt(plaintext, vault_id=vault_id)
+        round_trip = vault.decrypt(ciphertext) if is_whole_file_vault(ciphertext) else None
+    except Exception as exc:
+        # Ansible's messages here do not quote plaintext, but name only the type:
+        # the contract is that no PilferError carries vault content.
+        raise PilferError(f"could not encrypt {path} ({type(exc).__name__}); unchanged") from None
     # Prove the bytes decrypt to what we meant before they replace anything.
-    if not is_whole_file_vault(ciphertext) or vault.decrypt(ciphertext) != plaintext:
+    if round_trip != plaintext:
         raise PilferError(f"encryption did not round-trip; {path} unchanged")
-    if not check_only:
-        _replace_if_unchanged(path, ciphertext, original)
+    _replace_if_unchanged(path, ciphertext, original, publish=not check_only)
     return actions
 
 
@@ -147,13 +203,23 @@ def _read_closed_vault(path: Path) -> bytes:
     return original
 
 
+def _load(text: str):
+    # _SetLoader is a SafeLoader subclass; it adds only the !unsafe constructor.
+    return yaml.load(text, Loader=_SetLoader)
+
+
+def _tagged(mapping: dict) -> dict:
+    # A plain str and an _Unsafe compare equal; the tag must match too.
+    return {k: (isinstance(v, _Unsafe), v) for k, v in mapping.items()}
+
+
 def _edit_plaintext(text: str, key: str, value: str) -> tuple[str, str]:
     # YAML errors quote the offending line, which is vault plaintext. Constructors
     # also raise plain ValueError (a "2023-02-30" date names its digits), so catch
     # every Exception here and in the round-trip load below, and drop the detail.
     try:
-        old = yaml.safe_load(text)
-        root = yaml.compose(text, Loader=yaml.SafeLoader)
+        old = _load(text)
+        root = yaml.compose(text, Loader=_SetLoader)
     except Exception:
         raise PilferError("vault plaintext is not a single valid YAML document") from None
     if old is None:
@@ -166,15 +232,26 @@ def _edit_plaintext(text: str, key: str, value: str) -> tuple[str, str]:
     if len(nodes) > 1:
         raise PilferError(f"{key} appears {len(nodes)} times; refusing to guess")
 
-    # json.dumps gives a double-quoted scalar, so YAML 1.1 does not coerce yes/no/numbers.
-    rendered = json.dumps(value, ensure_ascii=False)
+    unsafe = any(delimiter in value for delimiter in JINJA_DELIMITERS)
     if nodes:
         node = nodes[0]
         if not isinstance(node, yaml.ScalarNode) or node.style in ("|", ">"):
             raise PilferError(f"{key} is not a flow scalar; edit it in a pilfer open session")
-        if old.get(key) == value:
+        # Someone tagged this value on purpose; keep the tag even if the new value
+        # has no delimiter.
+        tagged = node.tag == UNSAFE_TAG
+        unsafe = unsafe or tagged
+        if old.get(key) == value and tagged == unsafe:
             return text, "unchanged"
+    # json.dumps gives a double-quoted scalar, so YAML 1.1 does not coerce yes/no/numbers.
+    rendered = json.dumps(value, ensure_ascii=False)
+    if unsafe:
+        rendered = f"{UNSAFE_TAG} {rendered}"
+    if nodes:
         # Replace only the scalar's span, so an inline comment on the line survives.
+        # The span starts at a tag or anchor when there is one, so a kept !unsafe is
+        # written again above and an anchor is dropped (an alias to it then fails
+        # the reload below).
         start, end = node.start_mark.index, node.end_mark.index
         if text[start - 1] not in " \t":
             # An empty value ("key:") marks the position right after the colon.
@@ -190,18 +267,27 @@ def _edit_plaintext(text: str, key: str, value: str) -> tuple[str, str]:
     # folds to a space, and noncharacters such as U+FFFE fail the YAML reader. Refuse
     # rather than store a different secret.
     try:
-        new = yaml.safe_load(new_text)
+        new = _load(new_text)
     except Exception:
         raise PilferError(f"refusing to write {key}: edit did not produce valid YAML") from None
-    if new != {**old, key: value}:
+    expected = {**old, key: _Unsafe(value) if unsafe else value}
+    if not isinstance(new, dict) or _tagged(new) != _tagged(expected):
         raise PilferError(
             f"refusing to write {key}: YAML round-trip did not preserve the value or other keys"
         )
     return new_text, action
 
 
-def _replace_if_unchanged(path: Path, data: bytes, expected: bytes) -> None:
+def _replace_if_unchanged(
+    path: Path, data: bytes, expected: bytes, *, publish: bool = True
+) -> None:
     """Publish ciphertext with the file's mode, unless another writer changed it meanwhile.
+
+    With publish=False every step runs except os.replace, and the temp is removed:
+    check_only uses it so a read-only directory or a full disk is reported before
+    the real call. A mode or os.access check would miss ACLs, read-only mounts and
+    sandbox denials. Not covered: a sticky directory where the vault belongs to
+    another user, which only refuses the rename itself.
 
     The temp uses pilfer's rekey prefix, so open's scan skips a temp left by a
     killed process. It holds ciphertext only. open and close keep vault
@@ -218,8 +304,9 @@ def _replace_if_unchanged(path: Path, data: bytes, expected: bytes) -> None:
             os.fsync(handle.fileno())
         if path.is_symlink() or path.read_bytes() != expected:
             raise PilferError(f"{path} changed during the edit; nothing written. Retry")
-        os.replace(tmp, path)
-        replaced = True
+        if publish:
+            os.replace(tmp, path)
+            replaced = True
     finally:
         # BaseException too: KeyboardInterrupt must not leave the temp behind.
         if not replaced:
@@ -227,3 +314,30 @@ def _replace_if_unchanged(path: Path, data: bytes, expected: bytes) -> None:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+def read_value(key: str) -> str:
+    """Read a value for `pilfer set` without putting it on the command line.
+
+    A terminal gets a no-echo prompt. Piped or redirected input is read whole and
+    one trailing line ending is dropped, so `echo "$TOKEN" | pilfer set ...` stores
+    the token without a newline; a value that must end in a newline cannot come in
+    this way. argv is visible in `ps` and lands in shell history; stdin is neither.
+    """
+    stdin = sys.stdin
+    if stdin is None:
+        raise PilferError(f"no value for {key}: pass it on stdin")
+    if stdin.isatty():
+        try:
+            return getpass.getpass(f"Value for {key} (input hidden): ")
+        except EOFError:
+            raise PilferError(f"no value for {key}") from None
+    data = stdin.buffer.read(MAX_STDIN_VALUE_BYTES + 1)
+    if len(data) > MAX_STDIN_VALUE_BYTES:
+        raise PilferError(f"value for {key} on stdin is over {MAX_STDIN_VALUE_BYTES} bytes")
+    try:
+        value = data.decode("utf-8")
+    except UnicodeDecodeError:
+        # The exception text quotes the offending byte.
+        raise PilferError(f"value for {key} on stdin is not UTF-8") from None
+    return value.removesuffix("\n").removesuffix("\r") if value.endswith("\n") else value
