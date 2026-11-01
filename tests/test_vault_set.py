@@ -621,17 +621,22 @@ class TestVaultSetUnsafe(VaultSetBase):
         self.assertEqual(self._set("target", SENTINEL, vault), "unchanged")
 
     def test_existing_unsafe_tag_is_dropped_when_ansible_would_retype(self) -> None:
-        # !unsafe re-resolves the scalar. Quoted 0123 would become int 83.
+        # !unsafe re-resolves the scalar. Current Ansible turns quoted 0123
+        # into int 83, so the tag has to go. An older Ansible that still
+        # returns the string keeps the tag.
         vault = self._encrypt("target: !unsafe 'old'\n", name="retype.yml")
         for value in ("0123", "yes", "null", "1:30", "2024-01-01"):
             with self.subTest(value=value):
                 self.assertEqual(self._set("target", value, vault), "updated")
                 text = self._view(vault)
-                self.assertNotIn("!unsafe", text)
-                self.assertEqual(text, f"target: {json.dumps(value)}\n")
                 loaded = AnsibleLoader(text).get_single_data()["target"]
                 self.assertIsInstance(loaded, str)
                 self.assertEqual(loaded, value)
+                if vault_set._ansible_keeps_string(value):
+                    self.assertIn("!unsafe", text)
+                else:
+                    self.assertNotIn("!unsafe", text)
+                    self.assertEqual(text, f"target: {json.dumps(value)}\n")
 
     def test_unsafe_jinja_that_ansible_would_retype_is_refused(self) -> None:
         # A natural Jinja value stays a string. Lock the refuse branch.
