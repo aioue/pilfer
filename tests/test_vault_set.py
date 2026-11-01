@@ -909,5 +909,162 @@ class TestVaultSetCLI(VaultSetBase):
         self._assert_untouched()
 
 
+class TestReviewFollowups(VaultSetBase):
+    def test_failed_decrypt_leaves_another_opens_backup(self) -> None:
+        from pilfer import cli
+
+        plain = self.directory / "open.yml"
+        plain.write_text("target: already-open\n", encoding="utf-8")
+        backup = Path(cli._encrypted_backup_path(str(plain)))
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_bytes(b"$ANSIBLE_VAULT;1.1;AES256\nkeep-this-backup\n")
+        cli._write_session(
+            [{"path": str(plain), "kind": "file"}],
+            password_sha256="not-a-real-fingerprint",
+        )
+        with self.assertRaises(PilferError) as caught:
+            cli.decrypt_vault_files(str(self.password))
+        self.assertIn("another open", str(caught.exception))
+        self.assertEqual(backup.read_bytes(), b"$ANSIBLE_VAULT;1.1;AES256\nkeep-this-backup\n")
+        self.assertTrue((self.directory / "vaultedFileList.json").is_file())
+
+    def test_symlink_lock_is_refused(self) -> None:
+        import pilfer.publish
+
+        lock = self.directory / f"{self.vault.name}.pilfer-lock"
+        lock.symlink_to(self.directory / "missing-lock-target")
+        with self.assertRaises(OSError):
+            with pilfer.publish.vault_file_lock(self.vault):
+                pass
+        self._assert_untouched()
+        self.assertTrue(lock.is_symlink())
+
+    def test_project_lock_blocks_a_second_process(self) -> None:
+        import pilfer.publish
+
+        repo = str(Path(__file__).resolve().parents[1])
+        read_fd, write_fd = os.pipe()
+        os.set_inheritable(write_fd, True)
+        child = (
+            "import os\n"
+            "from pilfer.publish import project_session_lock\n"
+            f"os.write({write_fd}, b'1')\n"
+            "with project_session_lock():\n"
+            f"    os.write({write_fd}, b'2')\n"
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child],
+            cwd=self.directory,
+            env=env,
+            pass_fds=(write_fd,),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        os.close(write_fd)
+        try:
+            with pilfer.publish.project_session_lock():
+                self.assertEqual(os.read(read_fd, 1), b"1")
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    proc.wait(timeout=0.4)
+            self.assertEqual(os.read(read_fd, 1), b"2")
+            self.assertEqual(proc.wait(timeout=30), 0)
+        finally:
+            os.close(read_fd)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            if proc.stderr is not None:
+                proc.stderr.close()
+            if proc.stdout is not None:
+                proc.stdout.close()
+
+    def test_acl_read_failure_does_not_publish(self) -> None:
+        import ctypes
+        import errno
+
+        import pilfer.publish
+
+        lib = pilfer.publish._load_acl()
+        if lib is None or lib._pilfer_get_np is None:
+            self.skipTest("host acl_get_fd_np is unavailable")
+
+        def boom(_fd, _kind):
+            ctypes.set_errno(errno.EIO)
+            return None
+
+        with mock.patch.object(lib, "_pilfer_get_np", boom):
+            with self.assertRaises(PilferError) as caught:
+                self._set("target", "acl-should-not-land")
+        self.assertNotIn("acl-should-not-land", str(caught.exception))
+        self._assert_untouched()
+
+    def test_password_file_decode_error_hides_the_byte(self) -> None:
+        from pilfer.cli import _load_password
+
+        bad = self.directory / "bad-pass"
+        bad.write_bytes(b"\xff\xfe")
+        with self.assertRaises(PilferError) as caught:
+            _load_password(str(bad))
+        self.assertNotIn("xff", str(caught.exception).lower())
+        self.assertIn("not valid text", str(caught.exception))
+
+    def test_password_rotate_refuses_a_symlink_backup(self) -> None:
+        from pilfer.cli import _rotate_password_file
+
+        old = self._password_file("old-pass", "old-secret")
+        new = self._password_file("new-pass", "new-secret")
+        outside = self.directory / "outside"
+        outside.write_text("keep", encoding="utf-8")
+        (self.directory / "old-pass_old").symlink_to(outside)
+        with self.assertRaises(PilferError) as caught:
+            _rotate_password_file(str(old), str(new))
+        self.assertIn("symlink", str(caught.exception))
+        self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
+        self.assertEqual(old.read_text(encoding="utf-8").strip(), "old-secret")
+
+    def test_overlapping_inline_markers_are_not_spliced(self) -> None:
+        from pilfer.inline import recrypt_inline_content
+
+        content = b"outer: |  # pilfer:vault:1\n  inner: x  # pilfer:vault:2\n"
+        records = [
+            {
+                "id": 1,
+                "line_prefix": "outer: ",
+                "body_indent": "  ",
+                "plain_hash": "0" * 64,
+                "encrypted_b64": "",
+                "vault_id": None,
+            },
+            {
+                "id": 2,
+                "line_prefix": "  inner: ",
+                "body_indent": "",
+                "plain_hash": "0" * 64,
+                "encrypted_b64": "",
+                "vault_id": None,
+            },
+        ]
+        with self.assertRaises(ValueError) as caught:
+            recrypt_inline_content(content, records, _vault())
+        self.assertIn("overlapping", str(caught.exception))
+
+    def test_strict_vault_id_match_still_decrypts_a_label(self) -> None:
+        import ansible.constants as C
+
+        from pilfer import cli
+
+        secret = VaultSecret(PASSWORD.encode("utf-8"))
+        blob = VaultLib([("prod", secret)]).encrypt(b"target: labeled\n", vault_id="prod")
+        with (
+            mock.patch.object(C, "DEFAULT_VAULT_ID_MATCH", True),
+            mock.patch.object(cli, "DEFAULT_VAULT_ID_MATCH", True),
+        ):
+            vault = cli._make_vault(PASSWORD)
+            cli._match_ciphertext_label(vault, blob)
+            self.assertEqual(vault.decrypt(blob), b"target: labeled\n")
+
+
 if __name__ == "__main__":
     unittest.main()

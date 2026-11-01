@@ -359,7 +359,11 @@ def _replace_if_unchanged(
     try:
         # New inode. Copy uid, gid, mode, and ACLs, or a 0640 file would be
         # owned by the editor's primary group. Failure leaves the vault in place.
-        copy_owner_group_and_acls(path, fd, mode)
+        try:
+            copy_owner_group_and_acls(path, fd, mode)
+        except Exception:
+            os.close(fd)
+            raise
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()

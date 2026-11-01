@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import itertools
 import re
 from dataclasses import dataclass, field
 
@@ -252,6 +253,22 @@ def format_open_value(plaintext: bytes, span: InlineSpan) -> bytes:
     return span.line_prefix + quoted.encode("utf-8") + b"  " + marker + b"\n"
 
 
+def ensure_vault_label(vault: VaultLib, data: bytes) -> None:
+    """Register this ciphertext's label when Ansible matches vault ids strictly.
+
+    DEFAULT_VAULT_ID_MATCH is a bool. When it is true, a secret registered
+    under that bool does not decrypt a `prod` or `default` header.
+    """
+    from ansible.constants import DEFAULT_VAULT_ID_MATCH
+
+    if not DEFAULT_VAULT_ID_MATCH or not vault.secrets:
+        return
+    label = _vault_id_from_ciphertext(data) or "default"
+    if any(vault_id == label for vault_id, _secret in vault.secrets):
+        return
+    vault.secrets.append((label, vault.secrets[0][1]))
+
+
 def decrypt_inline_content(content: bytes, vault: VaultLib) -> tuple[bytes, list[dict]]:
     """Decrypt all inline vault spans. Returns (new_content, span_records)."""
     spans = find_inline_vault_spans(content)
@@ -261,6 +278,7 @@ def decrypt_inline_content(content: bytes, vault: VaultLib) -> tuple[bytes, list
     records = []
     plaintexts = []
     for span in spans:
+        ensure_vault_label(vault, span.ciphertext)
         plaintext = vault.decrypt(span.ciphertext)
         plaintexts.append(plaintext)
         records.append(
@@ -619,6 +637,7 @@ def _original_plaintext_from_record(record: dict, vault: VaultLib) -> bytes | No
             if idx < 0:
                 return None
             ciphertext = normalize_vault_ciphertext(blob[idx:])
+        ensure_vault_label(vault, ciphertext)
         return vault.decrypt(ciphertext)
     except Exception:
         return None
@@ -634,6 +653,7 @@ def _key_has_decryptable_vault(content: bytes, var_name: str, vault: VaultLib) -
         if var_name_from_prefix(prefix) != var_name:
             continue
         try:
+            ensure_vault_label(vault, span.ciphertext)
             vault.decrypt(span.ciphertext)
             return True
         except Exception:
@@ -780,6 +800,12 @@ def recrypt_inline_content(
         removed_vars.append(name)
 
     new_content = content
+    ordered = sorted(replacements)
+    for prev, nxt in itertools.pairwise(ordered):
+        if prev[1] > nxt[0]:
+            raise ValueError(
+                "overlapping pilfer vault markers; refusing to splice the file"
+            )
     for start, end, blob in sorted(replacements, key=lambda t: t[0], reverse=True):
         new_content = new_content[:start] + blob + new_content[end:]
 

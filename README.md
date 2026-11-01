@@ -264,6 +264,7 @@ non-zero. It does not invent fixes for ambiguous edits.
 vaultedFileList.json
 .vault/
 **/*.pilfer-open
+*.pilfer-lock
 ```
 
 ### Pre-commit hook (suggested)
