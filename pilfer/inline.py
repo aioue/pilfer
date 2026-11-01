@@ -22,9 +22,7 @@ MARKER_PREFIX = "# pilfer:vault:"
 # Close refuses metadata without it: an older pilfer rendered some secrets in a
 # form YAML reads differently, and guessing would re-encrypt the wrong value.
 INLINE_FORMAT = 2
-MARKER_RE = re.compile(
-    re.escape(MARKER_PREFIX.encode("utf-8")) + rb"(?P<id>\d+)[ \t]*(?=\r?\n|\Z)"
-)
+MARKER_RE = re.compile(re.escape(MARKER_PREFIX.encode("utf-8")) + rb"(?P<id>\d+)[ \t]*(?=\r?\n|\Z)")
 _MARKER_TEXT_RE = re.compile(re.escape(MARKER_PREFIX) + r"(?P<id>\d+)[ \t]*(?=\r?\n|\Z)")
 
 _HEX_LINE = re.compile(rb"^[ \t]*[0-9a-fA-F]+\s*$")
@@ -250,7 +248,9 @@ def _yaml_double_quoted(text: str) -> str:
     """
     body = json.dumps(text, ensure_ascii=False)[1:-1]
     escaped = "".join(
-        ch if ch.isprintable() else (f"\\u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"\\U{ord(ch):08x}")
+        ch
+        if ch.isprintable()
+        else (f"\\u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"\\U{ord(ch):08x}")
         for ch in body
     )
     return f'"{escaped}"'
@@ -477,9 +477,15 @@ def read_marked_values(content: bytes) -> list[MarkedValue]:
             if not isinstance(value, yaml.ScalarNode):
                 continue
             if value.style in ("|", ">"):
-                hit = line_of(key.start_mark.index) == marker_line and match.start() > value.start_mark.index
+                hit = (
+                    line_of(key.start_mark.index) == marker_line
+                    and match.start() > value.start_mark.index
+                )
             else:
-                hit = line_of(value.end_mark.index) == marker_line and match.start() >= value.end_mark.index
+                hit = (
+                    line_of(value.end_mark.index) == marker_line
+                    and match.start() >= value.end_mark.index
+                )
             if hit:
                 owner = (key, value)
                 break

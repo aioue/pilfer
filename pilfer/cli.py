@@ -376,8 +376,7 @@ def _emit_inline_close_refusal(file_path: str, exc: InlineCloseRefusal) -> None:
         )
         print(file=sys.stderr)
         print(
-            "  Fix:          restore the marker comment on the value line, "
-            "then pilfer close",
+            "  Fix:          restore the marker comment on the value line, then pilfer close",
             file=sys.stderr,
         )
         return
@@ -461,7 +460,7 @@ def _abandon_incomplete_session() -> bool:
     if not _session_is_incomplete(entries):
         return False
     _remove_file(temp_vault_file_list_path)
-    print("ℹ️  Cleared incomplete session (no decrypt backups/sidecars found); " "retrying open.")
+    print("ℹ️  Cleared incomplete session (no decrypt backups/sidecars found); retrying open.")
     return True
 
 
@@ -944,7 +943,9 @@ def _require_round_trip(vault: VaultLib, ciphertext: bytes, plaintext: bytes, pa
     except Exception:
         ok = False
     if not ok:
-        raise PilferError(f"Refusing to replace {path}: new ciphertext does not decrypt to the edit")
+        raise PilferError(
+            f"Refusing to replace {path}: new ciphertext does not decrypt to the edit"
+        )
 
 
 @locked_by_path
@@ -1275,8 +1276,7 @@ def rekey_vault_files(
     _prepare_project()
     if _session_is_open():
         raise PilferError(
-            f"Session already open ({temp_vault_file_list_path}). "
-            "Run 'pilfer close' before rekey."
+            f"Session already open ({temp_vault_file_list_path}). Run 'pilfer close' before rekey."
         )
 
     if rotate_password_file and not include_encrypted_vars:
@@ -1603,8 +1603,7 @@ def _build_argument_parser():
         action="store_true",
         dest="confirm_delete",
         help=(
-            "Confirm intentional deletion of opened inline vars "
-            "(marker and secret line removed)"
+            "Confirm intentional deletion of opened inline vars (marker and secret line removed)"
         ),
     )
 

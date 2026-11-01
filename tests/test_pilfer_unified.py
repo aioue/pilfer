@@ -185,7 +185,6 @@ class TestSessionSafety(ProjectDirTest):
         with open("secret.yml", "wb") as f:
             f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
 
-
     def _run(self, *args, password_file="vault_pass"):
         return self.run_pilfer(*args, "-p", password_file)
 
@@ -691,7 +690,10 @@ class TestInlineVault(ProjectDirTest):
 
     def _stored(self):
         with open("group_vars.yml", "rb") as f:
-            return [self.vault.decrypt(span.ciphertext) for span in pilfer_inline.find_inline_vault_spans(f.read())]
+            return [
+                self.vault.decrypt(span.ciphertext)
+                for span in pilfer_inline.find_inline_vault_spans(f.read())
+            ]
 
     def test_close_reads_an_edit_the_way_yaml_does(self):
         # Each of these was stored as the raw text (quotes, escapes, comment
@@ -705,7 +707,9 @@ class TestInlineVault(ProjectDirTest):
         }
         for label, (replacement, expected) in cases.items():
             with self.subTest(label):
-                closed = self._open_edit_close(b"old", lambda t, r=replacement: t.replace('"old"', r))
+                closed = self._open_edit_close(
+                    b"old", lambda t, r=replacement: t.replace('"old"', r)
+                )
                 self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
                 self.assertEqual(self._stored(), [expected])
 
@@ -728,7 +732,9 @@ class TestInlineVault(ProjectDirTest):
         self.assertEqual(self._stored(), secrets)
         with open("group_vars.yml", "rb") as f:
             # Untouched spans get their original ciphertext back.
-            self.assertEqual(f.read(), original.replace(b"plain_key: visible", b"plain_key: edited"))
+            self.assertEqual(
+                f.read(), original.replace(b"plain_key: visible", b"plain_key: edited")
+            )
 
     def test_broken_yaml_keeps_the_session_and_does_not_print_the_secret(self):
         closed = self._open_edit_close(
@@ -749,7 +755,9 @@ class TestInlineVault(ProjectDirTest):
         self._write_vars_file(("db_password", b"old"))
         self.assertEqual(self._run("open").returncode, 0)
         meta = next(
-            os.path.join(root, "inline.json") for root, _, files in os.walk(".vault") if "inline.json" in files
+            os.path.join(root, "inline.json")
+            for root, _, files in os.walk(".vault")
+            if "inline.json" in files
         )
         with open(meta) as f:
             data = json.load(f)
@@ -789,7 +797,9 @@ class TestInlineVault(ProjectDirTest):
         # The old regex scan unescaped only \\n \\r \\t \\\\ and \\", so \\x65 slipped past.
         closed = self._open_edit_close(
             b"hunter2",
-            lambda t: t.replace('db_password: "hunter2"  # pilfer:vault:0', 'renamed: "hunt\\x65r2"'),
+            lambda t: t.replace(
+                'db_password: "hunter2"  # pilfer:vault:0', 'renamed: "hunt\\x65r2"'
+            ),
         )
         self.assertNotEqual(closed.returncode, 0)
         self.assertIn("marker missing", closed.stdout + closed.stderr)
@@ -981,9 +991,7 @@ class TestInlineVault(ProjectDirTest):
             data = handle.read()
         spans = pilfer_inline.find_inline_vault_spans(data)
         self.assertEqual(len(spans), 1)
-        self.assertEqual(
-            self.vault.decrypt(spans[0].ciphertext), b"  return 9;\n    return 2;\n"
-        )
+        self.assertEqual(self.vault.decrypt(spans[0].ciphertext), b"  return 9;\n    return 2;\n")
 
     def test_edited_multiline_without_trailing_newline_does_not_gain_one(self):
         secret = b"  return 1;\n    return 2;"
@@ -1089,7 +1097,7 @@ class TestInlineVault(ProjectDirTest):
         self._write_vars_file(("db_password", b"super-secret"))
         self.assertEqual(self._run("open").returncode, 0)
         with open("group_vars.yml", "w") as f:
-            f.write("---\nplain_key: visible\n" 'database_password: "super-secret"\n')
+            f.write('---\nplain_key: visible\ndatabase_password: "super-secret"\n')
         closed = self._run("close")
         self.assertNotEqual(closed.returncode, 0)
         combined = closed.stderr + closed.stdout
@@ -1503,7 +1511,9 @@ class TestInlineUnit(unittest.TestCase):
         content = b"db_password: |  # pilfer:vault:0\n  a\n\nother: x\n"
         marked = self._read_one(content)
         self.assertEqual(marked.value, b"a\n")
-        self.assertEqual(content[marked.start : marked.end], b"db_password: |  # pilfer:vault:0\n  a\n")
+        self.assertEqual(
+            content[marked.start : marked.end], b"db_password: |  # pilfer:vault:0\n  a\n"
+        )
 
     def test_read_quoted_values_the_way_yaml_does(self):
         cases = {
@@ -1539,10 +1549,24 @@ class TestInlineUnit(unittest.TestCase):
     def test_every_rendering_reads_back_exactly(self):
         # Open refuses a span whose rendering does not; this pins the renderer.
         secrets = [
-            b"plain", b"", b"line1\nline2\n", b"line1\nline2", b"a\n\nb\n", b"a\n\n",
-            b"  lead\nx", b"trail  \nx\n", b"cr\r\nlf\n", b"tab\there", b'q"uote\\back',
-            "nel\x85 ls\u2028 bom\ufeff del\x7f c1\x9f".encode(), "\U0001f600 \u00e9".encode(),
-            b"# pilfer:vault:9 inside", b"{{ jinja }}", b"- dash", b": colon", b"\n\nlead",
+            b"plain",
+            b"",
+            b"line1\nline2\n",
+            b"line1\nline2",
+            b"a\n\nb\n",
+            b"a\n\n",
+            b"  lead\nx",
+            b"trail  \nx\n",
+            b"cr\r\nlf\n",
+            b"tab\there",
+            b'q"uote\\back',
+            "nel\x85 ls\u2028 bom\ufeff del\x7f c1\x9f".encode(),
+            "\U0001f600 \u00e9".encode(),
+            b"# pilfer:vault:9 inside",
+            b"{{ jinja }}",
+            b"- dash",
+            b": colon",
+            b"\n\nlead",
         ]
         for secret in secrets:
             with self.subTest(secret=secret):
@@ -1628,8 +1652,12 @@ class TestAllowRemovalsAndRekey(ProjectDirTest):
             f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
         os.chmod("secret.yml", 0o644)
         applied = self.run_pilfer(
-            "rekey", "--old-vault-password-file", "vault_pass",
-            "--new-vault-password-file", "vault_pass_new", "--yes",
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--yes",
         )
         self.assertEqual(applied.returncode, 0, applied.stderr)
         self.assertEqual(stat.S_IMODE(os.stat("secret.yml").st_mode), 0o644)
@@ -1645,11 +1673,15 @@ class TestAllowRemovalsAndRekey(ProjectDirTest):
                 if kind == "file":
                     body = self.vault.encrypt(b"secret_key: hunter2\n")
                 else:
-                    body = ("plain: x\n" + encrypt_string_yaml(self.vault, "db_password", b"hunter2")).encode()
+                    body = (
+                        "plain: x\n" + encrypt_string_yaml(self.vault, "db_password", b"hunter2")
+                    ).encode()
                 with open("secret.yml", "wb") as f:
                     f.write(body)
                 new_vault = make_vault("new_password")
-                with mock.patch.object(VaultLib, "encrypt", autospec=True, side_effect=wrong_secret):
+                with mock.patch.object(
+                    VaultLib, "encrypt", autospec=True, side_effect=wrong_secret
+                ):
                     with self.assertRaises(pilfer_cli.PilferError):
                         if kind == "file":
                             pilfer_cli._rekey_whole_file("secret.yml", self.vault, new_vault)
@@ -1872,7 +1904,7 @@ class TestAllowRemovalsAndRekey(ProjectDirTest):
     def test_denylisted_extension_still_detects_orphan_markers(self):
         """Marker orphans renamed to denylisted extensions must still block open."""
         with open("group_vars.yml", "w") as f:
-            f.write("---\n" 'db_password: "super-secret"  # pilfer:vault:0\n')
+            f.write('---\ndb_password: "super-secret"  # pilfer:vault:0\n')
         with open("group_vars.yml.pilfer-open", "w") as f:
             f.write("lock\n")
         os.rename("group_vars.yml", "leak.pyc")
