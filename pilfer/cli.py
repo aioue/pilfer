@@ -36,7 +36,7 @@ from pilfer.inline import (
     unsafe_missing_marker_names,
     var_name_from_prefix,
 )
-from pilfer.publish import LOCK_SUFFIX, vault_file_lock
+from pilfer.publish import LOCK_SUFFIX, project_session_lock, vault_file_lock
 
 temp_vault_file_list_path = "vaultedFileList.json"
 temp_hidden_encrypted_copies_directory_path = ".vault"
@@ -171,20 +171,42 @@ def _password_fingerprint(passphrase: str) -> str:
 
 def _load_password(vault_password_file_path=None):
     vault_file = _resolve_password_file(vault_password_file_path)
-    with open(vault_file) as vault_password_file:
-        password = vault_password_file.read().strip()
+    try:
+        with open(vault_file) as vault_password_file:
+            password = vault_password_file.read().strip()
+    except UnicodeDecodeError:
+        raise PilferError("vault password file is not valid text") from None
     return password, vault_file
 
 
 def _make_vault(password: str, vault_ids=None) -> VaultLib:
     secret = VaultSecret(password.encode("utf-8"))
-    secrets = [(DEFAULT_VAULT_ID_MATCH, secret)]
-    seen = {DEFAULT_VAULT_ID_MATCH, "default", None, ""}
+    # DEFAULT_VAULT_ID_MATCH is a bool. False means "try every registered id".
+    # True means the ciphertext label must be one of the registered ids, and
+    # the bool itself is not a label. An unlabeled header is the id "default".
+    if DEFAULT_VAULT_ID_MATCH:
+        secrets = [("default", secret)]
+        seen = {"default", None, ""}
+    else:
+        secrets = [(DEFAULT_VAULT_ID_MATCH, secret)]
+        seen = {DEFAULT_VAULT_ID_MATCH, "default", None, ""}
     for vault_id in vault_ids or []:
         if vault_id not in seen:
             secrets.append((vault_id, secret))
             seen.add(vault_id)
     return VaultLib(secrets)
+
+
+def _match_ciphertext_label(vault: VaultLib, data: bytes) -> None:
+    """Register this blob's label when Ansible is matching vault ids strictly."""
+    if not DEFAULT_VAULT_ID_MATCH or not vault.secrets:
+        return
+    from pilfer.inline import _vault_id_from_ciphertext
+
+    label = _vault_id_from_ciphertext(data) or "default"
+    if any(vault_id == label for vault_id, _secret in vault.secrets):
+        return
+    vault.secrets.append((label, vault.secrets[0][1]))
 
 
 def _session_is_open() -> bool:
@@ -443,6 +465,24 @@ def _session_is_incomplete(entries) -> bool:
         else:
             return False
     return saw_encrypted
+
+
+def _another_open_holds_entries(entries) -> bool:
+    """True when wiping the session would throw away another open's ciphertext."""
+    for entry in entries:
+        if _entry_has_open_artifacts(entry):
+            return True
+        path = entry["path"]
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            return True
+        if not _path_still_vault_ciphertext(entry, data):
+            return True
+    return False
 
 
 def _clear_session_list() -> None:
@@ -814,6 +854,7 @@ def _decrypt_whole_file_locked(vaulted_file_path: str, vault: VaultLib, cwd: Pat
             "Input is not vault encrypted data " "(refusing to overwrite encrypted backup)"
         )
 
+    _match_ciphertext_label(vault, encrypted_data)
     decrypted_bytes = vault.decrypt(encrypted_data)
 
     backup_dir = _backup_dir_for(vaulted_file_path)
@@ -941,6 +982,12 @@ def decrypt_vault_files(vault_password_file_path=None):
             print(f"Failed to decrypt {path}: {e}")
             failed.append(path)
 
+    if failed and not succeeded and _another_open_holds_entries(entries):
+        raise PilferError(
+            "Decrypt failed, and another open still has plaintext or backups. "
+            "Left the session and .vault in place."
+        )
+
     _write_session(succeeded, password_sha256=password_fp)
 
     if failed:
@@ -1001,6 +1048,7 @@ def _recrypt_whole_file_locked(vaulted_file_path: str, vault: VaultLib, cwd: Pat
             if normalized == normalize_whole_file_vault(old_encrypted_data):
                 return False
             try:
+                _match_ciphertext_label(vault, normalized)
                 vault.decrypt(normalized)
             except Exception as exc:
                 raise PilferError(
@@ -1024,11 +1072,16 @@ def _recrypt_whole_file_locked(vaulted_file_path: str, vault: VaultLib, cwd: Pat
     # live file first; a crash or short write then left garbage that a retry
     # re-encrypted, and the .vault backup was deleted on the way out.
     try:
+        _match_ciphertext_label(vault, new_encrypted_data)
         vault.decrypt(normalize_whole_file_vault(new_encrypted_data))
     except Exception as exc:
         raise PilferError(
             f"Refusing to replace {vaulted_file_path}: new ciphertext does not decrypt"
         ) from exc
+    if Path(vaulted_file_path).read_bytes() != new_data_bytes:
+        raise PilferError(
+            f"{vaulted_file_path} changed during close; nothing written. Retry"
+        )
     _atomic_write_bytes(vaulted_file_path, new_encrypted_data)
 
     return modified
@@ -1081,6 +1134,10 @@ def _recrypt_inline_file_locked(
     if old_hash == new_hash:
         with open(encrypted_backup, "rb") as f:
             original = f.read()
+        if Path(vaulted_file_path).read_bytes() != current:
+            raise PilferError(
+                f"{vaulted_file_path} changed during close; nothing written. Retry"
+            )
         _atomic_write_bytes(vaulted_file_path, original)
         return False
 
@@ -1128,6 +1185,10 @@ def _recrypt_inline_file_locked(
                 f"Refusing to replace {vaulted_file_path}: "
                 "re-encrypted inline span does not decrypt"
             ) from exc
+    if Path(vaulted_file_path).read_bytes() != current:
+        raise PilferError(
+            f"{vaulted_file_path} changed during close; nothing written. Retry"
+        )
     _atomic_write_bytes(vaulted_file_path, result.content)
 
     if result.removed_vars:
@@ -1262,6 +1323,8 @@ def _atomic_write_bytes(path: str, data: bytes) -> None:
             pass
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
         replaced = True
         _restrict_private(path)
@@ -1293,10 +1356,12 @@ def _rekey_probe_file(
         new_ok = True
         for span in spans:
             try:
+                _match_ciphertext_label(old_vault, span.ciphertext)
                 old_vault.decrypt(span.ciphertext)
             except Exception:
                 old_ok = False
             try:
+                _match_ciphertext_label(new_vault, span.ciphertext)
                 new_vault.decrypt(span.ciphertext)
             except Exception:
                 new_ok = False
@@ -1312,11 +1377,13 @@ def _rekey_probe_file(
     with open(path, "rb") as handle:
         data = normalize_whole_file_vault(handle.read())
     try:
+        _match_ciphertext_label(old_vault, data)
         old_vault.decrypt(data)
         return "needs_rekey", 1
     except Exception:
         pass
     try:
+        _match_ciphertext_label(new_vault, data)
         new_vault.decrypt(data)
         return "already_new", 1
     except Exception as exc:
@@ -1332,11 +1399,15 @@ def _rekey_whole_file_locked(path: str, old_vault: VaultLib, new_vault: VaultLib
     with open(path, "rb") as handle:
         data = handle.read()
     normalized = normalize_whole_file_vault(data)
+    _match_ciphertext_label(old_vault, normalized)
     plaintext = old_vault.decrypt(normalized)
     # Keep a 1.2 vault-id label; plain encrypt() writes a 1.1 header.
     new_cipher = new_vault.encrypt(plaintext, vault_id=_vault_id_from_ciphertext(normalized))
     # Verify before replace
+    _match_ciphertext_label(new_vault, new_cipher)
     new_vault.decrypt(normalize_whole_file_vault(new_cipher))
+    if Path(path).read_bytes() != data:
+        raise PilferError(f"{path} changed during rekey; nothing written. Retry")
     _atomic_write_bytes(path, new_cipher)
 
 
@@ -1355,12 +1426,10 @@ def _rekey_inline_file_locked(path: str, old_vault: VaultLib, new_vault: VaultLi
         raise PilferError(f"No inline vault spans found in {path}")
     replacements = []
     for span in spans:
+        _match_ciphertext_label(old_vault, span.ciphertext)
         plaintext = old_vault.decrypt(span.ciphertext)
         if span.vault_id:
-            try:
-                new_cipher = new_vault.encrypt(plaintext, vault_id=span.vault_id)
-            except TypeError:
-                new_cipher = new_vault.encrypt(plaintext)
+            new_cipher = new_vault.encrypt(plaintext, vault_id=span.vault_id)
         else:
             new_cipher = new_vault.encrypt(plaintext)
         replacements.append(
@@ -1375,7 +1444,10 @@ def _rekey_inline_file_locked(path: str, old_vault: VaultLib, new_vault: VaultLi
         new_content = new_content[:start] + blob + new_content[end:]
     # Verify each new span decrypts
     for span in find_inline_vault_spans(new_content):
+        _match_ciphertext_label(new_vault, span.ciphertext)
         new_vault.decrypt(span.ciphertext)
+    if Path(path).read_bytes() != content:
+        raise PilferError(f"{path} changed during rekey; nothing written. Retry")
     _atomic_write_bytes(path, new_content)
     return len(replacements)
 
@@ -1544,16 +1616,27 @@ def _rotate_password_file(old_path: str, new_path: str) -> str:
     Returns the backup path (old_path + '_old').
     """
     backup = f"{old_path}_old"
+    for path in (old_path, new_path, backup):
+        if os.path.islink(path):
+            raise PilferError(f"refusing symlink password file: {path}")
     if os.path.exists(backup):
         raise PilferError(f"Password backup already exists: {backup}. Move it aside first.")
-    with open(new_path) as handle:
-        new_contents = handle.read()
+    try:
+        new_fd = os.open(new_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise PilferError(f"could not read new password file: {exc.strerror}") from None
+    with os.fdopen(new_fd) as handle:
+        try:
+            new_contents = handle.read()
+        except UnicodeDecodeError:
+            raise PilferError("vault password file is not valid text") from None
     # Write the new password beside the live file first. Renaming the live
     # path away before that write left Ansible with no password file if the
     # process was cancelled in between.
     directory = os.path.dirname(old_path) or "."
     fd, tmp = tempfile.mkstemp(prefix=".pilfer-pass-", dir=directory)
     installed = False
+    backup_fd = None
     try:
         try:
             os.fchmod(fd, 0o600)
@@ -1563,18 +1646,29 @@ def _rotate_password_file(old_path: str, new_path: str) -> str:
             handle.write(new_contents)
             handle.flush()
             os.fsync(handle.fileno())
-        shutil.copy2(old_path, backup)
-        _restrict_private(backup)
+        # O_EXCL so a dangling symlink at the backup path is not created through.
+        backup_fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        try:
+            old_fd = os.open(old_path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as exc:
+            raise PilferError(f"could not read old password file: {exc.strerror}") from None
+        with os.fdopen(old_fd, "rb") as old_handle:
+            os.write(backup_fd, old_handle.read())
+            os.fsync(backup_fd)
+        os.close(backup_fd)
+        backup_fd = None
         os.replace(tmp, old_path)
         installed = True
         _restrict_private(old_path)
     finally:
+        if backup_fd is not None:
+            os.close(backup_fd)
         if not installed:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
-            if os.path.exists(old_path) and os.path.exists(backup):
+            if os.path.exists(old_path) and os.path.isfile(backup) and not os.path.islink(backup):
                 try:
                     os.remove(backup)
                 except OSError:
@@ -1839,86 +1933,89 @@ def main(argv=None):
 
     try:
         if args.action == "open":
-            print("🔓 Searching for and decrypting vault files...")
-            _refuse_planted_session_links()
-            _cleanup_stale_rekey_temps(include_open_markers=True)
-            if _session_is_open() and not _abandon_incomplete_session():
-                raise PilferError(
-                    f"Session already open ({temp_vault_file_list_path} exists). "
-                    "Run 'pilfer close' first. Re-running open would destroy "
-                    "encrypted backups and can leave secrets in plaintext."
+            with project_session_lock():
+                print("🔓 Searching for and decrypting vault files...")
+                _refuse_planted_session_links()
+                _cleanup_stale_rekey_temps(include_open_markers=True)
+                if _session_is_open() and not _abandon_incomplete_session():
+                    raise PilferError(
+                        f"Session already open ({temp_vault_file_list_path} exists). "
+                        "Run 'pilfer close' first. Re-running open would destroy "
+                        "encrypted backups and can leave secrets in plaintext."
+                    )
+
+                # Single walk: orphan detection + discovery (nested skips once).
+                scan = scan_project(
+                    include_encrypted_vars=args.include_encrypted_vars,
+                    announce_skips=not args.quiet,
                 )
+                assert_no_orphaned_open_state(scan)
 
-            # Single walk: orphan detection + discovery (nested skips once).
-            scan = scan_project(
-                include_encrypted_vars=args.include_encrypted_vars,
-                announce_skips=not args.quiet,
-            )
-            assert_no_orphaned_open_state(scan)
+                found = scan.targets
+                if not found:
+                    print("No vault files found in current directory tree.")
+                    return 0
 
-            found = scan.targets
-            if not found:
-                print("No vault files found in current directory tree.")
+                password, _vault_file = _load_password(args.vault_password_file)
+                password_fp = _password_fingerprint(password)
+                _write_session(found, password_sha256=password_fp)
+
+                whole = sum(1 for e in found if e["kind"] == "file")
+                inline = sum(1 for e in found if e["kind"] == "inline")
+                print(
+                    f"ℹ️  Found {len(found)} vault target(s) "
+                    f"({whole} whole-file, {inline} with inline encrypt_string)"
+                )
+                if not args.include_encrypted_vars:
+                    print(
+                        "(inline !vault strings skipped - pass "
+                        "--include-encrypted-vars to open them)"
+                    )
+                decrypt_vault_files(args.vault_password_file)
+                # ANSI bold around the next command (TTY-friendly; harmless in pipes).
+                print(
+                    "✅ All vault files decrypted. Edit as needed, "
+                    "then run '[1mpilfer close[0m' to re-encrypt."
+                )
                 return 0
 
-            password, _vault_file = _load_password(args.vault_password_file)
-            password_fp = _password_fingerprint(password)
-            _write_session(found, password_sha256=password_fp)
-
-            whole = sum(1 for e in found if e["kind"] == "file")
-            inline = sum(1 for e in found if e["kind"] == "inline")
-            print(
-                f"ℹ️  Found {len(found)} vault target(s) "
-                f"({whole} whole-file, {inline} with inline encrypt_string)"
-            )
-            if not args.include_encrypted_vars:
-                print(
-                    "(inline !vault strings skipped - pass "
-                    "--include-encrypted-vars to open them)"
-                )
-            decrypt_vault_files(args.vault_password_file)
-            # ANSI bold around the next command (TTY-friendly; harmless in pipes).
-            print(
-                "✅ All vault files decrypted. Edit as needed, "
-                "then run '[1mpilfer close[0m' to re-encrypt."
-            )
-            return 0
-
         if args.action == "close":
-            print("🔒 Re-encrypting vault files...")
-            _refuse_planted_session_links()
-            _cleanup_stale_rekey_temps(include_open_markers=True)
-            if not _session_is_open():
-                print("No vault file list found. Run 'pilfer open' first.", file=sys.stderr)
-                return 1
-            modified_count = recrypt_vault_files(
-                args.vault_password_file,
-                confirm_delete=args.confirm_delete,
-            )
-            print(
-                f"✅ Vault files re-encrypted. "
-                f"{modified_count} modified files have been updated."
-            )
-            return 0
+            with project_session_lock():
+                print("🔒 Re-encrypting vault files...")
+                _refuse_planted_session_links()
+                _cleanup_stale_rekey_temps(include_open_markers=True)
+                if not _session_is_open():
+                    print("No vault file list found. Run 'pilfer open' first.", file=sys.stderr)
+                    return 1
+                modified_count = recrypt_vault_files(
+                    args.vault_password_file,
+                    confirm_delete=args.confirm_delete,
+                )
+                print(
+                    f"✅ Vault files re-encrypted. "
+                    f"{modified_count} modified files have been updated."
+                )
+                return 0
 
         if args.action == "rekey":
-            include = not args.no_include_encrypted_vars
-            # Allow explicit --include-encrypted-vars to win; default on.
-            if args.include_encrypted_vars:
-                include = True
-            print("🔐 Re-keying vault files...")
-            count = rekey_vault_files(
-                args.old_vault_password_file,
-                args.new_vault_password_file,
-                include_encrypted_vars=include,
-                dry_run=args.dry_run,
-                yes=args.yes,
-                rotate_password_file=args.rotate_password_file,
-                announce_skips=not args.quiet,
-            )
-            if not args.dry_run:
-                print(f"✅  Rekeyed {count} file(s).")
-            return 0
+            with project_session_lock():
+                include = not args.no_include_encrypted_vars
+                # Allow explicit --include-encrypted-vars to win; default on.
+                if args.include_encrypted_vars:
+                    include = True
+                print("🔐 Re-keying vault files...")
+                count = rekey_vault_files(
+                    args.old_vault_password_file,
+                    args.new_vault_password_file,
+                    include_encrypted_vars=include,
+                    dry_run=args.dry_run,
+                    yes=args.yes,
+                    rotate_password_file=args.rotate_password_file,
+                    announce_skips=not args.quiet,
+                )
+                if not args.dry_run:
+                    print(f"✅  Rekeyed {count} file(s).")
+                return 0
 
         if args.action == "set":
             # Imported here: vault_set imports helpers from this module.

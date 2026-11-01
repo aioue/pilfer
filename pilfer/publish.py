@@ -42,7 +42,16 @@ def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
     """
     path = Path(path)
     lock_path = path.parent / f"{path.name}{LOCK_SUFFIX}"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    # O_NOFOLLOW: a planted sibling symlink must not be chmod'd or created through.
+    flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise OSError(exc.errno, f"refusing symlink lock file {lock_path}") from None
+        raise
     try:
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -52,6 +61,19 @@ def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+@contextmanager
+def project_session_lock() -> Iterator[None]:
+    """One open, close, or rekey at a time in this directory.
+
+    The per-file lock does not cover vaultedFileList.json or .vault. Two
+    opens can both pass the session check. The one whose decrypt then fails
+    because the other already published plaintext deletes .vault, which is
+    the only remaining ciphertext.
+    """
+    with vault_file_lock(Path.cwd() / ".pilfer-session"):
+        yield
 
 
 def _load_acl() -> ctypes.CDLL | None:
@@ -124,7 +146,12 @@ def copy_owner_group_and_acls(source: Path, dest_fd: int, mode: int) -> None:
             acl = lib.acl_get_fd(src_fd)
             set_np = lib.acl_set_fd
         if not acl:
-            return
+            # macOS: no ACL is NULL and errno ENOENT. Any other errno is a
+            # failed read. Publishing would drop an ACL the mode bits do not show.
+            err = ctypes.get_errno()
+            if err in (0, errno.ENOENT):
+                return
+            raise OSError(err, os.strerror(err) or "acl_get failed", str(source))
         try:
             rc = (
                 set_np(dest_fd, acl, _ACL_TYPE_EXTENDED)
