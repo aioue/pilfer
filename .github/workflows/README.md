@@ -22,14 +22,17 @@ Thorough validation for larger changes and pre-release checks.
 - Bandit (`-ll`, fails on medium+; SARIF uploaded to Security)
 - Coverage reports uploaded as artifacts
 
-### Code scanning (GitHub default setup)
+### `codeql.yml` - Code scanning
 
-CodeQL runs via GitHub's default code scanning setup (managed workflow, not a repo file).
+CodeQL for Python and Actions, as a repo workflow (advanced setup). GitHub's
+default setup ignores config files, so it scanned `tests/` and raised an alert
+for every fixture that writes a fake password. Default setup must stay off in
+Settings > Code security; GitHub refuses advanced-setup results while it is on.
 
-- Runs on push, pull request, and schedule
+- Runs on push and pull request to main/master, and weekly
 - Results appear in the repository Security tab
 - Config: [`.github/codeql/codeql-config.yml`](../codeql/codeql-config.yml) (`paths-ignore: tests`)
-- [`dismiss-codeql-fp.yml`](dismiss-codeql-fp.yml) dismisses the vault session-binding SHA-256 false positive after each CodeQL run (default setup ignores in-source `# codeql[...]` suppressions)
+- [`dismiss-codeql-fp.yml`](dismiss-codeql-fp.yml) dismisses the vault session-binding SHA-256 false positive after each CodeQL run
 - Complements Bandit (Python-specific rules) in `test.yml`
 
 ### `auto-merge.yml` - Dependabot and CodeQL action bumps
@@ -65,7 +68,7 @@ Tag pushes publish. Manual `workflow_dispatch` validates and builds only.
 | `ci.yml` | main, master | - | - |
 | `test.yml` | main, master | - | yes |
 | `auto-merge.yml` | Dependabot PRs | - | - |
-| CodeQL (default setup) | main, master | - | - |
+| `codeql.yml` | main, master (+ weekly) | - | - |
 | `release.yml` | - | `v*` | yes (dry-run) |
 
 ## Releasing

@@ -1,0 +1,50 @@
+name: CodeQL
+
+# Advanced setup instead of GitHub's default setup, which ignores repository
+# config files. The config excludes tests/: fixtures write fake vault passwords
+# and secrets to disk on purpose, and under default setup each new test raised
+# a "clear-text storage" alert that had to be dismissed by hand.
+# Default setup must stay off in Settings > Code security: GitHub refuses an
+# advanced-setup upload while default setup is on.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Weekly, so new queries run against code that has not changed.
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two languages default setup scanned.
+        language: [actions, python]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          # Interpreted languages: no build step.
+          build-mode: none
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
