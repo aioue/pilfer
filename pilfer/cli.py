@@ -35,6 +35,7 @@ from pilfer.inline import (
     unsafe_missing_marker_names,
     var_name_from_prefix,
 )
+from pilfer.publish import LOCK_SUFFIX, vault_file_lock
 
 temp_vault_file_list_path = "vaultedFileList.json"
 temp_hidden_encrypted_copies_directory_path = ".vault"
@@ -134,11 +135,13 @@ def get_vault_password_file():
     except (OSError, configparser.Error, KeyError, TypeError, ValueError):
         pass
 
+    # Named paths first. The parent-relative file is an ansible-toolkit layout;
+    # checking it earlier silently beat ~/.ansible-vault/.vault-file.
     fallback_locations = [
-        "../../vault_password_file",
         "~/.ansible-vault/.vault-file",
         ".vault_password",
         "vault_password_file",
+        "../../vault_password_file",
     ]
 
     for location in fallback_locations:
@@ -606,6 +609,9 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
             file_path = os.path.join(dirpath, name)
             if os.path.islink(file_path):
                 continue
+            # Empty sibling used by vault_file_lock. Not a vault target.
+            if name.endswith(LOCK_SUFFIX):
+                continue
             # Sidecars / markers must be collected even if renamed behind the
             # rekey temp prefix or a denylisted extension - otherwise orphan
             # detection fail-opens.
@@ -789,13 +795,18 @@ def write_vaulted_file_list(
 
 
 def _decrypt_whole_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> None:
+    with vault_file_lock(vaulted_file_path):
+        _decrypt_whole_file_locked(vaulted_file_path, vault, cwd)
+
+
+def _decrypt_whole_file_locked(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> None:
     _validate_target_path(vaulted_file_path, cwd)
 
     with open(vaulted_file_path, "rb") as f:
-        encrypted_data = f.read()
+        raw = f.read()
 
     # Tolerate BOM / leading whitespace on whole-file vaults (editors).
-    encrypted_data = normalize_whole_file_vault(encrypted_data)
+    encrypted_data = normalize_whole_file_vault(raw)
 
     if not _is_vault_ciphertext(encrypted_data):
         raise PilferError(
@@ -813,6 +824,16 @@ def _decrypt_whole_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> N
     file_hash = hashlib.sha256(decrypted_bytes).hexdigest()
     hash_path = _hash_backup_path(vaulted_file_path)
     _atomic_write_bytes(hash_path, file_hash.encode("utf-8"))
+
+    # set can replace the ciphertext while decrypt and the backup writes run.
+    # Publishing the plaintext we already decrypted would throw that edit away.
+    if Path(vaulted_file_path).read_bytes() != raw:
+        for stale in (encrypted_backup, hash_path):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+        raise PilferError(f"{vaulted_file_path} changed during open; nothing written. Retry")
 
     # Sidecar before plaintext so a crash/failure never leaves unmarked plaintext.
     # The plaintext replace is atomic: a crash keeps the original ciphertext
@@ -832,6 +853,11 @@ def _decrypt_whole_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> N
 
 
 def _decrypt_inline_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> int:
+    with vault_file_lock(vaulted_file_path):
+        return _decrypt_inline_file_locked(vaulted_file_path, vault, cwd)
+
+
+def _decrypt_inline_file_locked(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> int:
     """Decrypt inline spans. Returns number of spans opened."""
     _validate_target_path(vaulted_file_path, cwd)
 
@@ -858,6 +884,14 @@ def _decrypt_inline_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> 
         meta_path,
         json.dumps({"spans": records}, indent=2).encode("utf-8"),
     )
+
+    if Path(vaulted_file_path).read_bytes() != original:
+        for stale in (encrypted_backup, hash_path, meta_path):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+        raise PilferError(f"{vaulted_file_path} changed during open; nothing written. Retry")
 
     _write_open_sidecar(vaulted_file_path, "inline")
     try:
@@ -933,6 +967,11 @@ def decrypt_vault_files(vault_password_file_path=None):
 
 
 def _recrypt_whole_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> bool:
+    with vault_file_lock(vaulted_file_path):
+        return _recrypt_whole_file_locked(vaulted_file_path, vault, cwd)
+
+
+def _recrypt_whole_file_locked(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> bool:
     """Re-encrypt a whole-file vault. Returns True if modified.
 
     Does not delete session backups - caller cleans up only after all entries succeed
@@ -1002,6 +1041,18 @@ def _marker_missing_refusal(var_name: str, span_records: list[dict]) -> MarkerMi
 
 
 def _recrypt_inline_file(
+    vaulted_file_path: str,
+    password: str,
+    cwd: Path,
+    confirm_delete: bool = False,
+) -> bool:
+    with vault_file_lock(vaulted_file_path):
+        return _recrypt_inline_file_locked(
+            vaulted_file_path, password, cwd, confirm_delete=confirm_delete
+        )
+
+
+def _recrypt_inline_file_locked(
     vaulted_file_path: str,
     password: str,
     cwd: Path,
@@ -1272,6 +1323,11 @@ def _rekey_probe_file(
 
 
 def _rekey_whole_file(path: str, old_vault: VaultLib, new_vault: VaultLib) -> None:
+    with vault_file_lock(path):
+        _rekey_whole_file_locked(path, old_vault, new_vault)
+
+
+def _rekey_whole_file_locked(path: str, old_vault: VaultLib, new_vault: VaultLib) -> None:
     with open(path, "rb") as handle:
         data = handle.read()
     normalized = normalize_whole_file_vault(data)
@@ -1284,6 +1340,11 @@ def _rekey_whole_file(path: str, old_vault: VaultLib, new_vault: VaultLib) -> No
 
 
 def _rekey_inline_file(path: str, old_vault: VaultLib, new_vault: VaultLib) -> int:
+    with vault_file_lock(path):
+        return _rekey_inline_file_locked(path, old_vault, new_vault)
+
+
+def _rekey_inline_file_locked(path: str, old_vault: VaultLib, new_vault: VaultLib) -> int:
     from pilfer.inline import format_encrypted_block
 
     with open(path, "rb") as handle:
@@ -1523,8 +1584,9 @@ def _rotate_password_file(old_path: str, new_path: str) -> str:
 _HELP_FORMATTER = argparse.RawDescriptionHelpFormatter
 
 _HELP_EPILOG = """
-Vault password: -p PATH, else vault_password_file in ansible.cfg, else common
-default paths (~/.ansible-vault/.vault-file, .vault_password, and others).
+Vault password: -p PATH, else vault_password_file in ansible.cfg, else
+~/.ansible-vault/.vault-file, .vault_password, vault_password_file, and
+finally ../../vault_password_file.
 
 Never commit while a session is open. Add vaultedFileList.json, .vault/, and
 *.pilfer-open sidecars to your project's .gitignore. Check the exit code of close.
@@ -1565,7 +1627,10 @@ Sets one top-level key in a closed whole-file vault without writing plaintext to
 disk. A new key is appended; an existing scalar is replaced in place, keeping an
 inline comment. The value is stored as a JSON-quoted string, so yes/no/0123 stay
 strings. A value containing {{, {% or {# is stored as !unsafe so Ansible does
-not template it. Refuses plaintext and files open in a pilfer session.
+not template it. An existing !unsafe tag is kept only when Ansible would still
+load the new text as that string; otherwise the tag is dropped. A value that
+needs !unsafe and would not stay a string is refused. Refuses plaintext and
+files open in a pilfer session.
 
 Leave VALUE out to read it from stdin: a hidden prompt on a terminal, otherwise
 the whole input with one trailing newline dropped. A VALUE argument is visible
@@ -1583,6 +1648,20 @@ whole-file vault YAML only.
 """
 
 
+def _hides_unrecognized_set_value(message: str) -> bool:
+    """True when argparse would print a single-dash positional as an option.
+
+    `pilfer set file key -secret` is reported as an unrecognized argument, and
+    the message quotes the token. A double-dash token is a mistyped flag
+    (`--typo`); that one stays in the message.
+    """
+    marker = "unrecognized arguments:"
+    if marker not in message:
+        return False
+    tokens = message.split(marker, 1)[1].split()
+    return any(token.startswith("-") and not token.startswith("--") for token in tokens)
+
+
 def _build_argument_parser():
     """Build the pilfer CLI parser (subcommands: open, close, rekey, set)."""
     parser = argparse.ArgumentParser(
@@ -1594,6 +1673,17 @@ def _build_argument_parser():
         ),
         epilog=_HELP_EPILOG,
     )
+
+    def _parser_error(message: str) -> None:
+        # set takes an optional positional. A token that starts with "-" is
+        # reported by argparse as an unrecognized argument, and the message
+        # quotes it. That is the secret, on stderr.
+        argv = getattr(parser, "_pilfer_argv", ())
+        if "set" in argv and _hides_unrecognized_set_value(message):
+            parser.exit(2, f"{parser.prog}: error: put -- before a value that starts with -\n")
+        argparse.ArgumentParser.error(parser, message)
+
+    parser.error = _parser_error  # type: ignore[method-assign]
     parser.add_argument("--version", action="version", version=f"pilfer {__version__}")
 
     subparsers = parser.add_subparsers(
@@ -1726,12 +1816,24 @@ def _build_argument_parser():
         help="Path to vault password file (default: ansible.cfg or common paths)",
     )
 
+    def _set_parse_error(message: str) -> None:
+        # argparse's default quotes the rejected token. A leading-dash secret
+        # would land in stderr, which is what people paste into tickets.
+        if _hides_unrecognized_set_value(message):
+            set_parser.exit(
+                2, f"{set_parser.prog}: error: put -- before a value that starts with -\n"
+            )
+        argparse.ArgumentParser.error(set_parser, message)
+
+    set_parser.error = _set_parse_error  # type: ignore[method-assign]
+
     return parser
 
 
 def main(argv=None):
     """Main CLI entry point for pilfer"""
     parser = _build_argument_parser()
+    parser._pilfer_argv = list(argv) if argv is not None else sys.argv[1:]  # type: ignore[attr-defined]
     args = parser.parse_args(argv)
 
     try:
@@ -1786,7 +1888,7 @@ def main(argv=None):
             _refuse_planted_session_links()
             _cleanup_stale_rekey_temps(include_open_markers=True)
             if not _session_is_open():
-                print("No vault file list found. Run 'pilfer open' first.")
+                print("No vault file list found. Run 'pilfer open' first.", file=sys.stderr)
                 return 1
             modified_count = recrypt_vault_files(
                 args.vault_password_file,

@@ -27,6 +27,15 @@ UTF8_BOM = b"\xef\xbb\xbf"
 VAULT_HEADER_PREFIX = b"$ANSIBLE_VAULT;"
 
 
+class VaultLabelError(ValueError):
+    """The vault-id label cannot be written back.
+
+    Ansible's is_encrypted() rejects any non-ASCII byte in the blob, so a
+    UTF-8 label (or a U+FFFD substituted for one) becomes a file Ansible
+    will not decrypt. Callers leave the original ciphertext in place.
+    """
+
+
 def strip_leading_vault_noise(data: bytes) -> bytes:
     """Remove UTF-8 BOM and leading whitespace so vault magic can be detected."""
     data = data.removeprefix(UTF8_BOM)
@@ -120,7 +129,12 @@ def _vault_id_from_ciphertext(ciphertext: bytes) -> str | None:
     parts = first.split(b";")
     # $ANSIBLE_VAULT;1.2;AES256;vault_id
     if len(parts) >= 4 and parts[0] == b"$ANSIBLE_VAULT":
-        vault_id = parts[3].decode("ascii", errors="replace").strip()
+        try:
+            vault_id = parts[3].decode("ascii").strip()
+        except UnicodeDecodeError:
+            raise VaultLabelError(
+                "vault header label is not ASCII; Ansible would reject the re-encrypted file"
+            ) from None
         return vault_id or None
     return None
 

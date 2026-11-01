@@ -4,22 +4,22 @@ Lightweight DRY tests for pilfer vault file manipulation tool.
 
 ## What These Tests Do
 
-The unified test suite verifies that both the standalone `pilfer.py` script and the CLI module (`pilfer/cli.py`) work correctly and identically using a shared test base class.
+The unified test suite checks whole-file vaults, session safety, and inline `encrypt_string`. `TestPilferCLI` runs that matrix by calling `pilfer.cli`. `TestPilferStandalone` smoke-checks `pilfer.py` open/close. `TestCompatibility` decrypts one file both ways and compares the plaintext.
 
 ### Key Tests
 
 1. **Hash Consistency** - Ensures unchanged files maintain the same hash after re-encryption
 2. **Line Ending Preservation** - Verifies that Unix (`\n`), Windows (`\r\n`), and mixed line endings are preserved during vault operations
 3. **Modified File Detection** - Tests that the modified file counter accurately reports changes
-4. **Compatibility** - Confirms both standalone and CLI versions produce identical results
+4. **Compatibility** - Compares plaintext from `pilfer.cli` with plaintext from `pilfer.py open`
 
 ### DRY Architecture
 
 Tests use inheritance to eliminate duplication:
-- `PilferTestBase` - Abstract base class with shared test logic
-- `TestPilferCLI` - Tests CLI version by calling functions directly  
-- `TestPilferStandalone` - Tests standalone version via subprocess
-- `TestCompatibility` - Verifies identical behavior between versions
+- `PilferTestBase` - shared fixtures for the CLI matrix
+- `TestPilferCLI` - runs that matrix by calling `pilfer.cli`
+- `TestPilferStandalone` - one subprocess smoke test of `pilfer.py` open/close
+- `TestCompatibility` - compares CLI-module plaintext with `pilfer.py` open
 
 ## Running Tests
 
@@ -46,8 +46,8 @@ python -m unittest test_pilfer_unified.TestCompatibility
 # Test hash consistency for CLI version
 python -m unittest test_pilfer_unified.TestPilferCLI.test_unchanged_files_same_hash
 
-# Test line ending preservation for standalone version
-python -m unittest test_pilfer_unified.TestPilferStandalone.test_line_endings_preserved
+# Test line ending preservation for the CLI matrix
+python -m unittest test_pilfer_unified.TestPilferCLI.test_line_endings_preserved
 ```
 
 ## Test Structure

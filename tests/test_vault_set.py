@@ -202,6 +202,38 @@ class TestVaultSet(VaultSetBase):
         self._set("target", SENTINEL)
         self.assertEqual(self.vault.stat().st_mode & 0o777, 0o640)
 
+    def test_preserves_group(self) -> None:
+        groups = [g for g in os.getgroups() if g != self.vault.stat().st_gid]
+        if not groups:
+            self.skipTest("no supplementary group to assign")
+        os.chown(self.vault, -1, groups[0])
+        gid = self.vault.stat().st_gid
+        self.vault.chmod(0o640)
+        self._set("target", SENTINEL)
+        stat_result = self.vault.stat()
+        self.assertEqual(stat_result.st_gid, gid)
+        self.assertEqual(stat_result.st_mode & 0o777, 0o640)
+
+    def test_preserves_acl_when_the_host_has_one(self) -> None:
+        added = subprocess.run(
+            ["chmod", "+a", "group:admin allow read", str(self.vault)],
+            capture_output=True,
+            check=False,
+        )
+        if added.returncode != 0:
+            self.skipTest("chmod +a is not available")
+        self._set("target", SENTINEL)
+        listing = subprocess.check_output(["ls", "-le", str(self.vault)], text=True)
+        self.assertIn("group:admin allow read", listing)
+
+    def test_refuses_when_the_group_cannot_be_kept(self) -> None:
+        with (
+            mock.patch("pilfer.publish.os.fchown", side_effect=PermissionError(1, "Operation not permitted")),
+            self.assertRaises(PilferError),
+        ):
+            self._set("target", SENTINEL)
+        self._assert_untouched()
+
     def test_unrepresentable_value_is_refused(self) -> None:
         # NEL is a YAML 1.1 line break: inside the quoted scalar it would load as a space.
         # U+FFFE is valid UTF-8 but the YAML reader rejects it.
@@ -264,6 +296,21 @@ class TestVaultSet(VaultSetBase):
         self.assertTrue(self.vault.read_bytes().startswith(b"$ANSIBLE_VAULT;1.2;AES256;prod\n"))
         self.assertEqual(self._view(), _expected_target(SENTINEL))
 
+    def test_non_ascii_vault_label_is_refused(self) -> None:
+        secret = VaultSecret(PASSWORD.encode("utf-8"))
+        labelled = VaultLib([("prod", secret)]).encrypt(FIXTURE.encode("utf-8"), vault_id="prod")
+        first, nl, rest = labelled.partition(b"\n")
+        self.assertTrue(first.endswith(b";prod"))
+        for label in (b"caf\xc3\xa9", b"bad\xff"):
+            with self.subTest(label=label):
+                blob = first[: -len(b"prod")] + label + nl + rest
+                self.vault.write_bytes(blob)
+                before = self.vault.read_bytes()
+                with self.assertRaises(PilferError) as caught:
+                    self._set("target", SENTINEL)
+                self.assertIn("ASCII", str(caught.exception))
+                self.assertEqual(self.vault.read_bytes(), before)
+
     def test_wrong_password_file(self) -> None:
         wrong = self._password_file("wrong-password", "not-the-password")
         with self.assertRaises(PilferError):
@@ -293,9 +340,11 @@ class TestVaultSet(VaultSetBase):
 
         with (
             mock.patch.object(VaultLib, "decrypt", autospec=True, side_effect=decrypt_then_fail),
-            self.assertRaises(PilferError),
+            self.assertRaises(PilferError) as caught,
         ):
             self._set("target", SENTINEL)
+        self.assertIn("round-trip", str(caught.exception))
+        self.assertNotIn("could not encrypt", str(caught.exception))
         self._assert_untouched()
 
     def test_encrypt_returning_non_vault_output(self) -> None:
@@ -401,6 +450,24 @@ class TestVaultSet(VaultSetBase):
             # tearDown removes the directory before addCleanup callbacks run.
             os.chmod(self.directory, 0o755)
 
+    @unittest.skipIf(os.geteuid() == 0, "root writes to mode-555 directories")
+    def test_check_only_unchanged_value_still_probes_the_directory(self) -> None:
+        placeholder = "pilfer-set-check-placeholder"
+        self._set("target", placeholder)
+        current = self.vault.read_bytes()
+        os.chmod(self.directory, 0o555)
+        try:
+            with self.assertRaises(PilferError):
+                set_keys(
+                    self.vault,
+                    {"target": placeholder},
+                    str(self.password),
+                    check_only=True,
+                )
+            self.assertEqual(self.vault.read_bytes(), current)
+        finally:
+            os.chmod(self.directory, 0o755)
+
     def test_check_only_sees_a_concurrent_change(self) -> None:
         concurrent = _vault().encrypt(b"alpha: concurrent\n")
         real_encrypt = VaultLib.encrypt
@@ -463,6 +530,13 @@ class TestVaultSet(VaultSetBase):
         self._assert_untouched()
         # Look-alikes YAML 1.1 keeps as strings still work.
         self.assertEqual(self._set("y", SENTINEL), "added")
+
+    def test_refused_key_is_not_in_the_error(self) -> None:
+        pasted = "super-secret-token"
+        with self.assertRaises(PilferError) as caught:
+            self._set(pasted, SENTINEL)
+        self.assertNotIn(pasted, str(caught.exception))
+        self._assert_untouched()
 
     def test_refuses_plaintext_symlink_and_pilfer_sidecar(self) -> None:
         plain = self.directory / "plain.yml"
@@ -546,6 +620,28 @@ class TestVaultSetUnsafe(VaultSetBase):
         self.assertEqual(self._view(vault), f'target: !unsafe "{SENTINEL}"  # note\n')
         self.assertEqual(self._set("target", SENTINEL, vault), "unchanged")
 
+    def test_existing_unsafe_tag_is_dropped_when_ansible_would_retype(self) -> None:
+        # !unsafe re-resolves the scalar. Quoted 0123 would become int 83.
+        vault = self._encrypt("target: !unsafe 'old'\n", name="retype.yml")
+        for value in ("0123", "yes", "null", "1:30", "2024-01-01"):
+            with self.subTest(value=value):
+                self.assertEqual(self._set("target", value, vault), "updated")
+                text = self._view(vault)
+                self.assertNotIn("!unsafe", text)
+                self.assertEqual(text, f"target: {json.dumps(value)}\n")
+                loaded = AnsibleLoader(text).get_single_data()["target"]
+                self.assertIsInstance(loaded, str)
+                self.assertEqual(loaded, value)
+
+    def test_unsafe_jinja_that_ansible_would_retype_is_refused(self) -> None:
+        # A natural Jinja value stays a string. Lock the refuse branch.
+        with mock.patch.object(vault_set, "_ansible_keeps_string", return_value=False):
+            with self.assertRaises(PilferError) as caught:
+                self._set("target", "ab{{x}}")
+        self.assertIn("!unsafe", str(caught.exception))
+        self.assertNotIn("ab{{x}}", str(caught.exception))
+        self._assert_untouched()
+
     def test_same_jinja_value_gains_the_tag(self) -> None:
         # Stored untagged, Ansible would template it; the same value is not "unchanged".
         vault = self._encrypt(f"target: {json.dumps(self.JINJA)}\n", name="untagged.yml")
@@ -562,6 +658,98 @@ class TestVaultSetUnsafe(VaultSetBase):
         # The !unsafe constructor lives on pilfer's own loader only.
         with self.assertRaises(yaml.constructor.ConstructorError):
             yaml.safe_load("a: !unsafe x\n")
+
+    def test_open_leaves_a_file_changed_during_decrypt(self) -> None:
+        from pilfer.cli import _decrypt_whole_file
+
+        other = _vault().encrypt(b"target: other\n")
+        real = VaultLib.decrypt
+
+        def decrypt_and_replace(vault, data, *args, **kwargs):
+            self.vault.write_bytes(other)
+            return real(vault, data, *args, **kwargs)
+
+        with (
+            mock.patch.object(VaultLib, "decrypt", autospec=True, side_effect=decrypt_and_replace),
+            self.assertRaises(PilferError),
+        ):
+            _decrypt_whole_file(str(self.vault), _vault(), self.directory.resolve())
+        self.assertEqual(self.vault.read_bytes(), other)
+        self.assertFalse((self.directory / f"{self.vault.name}.pilfer-open").exists())
+        self._assert_no_temp()
+
+    def test_set_waits_while_another_process_holds_the_lock(self) -> None:
+        import pilfer.publish
+
+        repo = str(Path(__file__).resolve().parents[1])
+        read_fd, write_fd = os.pipe()
+        os.set_inheritable(write_fd, True)
+        child = (
+            "import os\n"
+            "from pilfer.vault_set import set_keys\n"
+            f"os.write({write_fd}, b'1')\n"
+            f"set_keys({str(self.vault)!r}, {{'target': 'from-other-process'}}, "
+            f"{str(self.password)!r})\n"
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child],
+            cwd=self.directory,
+            env=env,
+            pass_fds=(write_fd,),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        os.close(write_fd)
+        finished = None
+        try:
+            with pilfer.publish.vault_file_lock(self.vault):
+                self.assertEqual(os.read(read_fd, 1), b"1")
+                try:
+                    proc.wait(timeout=0.4)
+                except subprocess.TimeoutExpired:
+                    blocked = True
+                else:
+                    blocked = False
+                self.assertTrue(blocked, "set finished while the vault lock was held")
+            finished = proc.wait(timeout=30)
+        finally:
+            os.close(read_fd)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        stderr = b""
+        if proc.stderr is not None:
+            stderr = proc.stderr.read()
+            proc.stderr.close()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        self.assertEqual(finished, 0, stderr)
+        self.assertEqual(self._view(), _expected_target("from-other-process"))
+
+    def test_home_password_path_beats_the_parent_fallback(self) -> None:
+        from pilfer.cli import get_vault_password_file
+
+        home = os.path.expanduser("~/.ansible-vault/.vault-file")
+        parent = os.path.normpath(os.path.join(os.getcwd(), "../../vault_password_file"))
+
+        def exists(path: str) -> bool:
+            return path in (home, parent, "../../vault_password_file")
+
+        with mock.patch("pilfer.cli.os.path.exists", side_effect=exists):
+            self.assertEqual(get_vault_password_file(), home)
+
+    def test_parent_password_fallback_is_last(self) -> None:
+        from pilfer.cli import get_vault_password_file
+
+        parent = "../../vault_password_file"
+
+        def exists(path: str) -> bool:
+            return path == parent
+
+        with mock.patch("pilfer.cli.os.path.exists", side_effect=exists):
+            self.assertEqual(get_vault_password_file(), parent)
 
 
 class TestReadValue(unittest.TestCase):
@@ -652,6 +840,43 @@ class TestVaultSetCLI(VaultSetBase):
         result = self._run("-p", str(self.password), str(self.vault), "target", "--", "-dash")
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(self._view(), _expected_target("-dash"))
+
+    def test_cli_leading_dash_without_separator_does_not_echo_the_value(self) -> None:
+        secret = "-s3cret-value"
+        result = self._run("-p", str(self.password), str(self.vault), "target", secret)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn(secret.encode(), result.stdout + result.stderr)
+        self.assertIn(b"put -- before", result.stderr)
+
+    def test_cli_unknown_long_option_names_the_flag(self) -> None:
+        result = self._run("-p", str(self.password), str(self.vault), "target", "--typo")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"--typo", result.stderr)
+        self.assertNotIn(b"put -- before", result.stderr)
+        mixed = self._run("-p", str(self.password), str(self.vault), "target", "--typo", "-s3cret")
+        self.assertEqual(mixed.returncode, 2)
+        self.assertNotIn(b"-s3cret", mixed.stdout + mixed.stderr)
+        self.assertIn(b"put -- before", mixed.stderr)
+        before = subprocess.run(
+            [sys.executable, str(PILFER_SCRIPT), "--typo", "set", "file", "key"],
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(before.returncode, 2)
+        self.assertIn(b"--typo", before.stderr)
+        self.assertNotIn(b"put -- before", before.stderr)
+        self._assert_untouched()
+
+    def test_close_without_a_session_reports_on_stderr(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(PILFER_SCRIPT), "close"],
+            capture_output=True,
+            check=False,
+            cwd=self.directory,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"No vault file list found", result.stderr)
+        self.assertNotIn(b"No vault file list found", result.stdout)
 
     def test_cli_refusal_does_not_print_plaintext(self) -> None:
         # A parser error quotes the line. An impossible date raises a plain ValueError
