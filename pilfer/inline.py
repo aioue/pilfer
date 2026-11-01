@@ -82,21 +82,35 @@ class RecryptInlineResult:
     content: bytes
     modified_count: int
     removed_vars: list[str] = field(default_factory=list)
+    # (var name, YAML type) for changed values that plain YAML would not read
+    # as a string. The value is stored as a string anyway: see MarkedValue.
+    typed_notes: list[tuple[str, str]] = field(default_factory=list)
 
 
 class OpenedFileError(ValueError):
     """The opened file cannot be read back as YAML. Messages never quote its text."""
 
 
+_YAML_CORE_TAG = "tag:yaml.org,2002:"
+
+
 @dataclass
 class MarkedValue:
-    """A `key: value  # pilfer:vault:N` pair as the YAML parser reads it."""
+    """A `key: value  # pilfer:vault:N` pair as the YAML parser reads it.
+
+    value is the scalar's text after quoting and escapes, never a number or
+    bool: an inline !vault value is always a string in Ansible, so an edit to
+    `port: 5432` is stored as "5432". yaml_type names what plain YAML would
+    have read instead (int, bool, float, null, timestamp), so close can say so.
+    """
 
     span_id: int
     key_text: str
     value: bytes
     start: int  # byte offset of the key's line
     end: int  # byte offset just past the value's last line
+    key_index: int  # character offset of the key node, for verify_closed
+    yaml_type: str | None = None
 
 
 class InlineCloseRefusal(Exception):
@@ -256,34 +270,15 @@ def _yaml_double_quoted(text: str) -> str:
     return f'"{escaped}"'
 
 
-def _block_literal_safe(text: str) -> bool:
-    """True when a `|` or `|-` block shows text exactly and survives common editor saves.
-
-    Anything else is shown double-quoted on one line. A literal block cannot
-    hold: a carriage return (YAML normalises line breaks), more than one final
-    newline (`|` keeps one), leading whitespace on the first line (it would set
-    the indentation), or trailing whitespace (editors strip it on save, which
-    silently changed the secret).
-    """
-    if "\r" in text or text.endswith("\n\n") or not text.rstrip("\n"):
-        return False
-    lines = text.removesuffix("\n").split("\n")
-    first = next(line for line in lines if line)
-    if first[0] in " \t":
-        return False
-    for line in lines:
-        if line != line.rstrip(" \t"):
-            return False
-        if not all(ch.isprintable() or ch == "\t" for ch in line):
-            return False
-    return True
-
-
 def format_open_value(plaintext: bytes, span: InlineSpan) -> bytes:
-    """Render decrypted plaintext as YAML with a pilfer close marker.
+    """Render decrypted plaintext as one double-quoted YAML line with a close marker.
 
-    The rendering must read back as exactly plaintext through the YAML parser;
-    decrypt_inline_content checks that before anything is written.
+    Always quoted, multi-line secrets included (newlines show as \\n). A `|`
+    block was tried and lost data: an editor that trims trailing whitespace
+    changed a block's content, and one that drops the file's final newline took
+    the last newline off a block at the end of the file. Nothing an editor does
+    on save changes a quoted line. The rendering must read back as exactly
+    plaintext; decrypt_inline_content checks that before anything is written.
     """
     try:
         text = plaintext.decode("utf-8")
@@ -295,16 +290,6 @@ def format_open_value(plaintext: bytes, span: InlineSpan) -> bytes:
         ) from exc
 
     marker = MARKER_PREFIX.encode("utf-8") + str(span.span_id).encode("utf-8")
-
-    if "\n" in text and _block_literal_safe(text):
-        indent = span.body_indent or b"  "
-        # `|` keeps the one final newline, `|-` strips it. Empty lines carry no
-        # indent, so there is no whitespace for an editor to trim.
-        chomp = b"|" if text.endswith("\n") else b"|-"
-        lines = text.removesuffix("\n").split("\n")
-        body = b"".join((indent + line.encode("utf-8") if line else b"") + b"\n" for line in lines)
-        return span.line_prefix + chomp + b" " + marker + b"\n" + body
-
     quoted = _yaml_double_quoted(text).encode("utf-8")
     return span.line_prefix + quoted + b"  " + marker + b"\n"
 
@@ -445,7 +430,9 @@ def read_marked_values(content: bytes) -> list[MarkedValue]:
     scalar, on the header line for a `|` or `>` block. The value is the
     scalar's YAML value, so quoting style and escapes mean what they mean to
     Ansible. The region runs from the start of the key's line to the end of the
-    value's last non-blank line, so blank lines after a block stay in the file.
+    value. For a `|` or `>` block that is the last line YAML counts as content:
+    trailing lines of spaces are padding and stay in the file, unless the block
+    keeps them (`|+`), when they are part of the value.
 
     Raises OpenedFileError (see _compose).
     """
@@ -497,11 +484,10 @@ def read_marked_values(content: bytes) -> list[MarkedValue]:
         key, value = owner
         start = line_starts[line_of(key.start_mark.index)]
         if value.style in ("|", ">"):
-            span_text = text[value.start_mark.index : value.end_mark.index]
-            last = value.start_mark.index + len(span_text.rstrip())
-            end = line_end(last - 1)
+            end = _block_end(text, value, line_end)
         else:
             end = line_end(match.start())
+        resolved = value.tag.removeprefix(_YAML_CORE_TAG)
         found.append(
             MarkedValue(
                 span_id=int(match.group("id")),
@@ -509,9 +495,87 @@ def read_marked_values(content: bytes) -> list[MarkedValue]:
                 value=value.value.encode("utf-8"),
                 start=len(text[:start].encode("utf-8")),
                 end=len(text[:end].encode("utf-8")),
+                key_index=key.start_mark.index,
+                yaml_type=None if resolved in ("str", value.tag) else resolved,
             )
         )
     return found
+
+
+_BLOCK_HEADER_RE = re.compile(r"[|>](?P<indicators>[1-9+-]{0,2})")
+
+
+def _block_end(text: str, value: yaml.ScalarNode, line_end) -> int:
+    """Where a `|` or `>` block's own text ends.
+
+    PyYAML's end mark runs past every trailing blank line. With keep chomping
+    (`|+`) those lines are the value's final newlines. Otherwise a trailing line
+    of spaces only is padding. Anything else, a tab or U+00A0 included, is
+    content: str.rstrip() treated those as padding and left a tab-only line
+    behind the new !vault, which made the closed file invalid YAML.
+    """
+    header = _BLOCK_HEADER_RE.search(text, value.start_mark.index)
+    if header and "+" in header.group("indicators"):
+        return value.end_mark.index
+    span_text = text[value.start_mark.index : value.end_mark.index]
+    last = value.start_mark.index + len(span_text.rstrip(" \r\n"))
+    return line_end(last - 1)
+
+
+def _canonical(node: yaml.Node, secret_keys: set[int], vault: VaultLib, active: set[int]):
+    """A comparable form of a composed YAML node for verify_closed.
+
+    Scalars are (tag, text). A !vault scalar, and the value of a key whose node
+    starts at an offset in secret_keys, is ("secret", plaintext bytes).
+    """
+    if id(node) in active:
+        raise OpenedFileError("file contains a recursive YAML alias")
+    if isinstance(node, yaml.ScalarNode):
+        if node.tag == "!vault":
+            ciphertext = normalize_vault_ciphertext(node.value.encode("utf-8"))
+            try:
+                return ("secret", vault_decrypt(vault, ciphertext))
+            except Exception:
+                return ("!vault", ciphertext)
+        return (node.tag, node.value)
+    active.add(id(node))
+    try:
+        if isinstance(node, yaml.SequenceNode):
+            return [_canonical(item, secret_keys, vault, active) for item in node.value]
+        return [
+            (
+                _canonical(key, secret_keys, vault, active),
+                ("secret", value.value.encode("utf-8"))
+                if key.start_mark.index in secret_keys and isinstance(value, yaml.ScalarNode)
+                else _canonical(value, secret_keys, vault, active),
+            )
+            for key, value in node.value
+        ]
+    finally:
+        active.discard(id(node))
+
+
+def verify_closed(edited: bytes, closed: bytes, marked: list[MarkedValue], vault: VaultLib) -> None:
+    """Refuse a close whose output does not read back as the edited file.
+
+    The closed file must parse, every opened value must be a !vault that
+    decrypts to what the edited file says, and every other key and value must
+    be unchanged. This checks the result rather than each step that produced
+    it, so a splice that goes wrong in a case nobody thought of is refused
+    instead of written. Comments are not compared: YAML does not keep them.
+    """
+    _edited_text, edited_docs = _compose(edited)
+    try:
+        _closed_text, closed_docs = _compose(closed)
+    except OpenedFileError:
+        raise ValueError("re-encrypted file would not parse as YAML; nothing written") from None
+    secret_keys = {m.key_index for m in marked}
+    want = [_canonical(doc, secret_keys, vault, set()) for doc in edited_docs]
+    got = [_canonical(doc, set(), vault, set()) for doc in closed_docs]
+    if want != got:
+        raise ValueError(
+            "re-encrypted file would not read back as the edited file; nothing written"
+        )
 
 
 def format_encrypted_block(
@@ -676,9 +740,11 @@ def recrypt_inline_content(
 
     modified = 0
     replacements = []
+    typed_notes = []
     seen_ids: set[int] = set()
+    all_marked = read_marked_values(content)
 
-    for marked in read_marked_values(content):
+    for marked in all_marked:
         span_id = marked.span_id
         if span_id not in records:
             raise ValueError(f"Unknown pilfer vault marker id {span_id}")
@@ -727,6 +793,8 @@ def recrypt_inline_content(
                 )
             )
             modified += 1
+            if marked.yaml_type:
+                typed_notes.append((stored_name, marked.yaml_type))
 
     missing = set(records) - seen_ids
     removed_vars: list[str] = []
@@ -749,8 +817,11 @@ def recrypt_inline_content(
             raise SecretLineDeleted(name, span_id)
         removed_vars.append(name)
 
+    new_content = splice(content, replacements)
+    verify_closed(content, new_content, all_marked, vault)
     return RecryptInlineResult(
-        content=splice(content, replacements),
+        content=new_content,
         modified_count=modified + len(removed_vars),
         removed_vars=removed_vars,
+        typed_notes=typed_notes,
     )

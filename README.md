@@ -137,14 +137,20 @@ pilfer close   # no flag needed; re-encrypts everything this session opened
 
 The opened file is YAML, and `close` reads each value with a YAML parser, so
 what you store is what Ansible would read from that line: `'single quotes'`,
-`"escapes like \u00e9"`, plain text, and a comment before the marker all mean
-what they mean in YAML. A multi-line secret is shown as a `|` block; one that a
-block cannot show exactly, or that an editor could change by trimming trailing
-whitespace, is shown as a double-quoted line with `\n` escapes. `open` checks
-that every value reads back exactly before it writes anything, and leaves a
-file that does not parse as YAML encrypted. Close a session with the pilfer
-release that opened it: inline sessions from before 2.31 are refused rather
-than read with different rules.
+`"escapes like \u00e9"`, plain text, a `|` block you write yourself, and a
+comment before the marker all mean what they mean in YAML. Every secret opens
+as one double-quoted line, multi-line ones with `\n` escapes, because nothing
+an editor does on save can change a quoted line. `open` checks that every
+value reads back exactly before it writes anything, and leaves a file that
+does not parse as YAML encrypted. `close` checks that the re-encrypted file
+reads back as the file you edited, every value included, before it writes;
+otherwise it refuses and leaves your edits and the session in place. Close a
+session with the pilfer release that opened it: inline sessions from before
+2.31 are refused rather than read with different rules.
+
+An inline `!vault` value is always a string to Ansible. If you edit
+`db_port: "5432"` to `db_port: 5432`, close stores the string `"5432"` and
+says so; convert it where it is used, for example `{{ db_port | int }}`.
 
 If you delete an entire opened variable line (key + value + marker), `close`
 refuses by default (ambiguous delete vs accident). Confirm with:

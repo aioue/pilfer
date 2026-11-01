@@ -25,6 +25,9 @@ python -m unittest test_pilfer_unified.TestPilferCLI.test_line_endings_preserved
   `ProjectDirTest` gives each test its own temporary project directory as cwd,
   with a `vault_pass` file and `self.vault`. `run_pilfer()` runs `pilfer.py` in
   a subprocess.
+- `test_inline_randomized.py`: generated secrets, edits and editor saves
+  through open and close, checked against what YAML reads from the edited
+  file. Fixed seeds; `PILFER_RANDOM_CASES=5000` runs more.
 - `test_vault_set.py`: `pilfer set` and `set_keys`. Results are read back
   through the `ansible-vault` CLI, not through pilfer.
 
