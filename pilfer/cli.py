@@ -2,7 +2,7 @@
 # heavily borrows from this excellent repo https://github.com/dellis23/ansible-toolkit
 
 # pilfer - decrypt all ansible vault files recursively for search/editing
-# pilfer [open|close]
+# pilfer [open|close|rekey|set]
 
 import argparse
 import configparser
@@ -1548,6 +1548,17 @@ Re-encrypts every entry recorded in the open session (whole-file and inline).
 No --include-encrypted-vars flag is needed on close.
 """
 
+_SET_EPILOG = """
+Examples:
+  pilfer set inventory/group_vars/all/secrets.yml db_password 'new value'
+  pilfer set secrets.yml api_token -- '-starts-with-a-dash'
+
+Sets one top-level key in a closed whole-file vault without writing plaintext to
+disk. A new key is appended; an existing scalar is replaced in place, keeping an
+inline comment. The value is stored as a JSON-quoted string, so yes/no/0123 stay
+strings. Refuses plaintext and files open in a pilfer session.
+"""
+
 _REKEY_EPILOG = """
 Examples:
   pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run
@@ -1560,7 +1571,7 @@ whole-file vault YAML only.
 
 
 def _build_argument_parser():
-    """Build the pilfer CLI parser (subcommands: open, close, rekey)."""
+    """Build the pilfer CLI parser (subcommands: open, close, rekey, set)."""
     parser = argparse.ArgumentParser(
         prog="pilfer",
         formatter_class=_HELP_FORMATTER,
@@ -1680,6 +1691,23 @@ def _build_argument_parser():
         help="Suppress nested git repo skip messages during discovery",
     )
 
+    set_parser = subparsers.add_parser(
+        "set",
+        formatter_class=_HELP_FORMATTER,
+        help="set one key in a whole-file vault without opening it",
+        description="Add or replace one top-level string in a closed whole-file vault.",
+        epilog=_SET_EPILOG,
+    )
+    set_parser.add_argument("file", help="Whole-file vault YAML")
+    set_parser.add_argument("key", help="Top-level key to add or replace")
+    set_parser.add_argument("value", help="New string value (use -- before a leading dash)")
+    set_parser.add_argument(
+        "-p",
+        "--vault-password-file",
+        type=str,
+        help="Path to vault password file (default: ansible.cfg or common paths)",
+    )
+
     return parser
 
 
@@ -1769,6 +1797,14 @@ def main(argv=None):
             )
             if not args.dry_run:
                 print(f"✅  Rekeyed {count} file(s).")
+            return 0
+
+        if args.action == "set":
+            # Imported here: vault_set imports helpers from this module.
+            from pilfer.vault_set import set_keys
+
+            actions = set_keys(args.file, {args.key: args.value}, args.vault_password_file)
+            print(f"{actions[args.key]} {args.key} in {args.file}")
             return 0
 
     except PilferError as exc:

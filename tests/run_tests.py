@@ -59,6 +59,7 @@ def main():
                 "TestVersion",
             ],
         ),
+        ("test_vault_set", ["TestVaultSet", "TestVaultSetCLI"]),
     ]
 
     results = []

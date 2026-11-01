@@ -70,16 +70,19 @@ vault_password_file = ~/.ansible-vault/.vault-file
 ```
 pilfer [--version] COMMAND ...
 
-Commands: open | close | rekey
+Commands: open | close | rekey | set
 
 pilfer open [--include-encrypted-vars] [-q] [-p VAULT_PASSWORD_FILE]
 pilfer close [--confirm-delete] [-p VAULT_PASSWORD_FILE]
 pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW [options]
+pilfer set [-p VAULT_PASSWORD_FILE] FILE KEY VALUE
 ```
 
 Run `pilfer --help` or `pilfer COMMAND --help` for full options and examples.
 
 Re-key an entire tree (inline `!vault` included by default): `pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run`.
+
+Set one top-level key in a closed whole-file vault without opening it: `pilfer set secrets.yml db_password 'new value'`. Plaintext stays in memory. A new key is appended. An existing scalar is replaced in place, so an inline comment on that line survives. The value is written as a JSON-quoted string, so `yes`, `0123` and `null` stay strings. `set` refuses plaintext files and files open in a `pilfer open` session. If anything fails, the original ciphertext is left as it was. The value is a command-line argument, so it lands in shell history; put `--` before a value that starts with `-`.
 
 ### Inline encrypted variables (`encrypt_string` / `!vault`)
 
