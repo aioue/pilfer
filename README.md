@@ -84,6 +84,8 @@ Re-key an entire tree (inline `!vault` included by default): `pilfer rekey --old
 
 Set one top-level key in a closed whole-file vault without opening it: `pilfer set secrets.yml db_password 'new value'`. Plaintext stays in memory. A new key is appended. An existing scalar is replaced in place, so an inline comment on that line survives. The value is written as a JSON-quoted string, so `yes`, `0123` and `null` stay strings. `set` refuses plaintext files and files open in a `pilfer open` session. If anything fails, the original ciphertext is left as it was. The value is a command-line argument, so it lands in shell history; put `--` before a value that starts with `-`.
 
+Scripts that hold a secret should call `pilfer.vault_set.set_keys(path, {key: value}, password_file)` in-process instead, so the value never becomes an argument. It raises `PilferError` for every refusal, including an unreadable password file. `check_only=True` runs the whole edit, encrypt included, without writing: call it with a placeholder value before an action you cannot undo, such as minting a token.
+
 ### Inline encrypted variables (`encrypt_string` / `!vault`)
 
 Whole-file vaults are opened by default. Inline `!vault` scalars are **opt-in**:

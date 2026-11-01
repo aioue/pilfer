@@ -12,6 +12,10 @@ never encrypts in place, so a failed encrypt leaves the original ciphertext.
 `pilfer open` writes a *.pilfer-open sidecar next to each target before the
 plaintext, so a sidecar or a plaintext file means a session is open. set refuses
 both rather than walking vaultedFileList.json.
+
+A `$ANSIBLE_VAULT;1.2;AES256;<label>` header keeps its label: VaultLib.encrypt
+writes 1.1 unless it is given the vault_id, and a dropped label changes which
+--vault-id ansible-vault later matches.
 """
 
 from __future__ import annotations
@@ -32,13 +36,21 @@ from pilfer.cli import (
     _load_password,
     _make_vault,
 )
-from pilfer.inline import is_whole_file_vault, normalize_whole_file_vault
+from pilfer.inline import (
+    _vault_id_from_ciphertext,
+    is_whole_file_vault,
+    normalize_whole_file_vault,
+)
 
 KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def set_keys(
-    path: str | os.PathLike, values: Mapping[str, str], vault_password_file: str | None = None
+    path: str | os.PathLike,
+    values: Mapping[str, str],
+    vault_password_file: str | None = None,
+    *,
+    check_only: bool = False,
 ) -> dict[str, str]:
     """Insert or replace top-level scalars in one encrypt. Returns key -> added/updated/unchanged.
 
@@ -46,6 +58,11 @@ def set_keys(
     key is appended at the end. If nothing changes, the file bytes are left alone
     so git does not see a new vault blob. Error messages never contain a value or
     a decrypted line.
+
+    check_only runs every step except the replace, encrypt and round-trip included,
+    so a caller can learn before an irreversible action (minting a token) whether
+    the write will be refused. Pass a placeholder shaped like the real value. A
+    concurrent change between the check and the real call is still refused then.
     """
     path = Path(path)
     if not values:
@@ -58,13 +75,37 @@ def set_keys(
         if "\0" in value:
             raise PilferError(f"refusing a value for {key} that contains NUL")
 
+    try:
+        return _set_keys(path, values, vault_password_file, check_only)
+    except OSError as exc:
+        # Callers in scripts catch PilferError; an unreadable password file or an
+        # unwritable directory must not escape as a bare PermissionError. Name the
+        # file and the OS reason only. A failed write on a descriptor has no filename.
+        if not exc.strerror:
+            detail = str(exc)
+        elif exc.filename is None:
+            detail = f"{exc.strerror} while writing {path}"
+        else:
+            detail = f"{exc.strerror}: {exc.filename}"
+        raise PilferError(detail) from None
+
+
+def _set_keys(
+    path: Path, values: Mapping[str, str], vault_password_file: str | None, check_only: bool
+) -> dict[str, str]:
     original = _read_closed_vault(path)
-    password, _ = _load_password(vault_password_file)
-    vault = _make_vault(password)
+    try:
+        password, _ = _load_password(vault_password_file)
+    except UnicodeDecodeError:
+        # The exception text quotes a byte of the password.
+        raise PilferError("vault password file is not valid text") from None
+    normalized = normalize_whole_file_vault(original)
+    vault_id = _vault_id_from_ciphertext(normalized)
+    vault = _make_vault(password, [vault_id])
     try:
         # Decrypt the bytes just read, not the path, so the compare-before-replace
         # below is against exactly the ciphertext this edit is based on.
-        text = vault.decrypt(normalize_whole_file_vault(original)).decode("utf-8")
+        text = vault.decrypt(normalized).decode("utf-8")
     except UnicodeDecodeError:
         raise PilferError(f"{path} did not decrypt to UTF-8") from None
     except Exception:
@@ -78,11 +119,12 @@ def set_keys(
         return actions
 
     plaintext = edited.encode("utf-8")
-    ciphertext = vault.encrypt(plaintext)
+    ciphertext = vault.encrypt(plaintext, vault_id=vault_id)
     # Prove the bytes decrypt to what we meant before they replace anything.
     if not is_whole_file_vault(ciphertext) or vault.decrypt(ciphertext) != plaintext:
         raise PilferError(f"encryption did not round-trip; {path} unchanged")
-    _replace_if_unchanged(path, ciphertext, original)
+    if not check_only:
+        _replace_if_unchanged(path, ciphertext, original)
     return actions
 
 

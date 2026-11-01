@@ -234,9 +234,35 @@ class TestVaultSet(VaultSetBase):
     # Failure leaves the original ciphertext
 
     def test_missing_password_file(self) -> None:
-        with self.assertRaises(FileNotFoundError):
+        with self.assertRaises(PilferError):
             set_keys(self.vault, {"target": SENTINEL}, str(self.directory / "no-such-password"))
         self._assert_untouched()
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads mode-000 files")
+    def test_unreadable_password_file_is_a_pilfer_error(self) -> None:
+        # Script callers catch PilferError only; a bare PermissionError escaped them.
+        os.chmod(self.password, 0)
+        with self.assertRaises(PilferError) as caught:
+            self._set("target", SENTINEL)
+        self.assertIn(str(self.password), str(caught.exception))
+        self._assert_untouched()
+
+    def test_non_utf8_password_file_does_not_echo_bytes(self) -> None:
+        self.password.write_bytes(b"pass\xffword\n")
+        with self.assertRaises(PilferError) as caught:
+            self._set("target", SENTINEL)
+        self.assertNotIn("xff", str(caught.exception))
+        self.assertNotIn("pass", str(caught.exception).replace("password", ""))
+        self._assert_untouched()
+
+    def test_keeps_vault_id_label(self) -> None:
+        secret = VaultSecret(PASSWORD.encode("utf-8"))
+        labelled = VaultLib([("prod", secret)]).encrypt(FIXTURE.encode("utf-8"), vault_id="prod")
+        self.assertTrue(labelled.startswith(b"$ANSIBLE_VAULT;1.2;AES256;prod\n"))
+        self.vault.write_bytes(labelled)
+        self.assertEqual(self._set("target", SENTINEL), "updated")
+        self.assertTrue(self.vault.read_bytes().startswith(b"$ANSIBLE_VAULT;1.2;AES256;prod\n"))
+        self.assertEqual(self._view(), _expected_target(SENTINEL))
 
     def test_wrong_password_file(self) -> None:
         wrong = self._password_file("wrong-password", "not-the-password")
@@ -272,10 +298,12 @@ class TestVaultSet(VaultSetBase):
 
     def test_replace_failure_removes_temp(self) -> None:
         with (
-            mock.patch.object(vault_set.os, "replace", side_effect=OSError("disk full")),
-            self.assertRaises(OSError),
+            mock.patch.object(vault_set.os, "replace", side_effect=OSError(28, "disk full")),
+            self.assertRaises(PilferError) as caught,
         ):
             self._set("target", SENTINEL)
+        # No filename on the error: name the vault rather than print "None".
+        self.assertEqual(str(caught.exception), f"disk full while writing {self.vault}")
         self._assert_untouched()
 
     def test_interrupt_removes_temp(self) -> None:
@@ -301,6 +329,43 @@ class TestVaultSet(VaultSetBase):
         ):
             self._set("target", SENTINEL)
         self._assert_untouched(before=concurrent)
+
+    # check_only
+
+    def test_check_only_runs_the_edit_without_writing(self) -> None:
+        with mock.patch.object(
+            VaultLib, "encrypt", autospec=True, side_effect=VaultLib.encrypt
+        ) as enc:
+            actions = set_keys(
+                self.vault,
+                {"target": SENTINEL, "new_key": OTHER},
+                str(self.password),
+                check_only=True,
+            )
+        self.assertEqual(actions, {"target": "updated", "new_key": "added"})
+        enc.assert_called_once()  # the encrypt and round-trip ran
+        self._assert_untouched()
+
+    def test_check_only_reports_the_refusals_a_write_would_hit(self) -> None:
+        cases = {
+            "duplicate": "target: one\ntarget: two\n",
+            "block scalar": "target: |\n  line\n",
+            "list root": "- target\n",
+            "unknown tag": "target: !unsafe '{{ x }}'\n",
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                path = self._encrypt(text, name=f"{label.replace(' ', '-')}.yml")
+                before = path.read_bytes()
+                with self.assertRaises(PilferError):
+                    set_keys(path, {"target": SENTINEL}, str(self.password), check_only=True)
+                self._assert_untouched(path, before)
+
+    def test_check_only_refuses_an_open_session(self) -> None:
+        (self.directory / "secrets.yml.pilfer-open").touch()
+        with self.assertRaises(PilferError):
+            set_keys(self.vault, {"target": SENTINEL}, str(self.password), check_only=True)
+        self._assert_untouched()
 
     # Refusals leave the original ciphertext
 
