@@ -16,6 +16,7 @@ import ctypes.util
 import errno
 import fcntl
 import os
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -53,6 +54,9 @@ def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
             raise OSError(exc.errno, f"refusing symlink lock file {lock_path}") from None
         raise
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            # A FIFO or device opened here is not ours to chmod.
+            raise OSError(errno.EINVAL, f"pilfer lock is not a regular file: {lock_path}")
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:

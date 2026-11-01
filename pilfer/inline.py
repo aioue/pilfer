@@ -244,10 +244,16 @@ def format_open_value(plaintext: bytes, span: InlineSpan) -> bytes:
 
     if "\n" in text or "\r" in text:
         indent = span.body_indent or b"  "
-        # splitlines() keeps interior blank lines; drops a single trailing newline.
+        # splitlines() keeps interior blank lines and drops one trailing break.
+        # `|` means the secret ended with a break, so close puts that break back.
+        # `|-` means it did not; close must not invent one. The opened file
+        # cannot show the difference any other way: every body line already
+        # ends with a newline, and a blank line at the key's indent is the
+        # separator before the next key.
         lines = text.splitlines()
+        chomp = b"|-" if not text.endswith(("\n", "\r")) else b"|"
         body = b"".join(indent + line.encode("utf-8") + b"\n" for line in lines)
-        return span.line_prefix + b"| " + marker + b"\n" + body
+        return span.line_prefix + chomp + b" " + marker + b"\n" + body
 
     quoted = '"' + _yaml_escape_double(text) + '"'
     return span.line_prefix + quoted.encode("utf-8") + b"  " + marker + b"\n"
@@ -333,14 +339,12 @@ def _parse_marked_value(
             line = content[cursor:next_end]
             if not line.strip():
                 body = line.rstrip(b"\r\n")
-                if (
-                    block_indent
-                    and body.startswith(block_indent)
-                    and len(body) > len(block_indent)
-                ):
-                    # Spaces past the opened indent are secret content. Treating
-                    # them as a blank makes an edit of that line parse the same
-                    # as the original, so close restores the old ciphertext.
+                if block_indent and body.startswith(block_indent):
+                    # Spaces past the opened indent are secret content. A line
+                    # that is only that indent is a blank line of the secret,
+                    # including one at the end of the block. A blank at the
+                    # key's indent is the separator before the next key;
+                    # consuming it makes an unedited secret look modified.
                     body_lines.append(body[len(block_indent) :])
                     cursor = next_end
                     continue
@@ -374,6 +378,11 @@ def _parse_marked_value(
             body_lines.append(body)
             cursor = next_end
         plaintext = b"\n".join(body_lines)
+        # `|` keeps the break splitlines() dropped, including after a trailing
+        # empty line (join already ends in `\n`, and the secret had one more).
+        # `|-` is a secret that did not end in a break.
+        if body_lines and not value.strip().startswith(b"|-"):
+            plaintext += b"\n"
         return plaintext, region_start, cursor
 
     raw = value
@@ -753,10 +762,10 @@ def recrypt_inline_content(
         original_encrypted = base64.b64decode(record["encrypted_b64"])
 
         # Hash match means the parsed bytes are the original secret. The opened
-        # rendering is lossy for a trailing newline and CRLF, so an unedited span
-        # can fail that hash after any other edit in the file forces this path.
-        # If the current text parses the same as format(original), the user did
-        # not change the span: put the original ciphertext back.
+        # rendering still turns CRLF into LF, so an unedited span can fail that
+        # hash after any other edit in the file forces this path. If the current
+        # text parses the same as format(original), the user did not change the
+        # span: put the original ciphertext back.
         if plain_hash == record["plain_hash"] or _opened_form_unchanged(plaintext, record, vault):
             replacements.append((region_start, region_end, original_encrypted))
         else:

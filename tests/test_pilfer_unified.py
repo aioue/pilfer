@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
+from ansible.errors import AnsibleError
 from ansible.parsing.vault import VaultLib, VaultSecret
 
 from pilfer import __version__ as pilfer_version
@@ -30,10 +31,15 @@ def make_vault(password: str = "test_password") -> VaultLib:
 
 
 def encrypt_string_yaml(
-    vault: VaultLib, name: str, value: bytes, indent: str = "          "
+    vault: VaultLib,
+    name: str,
+    value: bytes,
+    indent: str = "          ",
+    vault_id: str | None = None,
 ) -> str:
     """Build YAML matching ansible-vault encrypt_string --name output."""
-    enc = vault.encrypt(value).decode("utf-8").strip().splitlines()
+    encrypted = vault.encrypt(value, vault_id=vault_id) if vault_id else vault.encrypt(value)
+    enc = encrypted.decode("utf-8").strip().splitlines()
     body = "\n".join(indent + line for line in enc)
     return f"{name}: !vault |\n{body}\n"
 
@@ -732,9 +738,8 @@ class TestInlineVault(unittest.TestCase):
     def test_neighbor_edit_preserves_lossy_inline_secrets(self):
         """Editing another key must not re-encrypt an unedited inline secret.
 
-        The opened form drops a trailing newline and CRLF, and a quoted
-        backslash-n used to parse as a real newline once close left the
-        whole-file shortcut.
+        The opened form turns CRLF into LF, and a quoted backslash-n used to
+        parse as a real newline once close left the whole-file shortcut.
         """
         chunks = ["---\n", "plain_key: visible\n"]
         chunks.append(encrypt_string_yaml(self.vault, "token", b"a\\nb"))
@@ -814,7 +819,42 @@ class TestInlineVault(unittest.TestCase):
             data = handle.read()
         spans = pilfer_inline.find_inline_vault_spans(data)
         self.assertEqual(len(spans), 1)
+        self.assertEqual(
+            self.vault.decrypt(spans[0].ciphertext), b"  return 9;\n    return 2;\n"
+        )
+
+    def test_edited_multiline_without_trailing_newline_does_not_gain_one(self):
+        secret = b"  return 1;\n    return 2;"
+        self._write_vars_file(("code", secret))
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml") as handle:
+            text = handle.read()
+        self.assertIn("|-", text)
+        text = text.replace("return 1;", "return 9;", 1)
+        with open("group_vars.yml", "w") as handle:
+            handle.write(text)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        with open("group_vars.yml", "rb") as handle:
+            data = handle.read()
+        spans = pilfer_inline.find_inline_vault_spans(data)
         self.assertEqual(self.vault.decrypt(spans[0].ciphertext), b"  return 9;\n    return 2;")
+
+    def test_edited_multiline_keeps_a_trailing_blank_line(self):
+        secret = b"line1\n\n"
+        self._write_vars_file(("code", secret))
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml") as handle:
+            text = handle.read()
+        text = text.replace("line1", "line9", 1)
+        with open("group_vars.yml", "w") as handle:
+            handle.write(text)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        with open("group_vars.yml", "rb") as handle:
+            data = handle.read()
+        spans = pilfer_inline.find_inline_vault_spans(data)
+        self.assertEqual(self.vault.decrypt(spans[0].ciphertext), b"line9\n\n")
 
     def test_edited_whitespace_only_line_is_kept(self):
         secret = b"line1\n   \nline3\n"
@@ -840,7 +880,7 @@ class TestInlineVault(unittest.TestCase):
             data = handle.read()
         spans = pilfer_inline.find_inline_vault_spans(data)
         self.assertEqual(len(spans), 1)
-        self.assertEqual(self.vault.decrypt(spans[0].ciphertext), b"line1\n \nline3")
+        self.assertEqual(self.vault.decrypt(spans[0].ciphertext), b"line1\n \nline3\n")
 
     def test_neighbor_edit_preserves_whitespace_only_line(self):
         secret = b"line1\n   \nline3\n"
@@ -1331,7 +1371,7 @@ class TestInlineUnit(unittest.TestCase):
         match = pilfer_inline.MARKER_RE.search(content)
         self.assertIsNotNone(match)
         plaintext, _start, end = pilfer_inline._parse_marked_value(content, match)
-        self.assertEqual(plaintext, b"line1\n\nline3")
+        self.assertEqual(plaintext, b"line1\n\nline3\n")
         self.assertTrue(content[end:].startswith(b"other:"))
 
     def test_parse_block_keeps_spaces_past_recorded_indent(self):
@@ -1347,14 +1387,30 @@ class TestInlineUnit(unittest.TestCase):
         plaintext, _start, end = pilfer_inline._parse_marked_value(
             content, match, block_indent=b"  "
         )
-        self.assertEqual(plaintext, b"line1\n   \nline3")
+        self.assertEqual(plaintext, b"line1\n   \nline3\n")
         self.assertTrue(content[end:].startswith(b"other:"))
         blank = content.replace(b"     \n", b"  \n", 1)
         match = pilfer_inline.MARKER_RE.search(blank)
         plaintext, _start, _end = pilfer_inline._parse_marked_value(
             blank, match, block_indent=b"  "
         )
-        self.assertEqual(plaintext, b"line1\n\nline3")
+        self.assertEqual(plaintext, b"line1\n\nline3\n")
+
+    def test_parse_strip_chomp_does_not_add_a_newline(self):
+        content = b"db_password: |-  # pilfer:vault:0\n  line1\n  line2\nother: x\n"
+        match = pilfer_inline.MARKER_RE.search(content)
+        plaintext, _start, end = pilfer_inline._parse_marked_value(content, match)
+        self.assertEqual(plaintext, b"line1\nline2")
+        self.assertTrue(content[end:].startswith(b"other:"))
+
+    def test_parse_keeps_trailing_blank_line_at_block_indent(self):
+        content = b"db_password: |  # pilfer:vault:0\n  line1\n  \nother: x\n"
+        match = pilfer_inline.MARKER_RE.search(content)
+        plaintext, _start, end = pilfer_inline._parse_marked_value(
+            content, match, block_indent=b"  "
+        )
+        self.assertEqual(plaintext, b"line1\n\n")
+        self.assertTrue(content[end:].startswith(b"other:"))
 
     def test_is_whole_file_vault_tolerates_bom_and_whitespace(self):
         body = b"$ANSIBLE_VAULT;1.1;AES256\naabb\n"
@@ -1486,6 +1542,36 @@ class TestAllowRemovalsAndRekey(unittest.TestCase):
             body = f.read()
         self.assertTrue(body.startswith(b"$ANSIBLE_VAULT;1.2;AES256;prod\n"))
         self.assertEqual(make_vault("new_password").decrypt(body), b"secret_key: hunter2\n")
+
+    def test_rekey_inline_vault_keeps_plaintext_and_label(self):
+        chunks = [
+            "---\n",
+            encrypt_string_yaml(self.vault, "db_password", b"s3cret\n"),
+            encrypt_string_yaml(self.vault, "script", b"line1\nline2\n", vault_id="prod"),
+        ]
+        with open("group_vars.yml", "w") as handle:
+            handle.write("".join(chunks))
+        applied = self._run(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--yes",
+        )
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        new_vault = make_vault("new_password")
+        with open("group_vars.yml", "rb") as handle:
+            data = handle.read()
+        spans = pilfer_inline.find_inline_vault_spans(data)
+        self.assertEqual(len(spans), 2)
+        self.assertIsNone(spans[0].vault_id)
+        self.assertEqual(new_vault.decrypt(spans[0].ciphertext), b"s3cret\n")
+        self.assertEqual(spans[1].vault_id, "prod")
+        self.assertTrue(spans[1].ciphertext.startswith(b"$ANSIBLE_VAULT;1.2;AES256;prod\n"))
+        self.assertEqual(new_vault.decrypt(spans[1].ciphertext), b"line1\nline2\n")
+        with self.assertRaises(AnsibleError):
+            self.vault.decrypt(spans[0].ciphertext)
 
     def test_rekey_resumes_after_partial_success(self):
         """Files already on the new password are skipped so rekey can finish."""
