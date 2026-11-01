@@ -75,16 +75,54 @@ Commands: open | close | rekey | set
 pilfer open [--include-encrypted-vars] [-q] [-p VAULT_PASSWORD_FILE]
 pilfer close [--confirm-delete] [-p VAULT_PASSWORD_FILE]
 pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW [options]
-pilfer set [-p VAULT_PASSWORD_FILE] FILE KEY VALUE
+pilfer set [-p VAULT_PASSWORD_FILE] FILE KEY [VALUE]
 ```
 
 Run `pilfer --help` or `pilfer COMMAND --help` for full options and examples.
 
-Re-key an entire tree (inline `!vault` included by default): `pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run`.
+### Re-key a project
 
-Set one top-level key in a closed whole-file vault without opening it: `pilfer set secrets.yml db_password 'new value'`. Plaintext stays in memory. A new key is appended. An existing scalar is replaced in place, so an inline comment on that line survives. The value is written as a JSON-quoted string, so `yes`, `0123` and `null` stay strings. `set` refuses plaintext files and files open in a `pilfer open` session. If anything fails, the original ciphertext is left as it was. The value is a command-line argument, so it lands in shell history; put `--` before a value that starts with `-`.
+To preview a password rotation across the current directory and its subdirectories, run:
 
-Scripts that hold a secret should call `pilfer.vault_set.set_keys(path, {key: value}, password_file)` in-process instead, so the value never becomes an argument. It raises `PilferError` for every refusal, including an unreadable password file. `check_only=True` runs the whole edit, encrypt included, without writing: call it with a placeholder value before an action you cannot undo, such as minting a token.
+```bash
+pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run
+```
+
+This includes inline `!vault` values by default. See [Rotating the vault password](#rotating-the-vault-password) for the full procedure.
+
+### Set a single value
+
+Use `pilfer set` to add or replace a top-level key in a whole-file vault without opening a session:
+
+```bash
+pilfer set secrets.yml db_password
+```
+
+Pilfer prompts for the value without echoing it. You can also pipe a value in:
+
+```bash
+printf '%s' "$TOKEN" | pilfer set secrets.yml db_password
+```
+
+Piped input drops one trailing newline, so `echo` works too. You can pass the value as the final argument, but it may appear in shell history and process listings. Put `--` before a value that starts with `-`.
+
+The value stays in memory and is saved as a string, even if it looks like a YAML boolean or number. New keys are appended; replacing an existing scalar preserves any inline comment on its line. Values containing `{{`, `{%` or `{#` are tagged `!unsafe` so Ansible uses them as typed. An existing `!unsafe` value keeps its tag.
+
+Pilfer refuses plaintext files, files in an open Pilfer session, and key names that YAML reads as a boolean or null, such as `yes`, `on` and `null`. If the operation fails, the original ciphertext remains unchanged. Pilfer replaces the file while preserving its mode; hard links continue to point to the old content.
+
+#### Set values from Python
+
+Scripts that already hold a secret can use the in-process API to keep it out of command arguments:
+
+```python
+from pilfer.vault_set import set_keys
+
+set_keys(path, {key: value}, password_file)
+```
+
+Failures and refusals raise `PilferError`, including an unreadable password file or failed encryption.
+
+To check whether an update can be made before an action you cannot undo, such as minting a token, call `set_keys` with a placeholder value and `check_only=True`. This performs the edit and encryption and writes a temporary ciphertext file beside the vault, but skips the final rename. It can therefore catch problems such as a read-only directory or full disk.
 
 ### Inline encrypted variables (`encrypt_string` / `!vault`)
 
