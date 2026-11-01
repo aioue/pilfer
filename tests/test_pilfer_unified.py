@@ -316,7 +316,7 @@ class TestSessionSafety(unittest.TestCase):
             f.write("wrong")
         result = self._run("open", password_file="bad_pass")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Session cleared", result.stderr)
+        self.assertIn("nothing was opened", result.stderr)
         with open("secret.yml", "rb") as f:
             self.assertTrue(f.read().startswith(b"$ANSIBLE_VAULT;"))
         self.assertFalse(os.path.isfile("vaultedFileList.json"))
@@ -452,28 +452,50 @@ class TestSessionSafety(unittest.TestCase):
         result = self._run("open", password_file="does-not-exist")
         self.assertNotEqual(result.returncode, 0)
 
-    def test_legacy_v1_session_list_still_loads(self):
-        """Bare JSON list sessions from older pilfer remain readable for decrypt."""
+    def test_session_list_from_an_old_release_is_refused(self):
+        """List and {"files": ...} sessions predate releases that can close safely here."""
         abs_path = os.path.abspath("secret.yml")
-        with open("vaultedFileList.json", "w") as f:
-            json.dump([abs_path], f)
-        count = pilfer_cli.decrypt_vault_files("vault_pass")
-        self.assertEqual(count, 1)
         with open("secret.yml", "rb") as f:
-            self.assertEqual(f.read(), b"secret_key: hunter2\n")
+            before = f.read()
+        for old in ([abs_path], {"files": [abs_path]}):
+            with self.subTest(old=old):
+                with open("vaultedFileList.json", "w") as f:
+                    json.dump(old, f)
+                for action in (pilfer_cli.decrypt_vault_files, pilfer_cli.recrypt_vault_files):
+                    with self.assertRaises(pilfer_cli.PilferError) as caught:
+                        action("vault_pass")
+                    self.assertIn("older pilfer", str(caught.exception))
+                with open("secret.yml", "rb") as f:
+                    self.assertEqual(f.read(), before)
 
-    def test_legacy_v1_session_close_proves_and_succeeds(self):
-        """Unbound legacy sessions close after password is proven against backups."""
-        abs_path = os.path.abspath("secret.yml")
-        with open("vaultedFileList.json", "w") as f:
-            json.dump([abs_path], f)
-        pilfer_cli.decrypt_vault_files("vault_pass")
-        # decrypt rewrote a v2 session with binding; simulate legacy by rewriting.
-        with open("vaultedFileList.json", "w") as f:
-            json.dump([abs_path], f)
-        modified = pilfer_cli.recrypt_vault_files("vault_pass")
-        self.assertEqual(modified, 0)
-        self.assertFalse(os.path.isfile("vaultedFileList.json"))
+    def test_failed_open_removes_only_what_it_wrote(self):
+        real_write = pilfer_cli._atomic_write_bytes
+
+        def fail_on_hash(path, data):
+            if path.endswith("hash"):
+                raise OSError(28, "No space left on device")
+            return real_write(path, data)
+
+        with open("secret.yml", "rb") as f:
+            before = f.read()
+        with mock.patch.object(pilfer_cli, "_atomic_write_bytes", side_effect=fail_on_hash):
+            result = pilfer_cli.main(["open", "-p", "vault_pass"])
+        self.assertEqual(result, 1)
+        with open("secret.yml", "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertFalse(os.path.exists(".vault"))
+        self.assertFalse(os.path.exists("vaultedFileList.json"))
+        self.assertFalse(os.path.exists("secret.yml.pilfer-open"))
+
+    def test_close_leaves_unexpected_vault_contents_and_says_so(self):
+        self.assertEqual(self._run("open").returncode, 0)
+        with open(os.path.join(".vault", "stray"), "wb") as f:
+            f.write(b"$ANSIBLE_VAULT;1.1;AES256\nnot-ours\n")
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertIn("Left .vault/ in place", closed.stderr)
+        with open(os.path.join(".vault", "stray"), "rb") as f:
+            self.assertIn(b"not-ours", f.read())
 
     def test_empty_password_fingerprint_close_proves_and_succeeds(self):
         """Empty password_sha256 can close when backups prove the password."""
@@ -560,13 +582,17 @@ class TestSessionSafety(unittest.TestCase):
         self.assertEqual(opened.returncode, 0, opened.stderr)
         self.assertFalse(os.path.exists(".pilfer-rekey-killed"))
 
-    def test_vault_ciphertext_temp_survives_open(self):
-        """Rekey dry-run must still find ciphertext left under the staging prefix."""
+    def test_ciphertext_temp_is_removed_on_open(self):
+        """A leftover temp never holds the only copy: its rename never happened."""
         with open(".pilfer-rekey-deadbeef", "wb") as handle:
             handle.write(self.vault.encrypt(b"orphan: true\n"))
+        os.makedirs(".vault/nested")
+        with open(".vault/nested/.pilfer-rekey-backup1", "wb") as handle:
+            handle.write(b"killed backup write")
         opened = self._run("open")
         self.assertEqual(opened.returncode, 0, opened.stderr)
-        self.assertTrue(os.path.isfile(".pilfer-rekey-deadbeef"))
+        self.assertFalse(os.path.exists(".pilfer-rekey-deadbeef"))
+        self.assertFalse(os.path.exists(".vault/nested/.pilfer-rekey-backup1"))
 
     def test_renamed_yaml_under_rekey_prefix_still_blocks(self):
         with open(".pilfer-rekey-hidden.yml", "w") as handle:
@@ -789,6 +815,28 @@ class TestInlineVault(unittest.TestCase):
         closed = self._open_edit_close(b"old", lambda t: t.replace('"old"', '"new"'))
         self.assertEqual(closed.returncode, 0, closed.stderr)
         self.assertEqual(stat.S_IMODE(os.stat("group_vars.yml").st_mode), 0o644)
+
+    def test_secret_moved_under_another_key_with_an_escape_is_refused(self):
+        # The old regex scan unescaped only \\n \\r \\t \\\\ and \\", so \\x65 slipped past.
+        closed = self._open_edit_close(
+            b"hunter2",
+            lambda t: t.replace('db_password: "hunter2"  # pilfer:vault:0', 'renamed: "hunt\\x65r2"'),
+        )
+        self.assertNotEqual(closed.returncode, 0)
+        self.assertIn("marker missing", closed.stdout + closed.stderr)
+        self.assertTrue(os.path.isfile("vaultedFileList.json"))
+
+    def test_marker_removed_and_yaml_broken_stops_close(self):
+        first = self._open_edit_close(
+            b"hunter2",
+            lambda t: t.replace('db_password: "hunter2"  # pilfer:vault:0', "broken: ["),
+        )
+        self.assertNotEqual(first.returncode, 0)
+        # Not even a confirmed delete: close cannot tell whether the secret is gone.
+        closed = self._run("close", confirm_delete=True)
+        self.assertNotEqual(closed.returncode, 0)
+        self.assertIn("YAML", closed.stdout + closed.stderr)
+        self.assertTrue(os.path.isfile("vaultedFileList.json"))
 
     def test_inline_skipped_without_flag(self):
         self._write_vars_file(("db_password", b"super-secret"))
@@ -1445,10 +1493,8 @@ class TestDiscoveryOptimizations(unittest.TestCase):
             self.assertEqual(f.read(), b"secret_key: hunter2\n")
         self.assertEqual(pilfer_cli.recrypt_vault_files("vault_pass"), 0)
         with open("bom_secret.yml", "rb") as f:
-            after = f.read()
-        self.assertTrue(
-            after.startswith(b"$ANSIBLE_VAULT;") or after.lstrip().startswith(b"$ANSIBLE_VAULT;")
-        )
+            # An unchanged close puts back the exact bytes, BOM included.
+            self.assertEqual(f.read(), b"\xef\xbb\xbf" + ciphertext)
 
 
 class TestCompatibility(unittest.TestCase):
@@ -1842,10 +1888,11 @@ class TestAllowRemovalsAndRekey(unittest.TestCase):
             "--yes",
         )
         self.assertEqual(dry.returncode, 0, dry.stderr)
-        self.assertTrue(
-            os.path.exists(".pilfer-rekey-deadbeef"),
-            "dry-run must not delete rekey temps",
-        )
+        # Leftover temps are removed even on a dry run: they are never the only
+        # copy, and one from a killed open holds plaintext.
+        self.assertFalse(os.path.exists(".pilfer-rekey-deadbeef"))
+        with open("secret.yml", "rb") as f:
+            self.assertEqual(self.vault.decrypt(f.read()), b"secret_key: hunter2\n")
         result = self._run(
             "rekey",
             "--old-vault-password-file",

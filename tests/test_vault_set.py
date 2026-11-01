@@ -923,7 +923,8 @@ class TestReviewFollowups(VaultSetBase):
         cli._write_session([{"path": str(plain), "kind": "file"}])
         with self.assertRaises(PilferError) as caught:
             cli.decrypt_vault_files(str(self.password))
-        self.assertIn("another open", str(caught.exception))
+        # Nothing outside this call's own writes is touched on total failure.
+        self.assertIn("nothing was opened", str(caught.exception))
         self.assertEqual(backup.read_bytes(), b"$ANSIBLE_VAULT;1.1;AES256\nkeep-this-backup\n")
         self.assertTrue((self.directory / "vaultedFileList.json").is_file())
 

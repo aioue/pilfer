@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import sys
 import tempfile
@@ -332,21 +331,19 @@ def _ensure_private_dir(path: str) -> None:
 
 
 def _normalize_entries(data):
-    """Return session entries from session JSON (any version).
+    """Return session entries from session JSON.
 
-    A password_sha256 field written by pilfer < 2.31 is ignored: close proves
+    Lists and {"files": [...]} came from pilfer releases too old to close
+    safely here; refuse rather than guess how they opened inline values. A
+    password_sha256 field written by pilfer < 2.31 is ignored: close proves
     the password against a .vault backup instead of storing a hash of it.
     """
-    if isinstance(data, list):
-        return [{"kind": "file", "path": p} for p in data]
-    if not isinstance(data, dict):
-        raise PilferError(f"Unrecognized {temp_vault_file_list_path} format; refuse to continue.")
-
-    if "entries" in data:
+    if isinstance(data, dict) and isinstance(data.get("entries"), list):
         return data["entries"]
-    if "files" in data:
-        return [{"kind": "file", "path": p} for p in data["files"]]
-    raise PilferError(f"Unrecognized {temp_vault_file_list_path} format; refuse to continue.")
+    raise PilferError(
+        f"{temp_vault_file_list_path} was written by an older pilfer or is damaged. "
+        "Close the session with the pilfer release that opened it."
+    )
 
 
 def _load_session():
@@ -455,22 +452,8 @@ def _session_is_incomplete(entries) -> bool:
     return saw_encrypted
 
 
-def _another_open_holds_entries(entries) -> bool:
-    """True when wiping the session would throw away another open's ciphertext."""
-    for entry in entries:
-        if _entry_has_open_artifacts(entry):
-            return True
-        path = entry["path"]
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "rb") as handle:
-                data = handle.read()
-        except OSError:
-            return True
-        if not _path_still_vault_ciphertext(entry, data):
-            return True
-    return False
+class NothingOpened(PilferError):
+    """decrypt_vault_files opened no file and wrote nothing."""
 
 
 def _clear_session_list() -> None:
@@ -653,71 +636,69 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
     return result
 
 
-def _prune_walk_dirnames(dirpath: str, dirnames: list) -> list:
-    """Prune skip dirs and nested git checkouts (same rules as scan_project)."""
-    pruned = []
-    for d in dirnames:
-        if d in _SKIP_DIR_NAMES:
-            continue
-        child = os.path.join(dirpath, d)
-        if _is_nested_git_checkout(child):
-            continue
-        pruned.append(d)
-    return pruned
+# A write_atomic temp: the prefix plus mkstemp's random letters, digits and
+# underscores. A name with a dot after the prefix is not one of pilfer's.
+_STALE_TEMP_RE = re.compile(re.escape(TEMP_PREFIX) + r"[A-Za-z0-9_]+")
 
 
-def _cleanup_stale_rekey_temps(root: str | None = None, *, include_open_markers: bool = False) -> int:
-    """Remove crash leftovers from atomic staging (sibling .pilfer-rekey-*).
+def _remove_stale_temps(root: str | None = None) -> int:
+    """Delete write_atomic temps a killed pilfer left behind. Returns how many.
 
-    Never deletes *.pilfer-open sidecars. A renamed YAML file that still has an
-    open marker is orphan evidence and is kept. Extensionless names are mkstemp
-    leftovers. When include_open_markers is set, those are removed when they
-    hold decrypted text (inline marker, or whole-file plaintext with no marker).
-    Vault ciphertext stays, so rekey --dry-run does not delete .pilfer-rekey-*
-    staging. A confirmed rekey deletes that ciphertext. Skips nested git checkouts.
+    A temp exists only until its rename, so a leftover is never the only copy:
+    the file it was meant to replace still holds its previous content. A
+    leftover from a killed open holds plaintext, so open, close and rekey (dry
+    runs included) remove them before anything else. A concurrent `pilfer set`
+    can lose its live temp too; it then fails and leaves its vault as it was.
+    .vault is walked as well, so a killed backup write does not look like
+    orphaned open state. Nested git checkouts are skipped.
     """
     walk_dir = os.path.abspath(root or os.getcwd())
-    marker = MARKER_PREFIX.encode("utf-8")
+    skip = _SKIP_DIR_NAMES - {temp_hidden_encrypted_copies_directory_path}
     removed = 0
     for dirpath, dirnames, filenames in os.walk(walk_dir):
-        dirnames[:] = _prune_walk_dirnames(dirpath, dirnames)
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in skip and not _is_nested_git_checkout(os.path.join(dirpath, d))
+        ]
         for name in filenames:
-            if not name.startswith(REKEY_TEMP_PREFIX):
+            if not _STALE_TEMP_RE.fullmatch(name):
                 continue
             path = os.path.join(dirpath, name)
-            if path.endswith(OPEN_SIDECAR_SUFFIX):
-                continue
             try:
-                with open(path, "rb") as handle:
-                    data = handle.read()
-                suffix = os.path.splitext(name)[1].lower()
-                if marker in data:
-                    # Only extensionless mkstemp leftovers are safe to remove.
-                    # A .yml/.yaml rename is orphan evidence.
-                    if not (include_open_markers and suffix == ""):
-                        continue
-                elif include_open_markers and (suffix != "" or is_whole_file_vault(data)):
-                    # No inline marker. A suffixed rename stays. Extensionless
-                    # vault ciphertext stays so rekey --dry-run does not delete
-                    # it. Extensionless non-vault bytes are whole-file plaintext
-                    # from a killed open and fall through to unlink.
+                if not stat.S_ISREG(os.lstat(path).st_mode):
                     continue
                 os.unlink(path)
                 removed += 1
             except OSError:
                 pass
+    if removed:
+        print(f"ℹ️  Removed {removed} leftover temp file(s) from an interrupted pilfer run.")
     return removed
 
 
+def _prune_empty_dirs(root: str) -> None:
+    """Remove empty directories under root, then root if it is empty. Never removes a file.
+
+    Used instead of rmtree on .vault: anything still in there is a backup or
+    session file pilfer did not expect, possibly the only ciphertext of a
+    file, and the next open reports it as orphaned state.
+    """
+    if os.path.islink(root) or not os.path.isdir(root):
+        return
+    for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
+        try:
+            os.rmdir(dirpath)
+        except OSError:
+            pass  # not empty
+
+
 def _vault_dir_has_artifacts() -> bool:
+    """True if .vault holds any file. Empty directories hold no backup."""
     root = Path(temp_hidden_encrypted_copies_directory_path)
     if not root.is_dir():
         return False
-    try:
-        next(root.rglob("*"))
-        return True
-    except StopIteration:
-        return False
+    return any(not path.is_dir() or path.is_symlink() for path in root.rglob("*"))
 
 
 def assert_no_orphaned_open_state(scan: ProjectScan | None = None):
@@ -792,6 +773,36 @@ def write_vaulted_file_list(
     return found
 
 
+def _publish_opened(
+    vaulted_file_path: str, kind: str, plaintext: bytes, original: bytes, backups: dict
+) -> None:
+    """Write the .vault backups and the sidecar, then the plaintext. Undo all of it on failure.
+
+    The sidecar goes before the plaintext, so a crash never leaves unmarked
+    plaintext. The plaintext replace is atomic: until it lands the file still
+    holds its ciphertext, so cleanup removes only what this call wrote and
+    never rewrites the target. expected=original: if the file changed while it
+    was decrypted (an editor, or a tool other than pilfer), publishing this
+    plaintext would throw that change away.
+    """
+    written = []
+    try:
+        _ensure_private_dir(_backup_dir_for(vaulted_file_path))
+        for path, data in backups.items():
+            _atomic_write_bytes(path, data)
+            written.append(path)
+        written.append(_open_sidecar_path(vaulted_file_path))
+        _write_open_sidecar(vaulted_file_path, kind)
+        write_atomic(vaulted_file_path, plaintext, expected=original, action="open")
+    except BaseException:
+        for path in written:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        raise
+
+
 def _decrypt_whole_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> dict:
     with vault_file_lock(vaulted_file_path):
         return _decrypt_whole_file_locked(vaulted_file_path, vault, cwd)
@@ -816,34 +827,20 @@ def _decrypt_whole_file_locked(vaulted_file_path: str, vault: VaultLib, cwd: Pat
     ensure_vault_label(vault, encrypted_data)
     decrypted_bytes = vault.decrypt(encrypted_data)
 
-    backup_dir = _backup_dir_for(vaulted_file_path)
-    _ensure_private_dir(backup_dir)
-
-    encrypted_backup = _encrypted_backup_path(vaulted_file_path)
-    _atomic_write_bytes(encrypted_backup, encrypted_data)
-
-    file_hash = hashlib.sha256(decrypted_bytes).hexdigest()
-    hash_path = _hash_backup_path(vaulted_file_path)
-    _atomic_write_bytes(hash_path, file_hash.encode("utf-8"))
-
-    # Sidecar before plaintext so a crash/failure never leaves unmarked plaintext.
-    # The plaintext replace is atomic: a crash keeps the original ciphertext
-    # until the decrypted bytes are complete, so failure cleanup must not
-    # rewrite the target (that rewrite was itself a truncate window).
-    _write_open_sidecar(vaulted_file_path, "file")
-    try:
-        # expected=raw: if the ciphertext changed while it was decrypted (an editor,
-        # or a tool other than pilfer), publishing this plaintext would throw that
-        # change away. The cleanup below then drops the sidecar and backups.
-        write_atomic(vaulted_file_path, decrypted_bytes, expected=raw, action="open")
-    except BaseException:
-        _remove_open_sidecar(vaulted_file_path)
-        for path in (encrypted_backup, hash_path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        raise
+    _publish_opened(
+        vaulted_file_path,
+        "file",
+        decrypted_bytes,
+        raw,
+        {
+            # The raw bytes, BOM and leading whitespace included, so an
+            # unchanged close puts back exactly what was there.
+            _encrypted_backup_path(vaulted_file_path): raw,
+            _hash_backup_path(vaulted_file_path): hashlib.sha256(decrypted_bytes)
+            .hexdigest()
+            .encode("utf-8"),
+        },
+    )
     return restore
 
 
@@ -866,34 +863,22 @@ def _decrypt_inline_file_locked(
     if not records:
         raise PilferError(f"No inline vault spans found in {vaulted_file_path}")
 
-    backup_dir = _backup_dir_for(vaulted_file_path)
-    _ensure_private_dir(backup_dir)
-
-    # Full original backup for unchanged whole-file restore shortcut.
-    encrypted_backup = _encrypted_backup_path(vaulted_file_path)
-    _atomic_write_bytes(encrypted_backup, original)
-
-    file_hash = hashlib.sha256(new_content).hexdigest()
-    hash_path = _hash_backup_path(vaulted_file_path)
-    _atomic_write_bytes(hash_path, file_hash.encode("utf-8"))
-
-    meta_path = _inline_meta_path(vaulted_file_path)
-    _atomic_write_bytes(
-        meta_path,
-        json.dumps({"format": INLINE_FORMAT, "spans": records}, indent=2).encode("utf-8"),
+    _publish_opened(
+        vaulted_file_path,
+        "inline",
+        new_content,
+        original,
+        {
+            # Full original, for the unchanged-file shortcut on close.
+            _encrypted_backup_path(vaulted_file_path): original,
+            _hash_backup_path(vaulted_file_path): hashlib.sha256(new_content)
+            .hexdigest()
+            .encode("utf-8"),
+            _inline_meta_path(vaulted_file_path): json.dumps(
+                {"format": INLINE_FORMAT, "spans": records}, indent=2
+            ).encode("utf-8"),
+        },
     )
-
-    _write_open_sidecar(vaulted_file_path, "inline")
-    try:
-        write_atomic(vaulted_file_path, new_content, expected=original, action="open")
-    except BaseException:
-        _remove_open_sidecar(vaulted_file_path)
-        for path in (encrypted_backup, hash_path, meta_path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        raise
 
     return len(records), restore
 
@@ -930,29 +915,18 @@ def decrypt_vault_files(vault_password_file_path=None):
             print(f"Failed to decrypt {path}: {e}")
             failed.append(path)
 
-    if failed and not succeeded and _another_open_holds_entries(entries):
-        raise PilferError(
-            "Decrypt failed, and another open still has plaintext or backups. "
-            "Left the session and .vault in place."
+    if failed and not succeeded:
+        # Each file undid what it wrote, and nothing else is touched here: the
+        # session list and .vault may belong to an open that is still in use.
+        # The CLI, which wrote this session list under the project lock, clears it.
+        raise NothingOpened(
+            f"Failed to decrypt all {len(entries)} file(s); nothing was opened. "
+            "Fix the errors and retry 'pilfer open'."
         )
 
     _write_session(succeeded)
 
     if failed:
-        if not succeeded:
-            # Total failure - clear the empty session so open can be retried.
-            try:
-                os.remove(temp_vault_file_list_path)
-            except OSError:
-                pass
-            try:
-                shutil.rmtree(temp_hidden_encrypted_copies_directory_path, ignore_errors=True)
-            except OSError:
-                pass
-            raise PilferError(
-                f"Failed to decrypt all {len(entries)} file(s). "
-                "Session cleared; no files were decrypted. Fix errors and retry 'pilfer open'."
-            )
         raise PilferError(
             f"Failed to decrypt {len(failed)} of {len(entries)} file(s). "
             f"Session kept for {len(succeeded)} decrypted file(s); "
@@ -1247,10 +1221,13 @@ def recrypt_vault_files(vault_password_file_path=None, confirm_delete: bool = Fa
     except OSError:
         pass
 
-    try:
-        os.removedirs(temp_hidden_encrypted_copies_directory_path)
-    except Exception:
-        shutil.rmtree(temp_hidden_encrypted_copies_directory_path, ignore_errors=True)
+    _prune_empty_dirs(temp_hidden_encrypted_copies_directory_path)
+    if os.path.isdir(temp_hidden_encrypted_copies_directory_path):
+        print(
+            f"⚠️  Left {temp_hidden_encrypted_copies_directory_path}/ in place: it holds files "
+            "this session did not create. Check them before deleting.",
+            file=sys.stderr,
+        )
 
     try:
         os.remove(temp_vault_file_list_path)
@@ -1423,10 +1400,9 @@ def rekey_vault_files(
     Returns number of files rewritten (0 on dry-run / already complete).
     """
     _refuse_planted_session_links()
-    # Extensionless staging files can hold decrypted text from a cancelled
-    # open. Remove those before the orphan check. Vault ciphertext leftovers
-    # stay until a confirmed rekey, so dry-run does not delete them.
-    _cleanup_stale_rekey_temps(include_open_markers=True)
+    # A leftover temp from a killed open can hold plaintext with markers, which
+    # the orphan check below would report. It is never the only copy.
+    _remove_stale_temps()
     if _session_is_open():
         raise PilferError(
             f"Session already open ({temp_vault_file_list_path}). "
@@ -1497,7 +1473,6 @@ def rekey_vault_files(
         print("ℹ️  All targets already decrypt with the new password; nothing to rewrite.")
         if rotate_password_file:
             _confirm_rekey(yes, action="rotate the vault password file")
-            _maybe_cleanup_rekey_temps()
             _rotate_password_file(old_path, new_path)
             _log_vault_password_file_rotated()
         return 0
@@ -1506,7 +1481,6 @@ def rekey_vault_files(
     if rotate_password_file:
         action += " and rotate the vault password file"
     _confirm_rekey(yes, action=action)
-    _maybe_cleanup_rekey_temps()
 
     succeeded = []
     failed = []
@@ -1550,13 +1524,6 @@ def _confirm_rekey(yes: bool, *, action: str) -> None:
         raise PilferError("Confirmation required (non-interactive; pass --yes).") from exc
     if answer.strip() != "REKEY":
         raise PilferError("Rekey aborted (confirmation not matched).")
-
-
-def _maybe_cleanup_rekey_temps() -> None:
-    """Delete staging leftovers only after the operator confirmed a mutating rekey."""
-    removed_temps = _cleanup_stale_rekey_temps()
-    if removed_temps:
-        print(f"ℹ️  Removed {removed_temps} stale rekey temp file(s).")
 
 
 def _log_vault_password_file_rotated() -> None:
@@ -1890,7 +1857,7 @@ def main(argv=None):
             with project_session_lock():
                 print("🔓 Searching for and decrypting vault files...")
                 _refuse_planted_session_links()
-                _cleanup_stale_rekey_temps(include_open_markers=True)
+                _remove_stale_temps()
                 if _session_is_open() and not _abandon_incomplete_session():
                     raise PilferError(
                         f"Session already open ({temp_vault_file_list_path} exists). "
@@ -1925,7 +1892,14 @@ def main(argv=None):
                         "(inline !vault strings skipped - pass "
                         "--include-encrypted-vars to open them)"
                     )
-                decrypt_vault_files(args.vault_password_file)
+                try:
+                    decrypt_vault_files(args.vault_password_file)
+                except NothingOpened:
+                    # This open wrote the session list a moment ago, under the
+                    # project lock, and every file cleaned up after itself.
+                    _clear_session_list()
+                    _prune_empty_dirs(temp_hidden_encrypted_copies_directory_path)
+                    raise
                 # ANSI bold around the next command (TTY-friendly; harmless in pipes).
                 print(
                     "✅ All vault files decrypted. Edit as needed, "
@@ -1937,7 +1911,7 @@ def main(argv=None):
             with project_session_lock():
                 print("🔒 Re-encrypting vault files...")
                 _refuse_planted_session_links()
-                _cleanup_stale_rekey_temps(include_open_markers=True)
+                _remove_stale_temps()
                 if not _session_is_open():
                     print("No vault file list found. Run 'pilfer open' first.", file=sys.stderr)
                     return 1

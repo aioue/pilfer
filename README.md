@@ -238,9 +238,8 @@ A mid-run failure can leave a split-password tree; **re-run the same `rekey`
 command to resume** (files already on the new password are skipped).
 `--rotate-password-file` is refused with `--no-include-encrypted-vars`, and also
 when nested git checkouts were skipped, so the live password file is not rotated
-while ciphertext remains on the old password. Stale `.pilfer-rekey-*` staging
-files are ignored as vault targets and removed only after confirmed mutating
-rekey (never on `--dry-run`).
+while ciphertext remains on the old password. Leftover
+`.pilfer-rekey-*` temp files are never vault targets.
 
 ## Safety
 
@@ -251,7 +250,7 @@ non-zero. It does not invent fixes for ambiguous edits.
 ### Failure modes this protects against
 
 - Silent re-key on `close` with a different password than `open`
-- Double-`open` destroying encrypted backups under `.vault/`
+- Double-`open` destroying encrypted backups under `.vault/` (a failed `open` removes only the files it wrote, and `close` never deletes a `.vault` file it did not create)
 - Orphan plaintext after deleting `vaultedFileList.json` (markers, `.vault/`, or `*.pilfer-open` sidecars still block re-open)
 - Stranded plaintext after stripping markers, renaming keys, or relocating secrets (including into comments)
 - Crash mid-decrypt leaving unmarked plaintext (open sidecars are written before plaintext)
@@ -268,6 +267,7 @@ non-zero. It does not invent fixes for ambiguous edits.
 - **Password check on close:** `close` proves the password by decrypting a `.vault` backup. The session list stores no hash of the password.
 - **File modes:** opened plaintext is `0600`. `close` puts back the mode and group the file had at `open`; `rekey` and `set` keep the file's own. The group is kept only when you are a member of it.
 - **Incomplete open** (session list written, crash before decrypt) is cleared on the next `open` only when listed paths still look like vault ciphertext and there are no backups/sidecars - so you are not told to `close` ciphertext. If the session list remains but files are already plaintext (artifacts deleted), `open` still refuses.
+- **Leftover temp files** (`.pilfer-rekey-*`, no extension) from a killed run are deleted by the next `open`, `close` or `rekey`, dry runs included. A temp exists only until its rename, so it is never the only copy of anything, and one from a killed `open` holds plaintext.
 - **`*.pilfer-open` sidecars** sit beside opened files (whole-file opens have no `# pilfer:vault:` markers).
 
 ### Gitignore
@@ -278,7 +278,7 @@ vaultedFileList.json
 **/*.pilfer-open
 # Empty lock left beside a vault after open, close, rekey, or set.
 **/*.pilfer-lock
-# Ciphertext temp a killed set or rekey can leave next to the vault.
+# Temp a killed pilfer can leave beside a file. The next open, close or rekey deletes it.
 **/.pilfer-rekey-*
 ```
 

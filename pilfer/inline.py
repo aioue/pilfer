@@ -376,20 +376,42 @@ def decrypt_inline_content(content: bytes, vault: VaultLib) -> tuple[bytes, list
     return new_content, records
 
 
-def _mapping_pairs(root: yaml.Node):
-    """Every (key, value) pair in every block or flow mapping under root."""
+def _nodes(root: yaml.Node):
+    """Every node under root, once each (an alias reuses a node already walked)."""
     stack, seen = [root], set()
     while stack:
         node = stack.pop()
         if id(node) in seen:
-            continue  # an alias points back at a node already walked
+            continue
         seen.add(id(node))
+        yield node
         if isinstance(node, yaml.MappingNode):
             for key, value in node.value:
-                yield key, value
                 stack.extend((key, value))
         elif isinstance(node, yaml.SequenceNode):
             stack.extend(node.value)
+
+
+def _compose(content: bytes) -> tuple[str, list[yaml.Node]]:
+    """Parse every YAML document in content.
+
+    Raises OpenedFileError, whose message never quotes the file: YAML errors
+    normally quote the offending line, and in an opened file that is a secret.
+    Tags such as !vault and !unsafe stay on the nodes; nothing is constructed.
+    """
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise OpenedFileError("file is not UTF-8") from None
+    try:
+        documents = [root for root in yaml.compose_all(text, Loader=yaml.SafeLoader) if root]
+    except yaml.MarkedYAMLError as exc:
+        mark = exc.problem_mark or exc.context_mark
+        where = f" (line {mark.line + 1})" if mark is not None else ""
+        raise OpenedFileError(f"file does not parse as YAML{where}") from None
+    except Exception:
+        raise OpenedFileError("file does not parse as YAML") from None
+    return text, documents
 
 
 def read_marked_values(content: bytes) -> list[MarkedValue]:
@@ -401,23 +423,11 @@ def read_marked_values(content: bytes) -> list[MarkedValue]:
     Ansible. The region runs from the start of the key's line to the end of the
     value's last non-blank line, so blank lines after a block stay in the file.
 
-    Raises OpenedFileError, whose message never quotes the file: YAML errors
-    normally quote the offending line, and here that is a secret.
+    Raises OpenedFileError (see _compose).
     """
     if not MARKER_RE.search(content):
         return []
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        raise OpenedFileError("file is not UTF-8") from None
-    try:
-        documents = list(yaml.compose_all(text, Loader=yaml.SafeLoader))
-    except yaml.MarkedYAMLError as exc:
-        mark = exc.problem_mark or exc.context_mark
-        where = f" (line {mark.line + 1})" if mark is not None else ""
-        raise OpenedFileError(f"file does not parse as YAML{where}") from None
-    except Exception:
-        raise OpenedFileError("file does not parse as YAML") from None
+    text, documents = _compose(content)
 
     line_starts = [0] + [i + 1 for i, ch in enumerate(text) if ch == "\n"]
 
@@ -428,7 +438,13 @@ def read_marked_values(content: bytes) -> list[MarkedValue]:
         nl = text.find("\n", index)
         return len(text) if nl < 0 else nl + 1
 
-    pairs = [pair for root in documents if root is not None for pair in _mapping_pairs(root)]
+    pairs = [
+        pair
+        for root in documents
+        for node in _nodes(root)
+        if isinstance(node, yaml.MappingNode)
+        for pair in node.value
+    ]
     found = []
     for match in _MARKER_TEXT_RE.finditer(text):
         marker_line = line_of(match.start())
@@ -489,49 +505,6 @@ def _yaml_key_present(content: bytes, var_name: str) -> bool:
     return pattern.search(content) is not None
 
 
-def _yaml_unescape_double(text: str) -> str:
-    """Decode a YAML double-quoted body. A backslash is consumed before \\n/\\r/\\t.
-
-    Replacing ``\\n`` first turns the two characters backslash, n inside ``\\\\n``
-    (an escaped backslash followed by n) into a real newline.
-    """
-    out = []
-    index = 0
-    escapes = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"'}
-    while index < len(text):
-        if text[index] == "\\" and index + 1 < len(text):
-            nxt = text[index + 1]
-            out.append(escapes.get(nxt, "\\" + nxt))
-            index += 2
-            continue
-        out.append(text[index])
-        index += 1
-    return "".join(out)
-
-
-def _yaml_unescape_single(text: str) -> str:
-    # YAML single-quoted: '' → '
-    return text.replace("''", "'")
-
-
-def _hash_block_scalar_body(body: bytes) -> str | None:
-    if not body:
-        return None
-    lines = body.splitlines()
-    indents = [len(line) - len(line.lstrip(b" \t")) for line in lines if line.strip()]
-    if not indents:
-        return None
-    min_indent = min(indents)
-    parts = []
-    for line in lines:
-        if not line.strip():
-            parts.append(b"")
-            continue
-        parts.append(line[min_indent:] if len(line) >= min_indent else line.lstrip(b" \t"))
-    plaintext = b"\n".join(parts)
-    return hashlib.sha256(plaintext).hexdigest()
-
-
 def _hash_text_matches(text: str, plain_hash: str) -> bool:
     """Match plain_hash allowing trailing-newline variance between forms."""
     candidates = {text, text + "\n"}
@@ -544,118 +517,20 @@ def _hash_text_matches(text: str, plain_hash: str) -> bool:
     return False
 
 
-def _strip_yaml_tag_anchor(raw: bytes) -> bytes:
-    """Strip leading &anchor / !!tag / !tag tokens from a plain scalar."""
-    value = raw.strip()
-    while True:
-        match = re.match(rb"(?:&\S+\s+|!!?\S+\s+)(.*)$", value)
-        if not match:
-            return value
-        value = match.group(1).strip()
+def _secret_in_yaml_scalars(content: bytes, plain_hash: str) -> bool:
+    """True if any scalar in the file, key or value, in any style, is the opened secret.
 
-
-def _plain_hash_still_present(content: bytes, plain_hash: str) -> bool:
-    """True if any plausible YAML scalar in content still hashes to plain_hash.
-
-    Used to refuse "intentional removal" when a marker was dropped but the
-    secret value remains (e.g. key renamed). Avoids stranding plaintext.
+    The YAML parser reads it however it was re-quoted, escaped, or moved: under
+    another key, into a list, into a block. Comments are not scalars;
+    plaintext_still_in_content covers those. A file that does not parse raises
+    OpenedFileError: close cannot tell whether the secret is gone, so it stops.
     """
-    # Double-quoted scalars: key: "value" (block or flow)
-    for match in re.finditer(rb'"((?:\\.|[^"\\])*)"', content):
-        try:
-            text = _yaml_unescape_double(match.group(1).decode("utf-8"))
-        except UnicodeDecodeError:
-            continue
-        if _hash_text_matches(text, plain_hash):
-            return True
-
-    # Single-quoted scalars: 'value' ('' is escaped quote)
-    for match in re.finditer(rb"'((?:[^']|'')*)'", content):
-        try:
-            text = _yaml_unescape_single(match.group(1).decode("utf-8"))
-        except UnicodeDecodeError:
-            continue
-        if _hash_text_matches(text, plain_hash):
-            return True
-
-    # Single-line plain scalars after ':' (mapping) — block or flow
-    for match in re.finditer(
-        rb":\s*(?![\|'\"|>[{])([^\s#\n,}\]][^#\n,}\]]*?)(?=\s*(?:[,}\]\n#]|$))",
-        content,
-    ):
-        raw = _strip_yaml_tag_anchor(match.group(1))
-        if not raw or raw.startswith(b"!"):
-            continue
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        if _hash_text_matches(text, plain_hash):
-            return True
-
-    # Sequence items: - value (not block indicators)
-    for match in re.finditer(
-        rb"(?m)^[ \t]*-\s*(?![\|'\"|>[{])([^\s#\n][^#\n]*?)\s*(?:#[^\n]*)?$",
-        content,
-    ):
-        raw = _strip_yaml_tag_anchor(match.group(1))
-        if not raw or raw.startswith(b"!"):
-            continue
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        if _hash_text_matches(text, plain_hash):
-            return True
-
-    # Flow sequence entries: [value, ...] (unquoted) — after [ or ,, not nested '['
-    for match in re.finditer(
-        rb"[\[\,][ \t]*(?!\[)([^\s'\"#,\]][^\s,\]]*)(?=[ \t]*[,\]])",
-        content,
-    ):
-        raw = _strip_yaml_tag_anchor(match.group(1))
-        if not raw or raw.startswith(b"!") or raw in (b"{", b"}"):
-            continue
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        if _hash_text_matches(text, plain_hash):
-            return True
-
-    # Literal / folded block scalars after mapping ':' or sequence '-'
-    # Supports chomp (+/-) and indent indicator (e.g. >+, |-, |2, >-1).
-    # '(?:^|[ \\t])-' covers column-0 list items as well as indented ones.
-    for match in re.finditer(
-        rb"(?::|(?:^|[ \t])-)\s*[|>][+-]?(?:\d+)?\s*(?:#[^\n]*)?\r?\n"
-        rb"((?:(?:[ \t]+.*)?\r?\n)*)",
-        content,
-        re.MULTILINE,
-    ):
-        body = match.group(1)
-        digest = _hash_block_scalar_body(body)
-        if digest == plain_hash:
-            return True
-        indents = [
-            len(line) - len(line.lstrip(b" \t")) for line in body.splitlines() if line.strip()
-        ]
-        if not indents:
-            continue
-        min_indent = min(indents)
-        parts = []
-        for line in body.splitlines():
-            if not line.strip():
-                parts.append(b"")
-                continue
-            parts.append(line[min_indent:] if len(line) >= min_indent else line.lstrip(b" \t"))
-        try:
-            text = b"\n".join(parts).decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        if _hash_text_matches(text, plain_hash):
-            return True
-
-    return False
+    _text, documents = _compose(content)
+    return any(
+        isinstance(node, yaml.ScalarNode) and _hash_text_matches(node.value, plain_hash)
+        for root in documents
+        for node in _nodes(root)
+    )
 
 
 def _yaml_key_has_vault_value(content: bytes, var_name: str) -> bool:
@@ -748,7 +623,7 @@ def unsafe_missing_marker_names(
         if plaintext_still_in_content(content, plaintext):
             unsafe.append(name)
             continue
-        if _plain_hash_still_present(content, record["plain_hash"]):
+        if _secret_in_yaml_scalars(content, record["plain_hash"]):
             unsafe.append(name)
             continue
         if _yaml_key_present(content, name):
@@ -851,7 +726,7 @@ def recrypt_inline_content(
             )
         if plaintext_still_in_content(content, plaintext):
             raise MarkerMissingSecretPresent(name, span_id)
-        if _plain_hash_still_present(content, record["plain_hash"]):
+        if _secret_in_yaml_scalars(content, record["plain_hash"]):
             raise MarkerMissingSecretPresent(name, span_id)
         if not confirm_delete:
             raise SecretLineDeleted(name, span_id)
