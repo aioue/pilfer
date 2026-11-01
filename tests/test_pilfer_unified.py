@@ -17,6 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import yaml
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.errors import AnsibleError
 from ansible.parsing.vault import VaultLib, VaultSecret
@@ -24,6 +25,13 @@ from ansible.parsing.vault import VaultLib, VaultSecret
 from pilfer import __version__ as pilfer_version
 from pilfer import cli as pilfer_cli
 from pilfer import inline as pilfer_inline
+
+
+class _VaultTagLoader(yaml.SafeLoader):
+    """Reads a closed file: !vault values stay ciphertext strings."""
+
+
+_VaultTagLoader.add_constructor("!vault", lambda loader, node: loader.construct_scalar(node))
 
 
 def make_vault(password: str = "test_password") -> VaultLib:
@@ -1000,6 +1008,66 @@ class TestInlineVault(ProjectDirTest):
             data = handle.read()
         spans = pilfer_inline.find_inline_vault_spans(data)
         self.assertEqual(self.vault.decrypt(spans[0].ciphertext), b"  return 9;\n    return 2;")
+
+    def test_multiline_secret_opens_as_one_quoted_line(self):
+        # A `|` block at the end of the file lost its final newline when an
+        # editor dropped the file's final newline. A quoted line cannot.
+        self._write_vars_file(("cert", b"line1\nline2\n"))
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml") as handle:
+            text = handle.read()
+        self.assertIn('cert: "line1\\nline2\\n"  # pilfer:vault:0', text)
+        with open("group_vars.yml", "w") as handle:
+            handle.write(text.rstrip("\n"))
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        self.assertEqual(self._stored(), [b"line1\nline2\n"])
+
+    def test_user_block_ending_in_a_tab_line_closes_to_valid_yaml(self):
+        # str.rstrip() treated the tab-only line as padding and left it after
+        # the new !vault, which made the closed file invalid YAML.
+        for header, want in (("|+", b"a\n\t\n\n"), ("|", b"a\n\t\n")):
+            with self.subTest(header=header):
+                closed = self._open_edit_close(
+                    b"old",
+                    lambda text, header=header: text.replace(
+                        '"old"  # pilfer:vault:0\n',
+                        f"{header}  # pilfer:vault:0\n  a\n  \t\n\nafter: 1\n",
+                    ),
+                )
+                self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+                with open("group_vars.yml", "rb") as handle:
+                    data = handle.read()
+                self.assertEqual(yaml.load(data, Loader=_VaultTagLoader)["after"], 1)
+                self.assertEqual(self._stored(), [want])
+
+    def test_close_refuses_output_that_does_not_read_back(self):
+        real_splice = pilfer_inline.splice
+
+        def drop_a_line(content, replacements):
+            return real_splice(content, replacements).replace(b"plain_key: visible\n", b"")
+
+        self._write_vars_file(("db_password", b"old"))
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml") as handle:
+            edited = handle.read().replace('"old"', '"new"')
+        with open("group_vars.yml", "w") as handle:
+            handle.write(edited)
+        with mock.patch.object(pilfer_inline, "splice", side_effect=drop_a_line):
+            with self.assertRaises(pilfer_cli.PilferError):
+                pilfer_cli.recrypt_vault_files("vault_pass")
+        with open("group_vars.yml") as handle:
+            self.assertEqual(handle.read(), edited)
+        self.assertTrue(os.path.isfile("vaultedFileList.json"))
+
+    def test_close_says_when_an_unquoted_edit_is_stored_as_a_string(self):
+        closed = self._open_edit_close(b"5000", lambda text: text.replace('"5000"', "5432"))
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        self.assertEqual(self._stored(), [b"5432"])
+        self.assertIn("db_password: stored as a string", closed.stdout)
+        self.assertIn("as int", closed.stdout)
+        # The note never prints the value.
+        self.assertNotIn("5432", closed.stdout + closed.stderr)
 
     def test_edited_multiline_keeps_a_trailing_blank_line(self):
         secret = b"line1\n\n"

@@ -1075,13 +1075,9 @@ def _recrypt_inline_file(
         print(f"⏭️  Already re-encrypted inline file (retrying close): {vaulted_file_path}")
         return True
 
+    # recrypt_inline_content refuses (ValueError) unless its output reads back
+    # as the edited file with every opened value decrypting to its edit.
     result = recrypt_inline_content(current, spans, vault, confirm_delete=confirm_delete)
-    for span in find_inline_vault_spans(result.content):
-        if not decrypts(vault, span.ciphertext):
-            raise PilferError(
-                f"Refusing to replace {vaulted_file_path}: "
-                "re-encrypted inline span does not decrypt"
-            )
     publish_vault(
         vaulted_file_path, result.content, expected=current, action="close", restore=restore or {}
     )
@@ -1096,6 +1092,14 @@ def _recrypt_inline_file(
         print(
             f"ℹ️  Re-encrypting modified inline vault string(s) in: {vaulted_file_path}"
             f" ({changed} changed)"
+        )
+
+    for name, yaml_type in result.typed_notes:
+        # Never the value: it is a secret.
+        print(
+            f"ℹ️  {name}: stored as a string, though plain YAML would read it as {yaml_type}. "
+            "An inline !vault value is always a string; convert it where it is used "
+            "(for example | int or | bool)."
         )
 
     return result.modified_count > 0
