@@ -80,16 +80,6 @@ pilfer set [-p VAULT_PASSWORD_FILE] FILE KEY [VALUE]
 
 Run `pilfer --help` or `pilfer COMMAND --help` for full options and examples.
 
-### Re-key a project
-
-To preview a password rotation across the current directory and its subdirectories, run:
-
-```bash
-pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run
-```
-
-This includes inline `!vault` values by default. See [Rotating the vault password](#rotating-the-vault-password) for the full procedure.
-
 ### Set a single value
 
 Use `pilfer set` to add or replace a top-level key in a whole-file vault without opening a session:
@@ -197,6 +187,16 @@ pilfer open -p ~/.my-vault-password
 pilfer open --include-encrypted-vars
 pilfer close
 ```
+
+### Re-key a project
+
+To preview a password rotation across the current directory and its subdirectories, run:
+
+```bash
+pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run
+```
+
+This includes inline `!vault` values by default. See [Rotating the vault password](#rotating-the-vault-password) for the full procedure.
 
 ## Rotating the vault password
 
