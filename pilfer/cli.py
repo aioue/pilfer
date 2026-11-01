@@ -25,6 +25,7 @@ from pilfer.inline import (
     InlineCloseRefusal,
     MarkerMissingSecretPresent,
     SecretLineDeleted,
+    _vault_id_from_ciphertext,
     decrypt_inline_content,
     find_inline_vault_spans,
     intentional_removal_candidate_names,
@@ -968,7 +969,11 @@ def _recrypt_whole_file(vaulted_file_path: str, vault: VaultLib, cwd: Path) -> b
                 ) from exc
             print(f"ℹ️  Already re-encrypted (retrying close): {vaulted_file_path}")
             return True
-        new_encrypted_data = vault.encrypt(new_data_bytes)
+        # Keep a 1.2 vault-id label; plain encrypt() writes a 1.1 header.
+        new_encrypted_data = vault.encrypt(
+            new_data_bytes,
+            vault_id=_vault_id_from_ciphertext(normalize_whole_file_vault(old_encrypted_data)),
+        )
         print(f"ℹ️  Re-encrypting modified file: {vaulted_file_path}")
         modified = True
     else:
@@ -1271,7 +1276,8 @@ def _rekey_whole_file(path: str, old_vault: VaultLib, new_vault: VaultLib) -> No
         data = handle.read()
     normalized = normalize_whole_file_vault(data)
     plaintext = old_vault.decrypt(normalized)
-    new_cipher = new_vault.encrypt(plaintext)
+    # Keep a 1.2 vault-id label; plain encrypt() writes a 1.1 header.
+    new_cipher = new_vault.encrypt(plaintext, vault_id=_vault_id_from_ciphertext(normalized))
     # Verify before replace
     new_vault.decrypt(normalize_whole_file_vault(new_cipher))
     _atomic_write_bytes(path, new_cipher)

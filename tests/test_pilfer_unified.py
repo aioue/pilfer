@@ -560,6 +560,19 @@ class TestSessionSafety(unittest.TestCase):
         with open("secret.yml") as f:
             self.assertIn("hunter2", f.read())
 
+    def test_close_keeps_vault_id_label(self):
+        with open("secret.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n", vault_id="prod"))
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("secret.yml", "w") as f:
+            f.write("secret_key: changed\n")
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        with open("secret.yml", "rb") as f:
+            body = f.read()
+        self.assertTrue(body.startswith(b"$ANSIBLE_VAULT;1.2;AES256;prod\n"))
+        self.assertEqual(self.vault.decrypt(body), b"secret_key: changed\n")
+
     def test_close_retry_after_already_encrypted_write(self):
         """Interrupted close that wrote ciphertext must be idempotent on retry."""
         self.assertEqual(self._run("open").returncode, 0)
@@ -1437,6 +1450,23 @@ class TestAllowRemovalsAndRekey(unittest.TestCase):
         with open("secret.yml", "rb") as f:
             body = f.read()
         self.assertEqual(new_vault.decrypt(body), b"secret_key: hunter2\n")
+
+    def test_rekey_keeps_vault_id_label(self):
+        with open("secret.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n", vault_id="prod"))
+        applied = self._run(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--yes",
+        )
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        with open("secret.yml", "rb") as f:
+            body = f.read()
+        self.assertTrue(body.startswith(b"$ANSIBLE_VAULT;1.2;AES256;prod\n"))
+        self.assertEqual(make_vault("new_password").decrypt(body), b"secret_key: hunter2\n")
 
     def test_rekey_resumes_after_partial_success(self):
         """Files already on the new password are skipped so rekey can finish."""
