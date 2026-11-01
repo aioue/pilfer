@@ -5,21 +5,27 @@
 from __future__ import annotations
 
 import base64
+import bisect
 import hashlib
 import itertools
+import json
 import re
 from dataclasses import dataclass, field
 
+import yaml
 from ansible.parsing.vault import VaultLib
 
-# Marker left beside a decrypted value so close can find spans after edits.
+# Marker comment left beside a decrypted value so close can find spans after edits.
+# It is a YAML comment: close reads the value itself with the YAML parser.
 MARKER_PREFIX = "# pilfer:vault:"
+# Inline session metadata format. 2: values are rendered and read back as YAML.
+# Close refuses metadata without it: an older pilfer rendered some secrets in a
+# form YAML reads differently, and guessing would re-encrypt the wrong value.
+INLINE_FORMAT = 2
 MARKER_RE = re.compile(
-    rb"^(?P<indent>[ \t]*)(?P<lhs>.+?):\s+(?P<value>.+?)\s+"
-    + re.escape(MARKER_PREFIX.encode("utf-8"))
-    + rb"(?P<id>\d+)\s*$",
-    re.MULTILINE,
+    re.escape(MARKER_PREFIX.encode("utf-8")) + rb"(?P<id>\d+)[ \t]*(?=\r?\n|\Z)"
 )
+_MARKER_TEXT_RE = re.compile(re.escape(MARKER_PREFIX) + r"(?P<id>\d+)[ \t]*(?=\r?\n|\Z)")
 
 _HEX_LINE = re.compile(rb"^[ \t]*[0-9a-fA-F]+\s*$")
 # Only plain literal block style for now (!vault |). Other styles are skipped.
@@ -76,6 +82,21 @@ class RecryptInlineResult:
     content: bytes
     modified_count: int
     removed_vars: list[str] = field(default_factory=list)
+
+
+class OpenedFileError(ValueError):
+    """The opened file cannot be read back as YAML. Messages never quote its text."""
+
+
+@dataclass
+class MarkedValue:
+    """A `key: value  # pilfer:vault:N` pair as the YAML parser reads it."""
+
+    span_id: int
+    key_text: str
+    value: bytes
+    start: int  # byte offset of the key's line
+    end: int  # byte offset just past the value's last line
 
 
 class InlineCloseRefusal(Exception):
@@ -219,18 +240,51 @@ def find_inline_vault_spans(content: bytes) -> list[InlineSpan]:
     return spans
 
 
-def _yaml_escape_double(text: str) -> str:
-    return (
-        text.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\t", "\\t")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
+def _yaml_double_quoted(text: str) -> str:
+    """A YAML double-quoted scalar that reads back as exactly text.
+
+    json.dumps escapes quotes, backslashes and C0 controls the way YAML does.
+    Everything else that is not printable is escaped too: DEL and C1 controls
+    fail the YAML reader, and NEL, U+2028 and U+2029 are YAML 1.1 line breaks
+    that would fold to a space.
+    """
+    body = json.dumps(text, ensure_ascii=False)[1:-1]
+    escaped = "".join(
+        ch if ch.isprintable() else (f"\\u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"\\U{ord(ch):08x}")
+        for ch in body
     )
+    return f'"{escaped}"'
+
+
+def _block_literal_safe(text: str) -> bool:
+    """True when a `|` or `|-` block shows text exactly and survives common editor saves.
+
+    Anything else is shown double-quoted on one line. A literal block cannot
+    hold: a carriage return (YAML normalises line breaks), more than one final
+    newline (`|` keeps one), leading whitespace on the first line (it would set
+    the indentation), or trailing whitespace (editors strip it on save, which
+    silently changed the secret).
+    """
+    if "\r" in text or text.endswith("\n\n") or not text.rstrip("\n"):
+        return False
+    lines = text.removesuffix("\n").split("\n")
+    first = next(line for line in lines if line)
+    if first[0] in " \t":
+        return False
+    for line in lines:
+        if line != line.rstrip(" \t"):
+            return False
+        if not all(ch.isprintable() or ch == "\t" for ch in line):
+            return False
+    return True
 
 
 def format_open_value(plaintext: bytes, span: InlineSpan) -> bytes:
-    """Render decrypted plaintext as YAML with a pilfer close marker."""
+    """Render decrypted plaintext as YAML with a pilfer close marker.
+
+    The rendering must read back as exactly plaintext through the YAML parser;
+    decrypt_inline_content checks that before anything is written.
+    """
     try:
         text = plaintext.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -242,21 +296,17 @@ def format_open_value(plaintext: bytes, span: InlineSpan) -> bytes:
 
     marker = MARKER_PREFIX.encode("utf-8") + str(span.span_id).encode("utf-8")
 
-    if "\n" in text or "\r" in text:
+    if "\n" in text and _block_literal_safe(text):
         indent = span.body_indent or b"  "
-        # splitlines() keeps interior blank lines and drops one trailing break.
-        # `|` means the secret ended with a break, so close puts that break back.
-        # `|-` means it did not; close must not invent one. The opened file
-        # cannot show the difference any other way: every body line already
-        # ends with a newline, and a blank line at the key's indent is the
-        # separator before the next key.
-        lines = text.splitlines()
-        chomp = b"|-" if not text.endswith(("\n", "\r")) else b"|"
-        body = b"".join(indent + line.encode("utf-8") + b"\n" for line in lines)
+        # `|` keeps the one final newline, `|-` strips it. Empty lines carry no
+        # indent, so there is no whitespace for an editor to trim.
+        chomp = b"|" if text.endswith("\n") else b"|-"
+        lines = text.removesuffix("\n").split("\n")
+        body = b"".join((indent + line.encode("utf-8") if line else b"") + b"\n" for line in lines)
         return span.line_prefix + chomp + b" " + marker + b"\n" + body
 
-    quoted = '"' + _yaml_escape_double(text) + '"'
-    return span.line_prefix + quoted.encode("utf-8") + b"  " + marker + b"\n"
+    quoted = _yaml_double_quoted(text).encode("utf-8")
+    return span.line_prefix + quoted + b"  " + marker + b"\n"
 
 
 def ensure_vault_label(vault: VaultLib, data: bytes) -> None:
@@ -309,90 +359,113 @@ def decrypt_inline_content(content: bytes, vault: VaultLib) -> tuple[bytes, list
         replacement = format_open_value(plaintext, span)
         new_content = new_content[: span.start] + replacement + new_content[span.end :]
 
+    # close reads values back with the YAML parser. Prove now, before any
+    # plaintext is written, that it would read every untouched secret exactly.
+    try:
+        reread = {mv.span_id: mv.value for mv in read_marked_values(new_content)}
+    except OpenedFileError as exc:
+        raise ValueError(f"cannot open inline secrets in this file: {exc}") from None
+    for span, plaintext in zip(spans, plaintexts, strict=True):
+        if reread.get(span.span_id) != plaintext:
+            name = var_name_from_prefix(span.line_prefix.decode("utf-8", errors="replace"))
+            raise ValueError(
+                f"inline secret {name!r} would not read back exactly from the opened "
+                "file; left encrypted"
+            )
+
     return new_content, records
 
 
-def _parse_marked_value(
-    content: bytes,
-    match: re.Match,
-    *,
-    block_indent: bytes | None = None,
-) -> tuple[bytes, int, int]:
-    """Return (plaintext_bytes, region_start, region_end) for an open marker match.
+def _mapping_pairs(root: yaml.Node):
+    """Every (key, value) pair in every block or flow mapping under root."""
+    stack, seen = [root], set()
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue  # an alias points back at a node already walked
+        seen.add(id(node))
+        if isinstance(node, yaml.MappingNode):
+            for key, value in node.value:
+                yield key, value
+                stack.extend((key, value))
+        elif isinstance(node, yaml.SequenceNode):
+            stack.extend(node.value)
 
-    block_indent is the prefix format_open_value added to each body line. Strip
-    that prefix only, so spaces that belong to the secret survive an edit.
-    Without it, each line is fully dedented (callers that did not record the
-    open indent).
+
+def read_marked_values(content: bytes) -> list[MarkedValue]:
+    """Read every `key: value  # pilfer:vault:N` the way Ansible's YAML parser would.
+
+    The marker is a comment: on the value's last line for a quoted or plain
+    scalar, on the header line for a `|` or `>` block. The value is the
+    scalar's YAML value, so quoting style and escapes mean what they mean to
+    Ansible. The region runs from the start of the key's line to the end of the
+    value's last non-blank line, so blank lines after a block stay in the file.
+
+    Raises OpenedFileError, whose message never quotes the file: YAML errors
+    normally quote the offending line, and here that is a secret.
     """
-    indent = match.group("indent")
-    value = match.group("value")
-    region_start = match.start()
+    if not MARKER_RE.search(content):
+        return []
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise OpenedFileError("file is not UTF-8") from None
+    try:
+        documents = list(yaml.compose_all(text, Loader=yaml.SafeLoader))
+    except yaml.MarkedYAMLError as exc:
+        mark = exc.problem_mark or exc.context_mark
+        where = f" (line {mark.line + 1})" if mark is not None else ""
+        raise OpenedFileError(f"file does not parse as YAML{where}") from None
+    except Exception:
+        raise OpenedFileError("file does not parse as YAML") from None
 
-    if value.strip() == b"|" or value.startswith(b"|"):
-        line_end = content.find(b"\n", match.end())
-        cursor = len(content) if line_end < 0 else line_end + 1
-        body_lines = []
-        base_indent_len = len(indent)
-        while cursor < len(content):
-            next_end = _line_end(content, cursor)
-            line = content[cursor:next_end]
-            if not line.strip():
-                body = line.rstrip(b"\r\n")
-                if block_indent and body.startswith(block_indent):
-                    # Spaces past the opened indent are secret content. A line
-                    # that is only that indent is a blank line of the secret,
-                    # including one at the end of the block. A blank at the
-                    # key's indent is the separator before the next key;
-                    # consuming it makes an unedited secret look modified.
-                    body_lines.append(body[len(block_indent) :])
-                    cursor = next_end
-                    continue
-                # Interior blank lines belong to the block. A blank run that is
-                # followed by a dedented key (or EOF) is the separator before the
-                # next key; consuming it makes an unedited secret look modified.
-                look = next_end
-                separator = True
-                while look < len(content):
-                    look_end = _line_end(content, look)
-                    look_line = content[look:look_end]
-                    if not look_line.strip():
-                        look = look_end
-                        continue
-                    look_indent = len(look_line) - len(look_line.lstrip(b" \t"))
-                    separator = look_indent <= base_indent_len
-                    break
-                if separator:
-                    break
-                body_lines.append(b"")
-                cursor = next_end
+    line_starts = [0] + [i + 1 for i, ch in enumerate(text) if ch == "\n"]
+
+    def line_of(index: int) -> int:
+        return bisect.bisect_right(line_starts, index) - 1
+
+    def line_end(index: int) -> int:
+        nl = text.find("\n", index)
+        return len(text) if nl < 0 else nl + 1
+
+    pairs = [pair for root in documents if root is not None for pair in _mapping_pairs(root)]
+    found = []
+    for match in _MARKER_TEXT_RE.finditer(text):
+        marker_line = line_of(match.start())
+        owner = None
+        for key, value in pairs:
+            if not isinstance(value, yaml.ScalarNode):
                 continue
-            line_indent = len(line) - len(line.lstrip(b" \t"))
-            if line_indent <= base_indent_len:
-                break
-            body = line.rstrip(b"\r\n")
-            if block_indent and body.startswith(block_indent):
-                body = body[len(block_indent) :]
+            if value.style in ("|", ">"):
+                hit = line_of(key.start_mark.index) == marker_line and match.start() > value.start_mark.index
             else:
-                body = body.lstrip(b" \t")
-            body_lines.append(body)
-            cursor = next_end
-        plaintext = b"\n".join(body_lines)
-        # `|` keeps the break splitlines() dropped, including after a trailing
-        # empty line (join already ends in `\n`, and the secret had one more).
-        # `|-` is a secret that did not end in a break.
-        if body_lines and not value.strip().startswith(b"|-"):
-            plaintext += b"\n"
-        return plaintext, region_start, cursor
-
-    raw = value
-    if raw.startswith(b'"') and raw.endswith(b'"') and len(raw) >= 2:
-        plaintext = _yaml_unescape_double(raw[1:-1].decode("utf-8")).encode("utf-8")
-    else:
-        plaintext = raw
-
-    region_end = _line_end(content, match.start())
-    return plaintext, region_start, region_end
+                hit = line_of(value.end_mark.index) == marker_line and match.start() >= value.end_mark.index
+            if hit:
+                owner = (key, value)
+                break
+        if owner is None:
+            raise OpenedFileError(
+                f"marker pilfer:vault:{match.group('id')} on line {marker_line + 1} is not "
+                "after a single `key: value`"
+            )
+        key, value = owner
+        start = line_starts[line_of(key.start_mark.index)]
+        if value.style in ("|", ">"):
+            span_text = text[value.start_mark.index : value.end_mark.index]
+            last = value.start_mark.index + len(span_text.rstrip())
+            end = line_end(last - 1)
+        else:
+            end = line_end(match.start())
+        found.append(
+            MarkedValue(
+                span_id=int(match.group("id")),
+                key_text=text[key.start_mark.index : key.end_mark.index],
+                value=value.value.encode("utf-8"),
+                start=len(text[:start].encode("utf-8")),
+                end=len(text[:end].encode("utf-8")),
+            )
+        )
+    return found
 
 
 def format_encrypted_block(
@@ -610,31 +683,6 @@ def plaintext_still_in_content(content: bytes, plaintext: bytes) -> bool:
     return False
 
 
-def _opened_form_unchanged(parsed_current: bytes, record: dict, vault: VaultLib) -> bool:
-    """True when the opened rendering of the stored secret parses to these bytes."""
-    original = _original_plaintext_from_record(record, vault)
-    if original is None:
-        return False
-    span = InlineSpan(
-        span_id=int(record["id"]),
-        start=0,
-        end=0,
-        encrypted=b"",
-        ciphertext=b"",
-        line_prefix=record["line_prefix"].encode("utf-8", errors="surrogateescape"),
-        body_indent=record["body_indent"].encode("utf-8", errors="surrogateescape"),
-        vault_id=record.get("vault_id"),
-    )
-    opened = format_open_value(original, span)
-    match = MARKER_RE.search(opened)
-    if match is None:
-        return False
-    parsed_opened, _, _ = _parse_marked_value(
-        opened, match, block_indent=span.body_indent
-    )
-    return parsed_current == parsed_opened
-
-
 def _original_plaintext_from_record(record: dict, vault: VaultLib) -> bytes | None:
     """Recover opened plaintext from session meta (ciphertext or full !vault block)."""
     try:
@@ -733,8 +781,8 @@ def recrypt_inline_content(
     replacements = []
     seen_ids: set[int] = set()
 
-    for match in MARKER_RE.finditer(content):
-        span_id = int(match.group("id"))
+    for marked in read_marked_values(content):
+        span_id = marked.span_id
         if span_id not in records:
             raise ValueError(f"Unknown pilfer vault marker id {span_id}")
         if span_id in seen_ids:
@@ -746,28 +794,29 @@ def recrypt_inline_content(
         record = records[span_id]
 
         stored_name = var_name_from_prefix(record["line_prefix"])
-        current_name = match.group("lhs").decode("utf-8", errors="replace").strip()
-        if stored_name != current_name:
+        # A list item's prefix is "- key: "; the YAML key is just "key".
+        if marked.key_text != stored_name.removeprefix("-").strip():
             raise ValueError(
-                f"Marker # pilfer:vault:{span_id} is on key {current_name!r} "
+                f"Marker # pilfer:vault:{span_id} is on key {marked.key_text!r} "
                 f"but was opened as {stored_name!r}. Move the marker back to "
                 f"{stored_name!r} (or restore the line) before close."
             )
 
-        block_indent = record["body_indent"].encode("utf-8", errors="surrogateescape")
-        plaintext, region_start, region_end = _parse_marked_value(
-            content, match, block_indent=block_indent
-        )
+        plaintext = marked.value
         plain_hash = hashlib.sha256(plaintext).hexdigest()
+        if not plaintext and plain_hash != record["plain_hash"]:
+            # An emptied value is more likely a slip than a new secret.
+            raise ValueError(
+                f"{stored_name} is empty. Put a value back, or delete the whole line "
+                "and close with --confirm-delete."
+            )
         original_encrypted = base64.b64decode(record["encrypted_b64"])
 
-        # Hash match means the parsed bytes are the original secret. The opened
-        # rendering still turns CRLF into LF, so an unedited span can fail that
-        # hash after any other edit in the file forces this path. If the current
-        # text parses the same as format(original), the user did not change the
-        # span: put the original ciphertext back.
-        if plain_hash == record["plain_hash"] or _opened_form_unchanged(plaintext, record, vault):
-            replacements.append((region_start, region_end, original_encrypted))
+        # Open proved the parser reads the untouched rendering as exactly the
+        # secret, so a hash match means the user did not change it: put the
+        # original ciphertext back rather than a new one.
+        if plain_hash == record["plain_hash"]:
+            replacements.append((marked.start, marked.end, original_encrypted))
         else:
             vault_id = record.get("vault_id") or None
             if vault_id:
@@ -778,8 +827,8 @@ def recrypt_inline_content(
             body_indent = record["body_indent"].encode("utf-8")
             replacements.append(
                 (
-                    region_start,
-                    region_end,
+                    marked.start,
+                    marked.end,
                     format_encrypted_block(new_cipher, line_prefix, body_indent),
                 )
             )

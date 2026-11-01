@@ -35,8 +35,8 @@ import getpass
 import json
 import os
 import re
+import stat
 import sys
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -44,7 +44,6 @@ import yaml
 
 from pilfer.cli import (
     OPEN_SIDECAR_SUFFIX,
-    REKEY_TEMP_PREFIX,
     PilferError,
     _load_password,
     _make_vault,
@@ -55,7 +54,7 @@ from pilfer.inline import (
     is_whole_file_vault,
     normalize_whole_file_vault,
 )
-from pilfer.publish import copy_owner_group_and_acls, vault_file_lock
+from pilfer.publish import vault_file_lock, write_atomic
 
 KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 UNSAFE_TAG = "!unsafe"
@@ -189,7 +188,7 @@ def _set_keys_locked(
             # A no-op edit used to return before the temp write, so a placeholder
             # that already matched the stored value reported success on a
             # read-only directory.
-            _replace_if_unchanged(path, original, original, publish=False)
+            _publish_vault(path, original, original, publish=False)
         return actions
 
     plaintext = edited.encode("utf-8")
@@ -209,7 +208,7 @@ def _set_keys_locked(
     # Prove the bytes decrypt to what we meant before they replace anything.
     if round_trip != plaintext:
         raise PilferError(f"encryption did not round-trip; {path} unchanged")
-    _replace_if_unchanged(path, ciphertext, original, publish=not check_only)
+    _publish_vault(path, ciphertext, original, publish=not check_only)
     return actions
 
 
@@ -338,10 +337,8 @@ def _edit_plaintext(text: str, key: str, value: str) -> tuple[str, str]:
     return new_text, action
 
 
-def _replace_if_unchanged(
-    path: Path, data: bytes, expected: bytes, *, publish: bool = True
-) -> None:
-    """Publish ciphertext with the file's mode, unless another writer changed it meanwhile.
+def _publish_vault(path: Path, data: bytes, expected: bytes, *, publish: bool = True) -> None:
+    """Replace the vault with data, keeping its mode and group, unless it changed meanwhile.
 
     With publish=False every step runs except os.replace, and the temp is removed:
     check_only uses it so a read-only directory or a full disk is reported before
@@ -349,41 +346,18 @@ def _replace_if_unchanged(
     sandbox denials. Not covered: a sticky directory where the vault belongs to
     another user, which only refuses the rename itself.
 
-    The temp uses pilfer's rekey prefix, so open's scan skips a temp left by a
-    killed process. It holds ciphertext only. open and close keep vault
-    ciphertext temps; only a confirmed rekey deletes them.
+    No sidecar recheck here: the caller holds vault_file_lock from its first
+    read, and open writes its sidecar under the same lock.
     """
-    mode = path.stat().st_mode & 0o777
-    fd, tmp = tempfile.mkstemp(prefix=REKEY_TEMP_PREFIX, dir=path.parent)
-    replaced = False
-    try:
-        # New inode. Copy uid, gid, mode, and ACLs, or a 0640 file would be
-        # owned by the editor's primary group. Failure leaves the vault in place.
-        try:
-            copy_owner_group_and_acls(path, fd, mode)
-        except Exception:
-            os.close(fd)
-            raise
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if path.is_symlink() or path.read_bytes() != expected:
-            raise PilferError(f"{path} changed during the edit; nothing written. Retry")
-        # open writes the sidecar before plaintext. Recheck under the same lock
-        # the open holds, so a session that appeared after the first read is refused.
-        if (path.parent / f"{path.name}{OPEN_SIDECAR_SUFFIX}").exists():
-            raise PilferError(f"{path} is open in a pilfer session; run 'pilfer close' first")
-        if publish:
-            os.replace(tmp, path)
-            replaced = True
-    finally:
-        # BaseException too: KeyboardInterrupt must not leave the temp behind.
-        if not replaced:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+    st = path.stat()
+    write_atomic(
+        path,
+        data,
+        mode=stat.S_IMODE(st.st_mode),
+        gid=st.st_gid,
+        expected=expected,
+        publish=publish,
+    )
 
 
 def read_value(key: str) -> str:

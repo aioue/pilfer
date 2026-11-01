@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from abc import ABC, abstractmethod
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -259,6 +260,45 @@ class TestSessionSafety(unittest.TestCase):
             self.assertTrue(f.read().startswith(b"$ANSIBLE_VAULT;"))
         with open("other.yml", "rb") as f:
             self.assertTrue(f.read().startswith(b"$ANSIBLE_VAULT;"))
+
+    def test_session_holds_no_password_hash(self):
+        # pilfer < 2.31 stored an unsalted SHA-256 of the vault password here,
+        # far cheaper to guess offline than the vault's own key derivation.
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("vaultedFileList.json") as f:
+            session = json.load(f)
+        self.assertNotIn("password_sha256", session)
+        self.assertNotIn(hashlib.sha256(b"test_password").hexdigest(), json.dumps(session))
+        self.assertEqual(self._run("close").returncode, 0)
+
+    def test_open_close_keeps_the_vault_mode(self):
+        for edit in (False, True):
+            with self.subTest(edit=edit):
+                os.chmod("secret.yml", 0o644)
+                self.assertEqual(self._run("open").returncode, 0)
+                # Plaintext is private while the session is open.
+                self.assertEqual(stat.S_IMODE(os.stat("secret.yml").st_mode), 0o600)
+                if edit:
+                    with open("secret.yml", "w") as f:
+                        f.write("secret_key: changed\n")
+                closed = self._run("close")
+                self.assertEqual(closed.returncode, 0, closed.stderr)
+                self.assertEqual(stat.S_IMODE(os.stat("secret.yml").st_mode), 0o644)
+
+    def test_close_from_an_older_session_without_a_hash_still_proves_the_password(self):
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("vaultedFileList.json") as f:
+            session = json.load(f)
+        session["password_sha256"] = "left-by-an-older-pilfer"
+        with open("vaultedFileList.json", "w") as f:
+            json.dump(session, f)
+        with open("wrong_pass", "w") as f:
+            f.write("not-the-password")
+        refused = self._run("close", password_file="wrong_pass")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("does not match", refused.stderr)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
 
     def test_password_mismatch_on_close_refused(self):
         self.assertEqual(self._run("open").returncode, 0)
@@ -644,6 +684,112 @@ class TestInlineVault(unittest.TestCase):
         with open("group_vars.yml", "rb") as f:
             return f.read()
 
+    def _open_edit_close(self, secret, edit):
+        self._write_vars_file(("db_password", secret))
+        opened = self._run("open")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        with open("group_vars.yml") as f:
+            text = f.read()
+        with open("group_vars.yml", "w") as f:
+            f.write(edit(text))
+        return self._run("close")
+
+    def _stored(self):
+        with open("group_vars.yml", "rb") as f:
+            return [self.vault.decrypt(span.ciphertext) for span in pilfer_inline.find_inline_vault_spans(f.read())]
+
+    def test_close_reads_an_edit_the_way_yaml_does(self):
+        # Each of these was stored as the raw text (quotes, escapes, comment
+        # and all) before close read values with the YAML parser.
+        cases = {
+            "single quotes": ("'new'", b"new"),
+            "unicode escape": ('"caf\\u00e9"', "caf\u00e9".encode()),
+            "hex escape": ('"\\x41BC"', b"ABC"),
+            "comment before the marker": ('"new"  # rotated 2026-11', b"new"),
+            "plain": ("new value", b"new value"),
+        }
+        for label, (replacement, expected) in cases.items():
+            with self.subTest(label):
+                closed = self._open_edit_close(b"old", lambda t, r=replacement: t.replace('"old"', r))
+                self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+                self.assertEqual(self._stored(), [expected])
+
+    def test_editor_stripping_trailing_whitespace_changes_no_secret(self):
+        secrets = [b"line1\nline2\n\n", b"trail  \nx\n", b"a\n\nb\n", b"line1\nline2\n"]
+        self._write_vars_file(*[(f"s{i}", v) for i, v in enumerate(secrets)])
+        with open("group_vars.yml", "rb") as f:
+            original = f.read()
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml") as f:
+            text = f.read()
+        stripped = "\n".join(line.rstrip() for line in text.split("\n"))
+        # Something else in the file changes too, so close cannot take the
+        # whole-file shortcut and has to read every value back.
+        stripped = stripped.replace("plain_key: visible", "plain_key: edited")
+        with open("group_vars.yml", "w") as f:
+            f.write(stripped)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
+        self.assertEqual(self._stored(), secrets)
+        with open("group_vars.yml", "rb") as f:
+            # Untouched spans get their original ciphertext back.
+            self.assertEqual(f.read(), original.replace(b"plain_key: visible", b"plain_key: edited"))
+
+    def test_broken_yaml_keeps_the_session_and_does_not_print_the_secret(self):
+        closed = self._open_edit_close(
+            b"hunter2-secret", lambda t: t.replace('"hunter2-secret"', '"hunter2-secret')
+        )
+        self.assertNotEqual(closed.returncode, 0)
+        self.assertNotIn("hunter2", closed.stdout + closed.stderr)
+        self.assertIn("YAML", closed.stdout + closed.stderr)
+        self.assertTrue(os.path.isfile("vaultedFileList.json"))
+
+    def test_emptied_value_is_refused(self):
+        closed = self._open_edit_close(b"old", lambda t: t.replace('"old"', '""'))
+        self.assertNotEqual(closed.returncode, 0)
+        self.assertIn("empty", closed.stdout + closed.stderr)
+        self.assertTrue(os.path.isfile("vaultedFileList.json"))
+
+    def test_session_opened_by_an_older_pilfer_is_refused_not_guessed(self):
+        self._write_vars_file(("db_password", b"old"))
+        self.assertEqual(self._run("open").returncode, 0)
+        meta = next(
+            os.path.join(root, "inline.json") for root, _, files in os.walk(".vault") if "inline.json" in files
+        )
+        with open(meta) as f:
+            data = json.load(f)
+        del data["format"]
+        with open(meta, "w") as f:
+            json.dump(data, f)
+        with open("group_vars.yml") as f:
+            text = f.read().replace('"old"', '"new"')
+        with open("group_vars.yml", "w") as f:
+            f.write(text)
+        closed = self._run("close")
+        self.assertNotEqual(closed.returncode, 0)
+        self.assertIn("older pilfer", closed.stdout + closed.stderr)
+        with open("group_vars.yml") as f:
+            self.assertEqual(f.read(), text)
+
+    def test_open_leaves_a_file_that_is_not_yaml_encrypted(self):
+        self._write_vars_file(("db_password", b"hunter2-secret"))
+        with open("group_vars.yml", "a") as f:
+            f.write("broken: [\n")
+        with open("group_vars.yml", "rb") as f:
+            before = f.read()
+        opened = self._run("open")
+        self.assertNotEqual(opened.returncode, 0)
+        self.assertNotIn("hunter2", opened.stdout + opened.stderr)
+        with open("group_vars.yml", "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_inline_file_keeps_its_mode(self):
+        self._write_vars_file(("db_password", b"old"))
+        os.chmod("group_vars.yml", 0o644)
+        closed = self._open_edit_close(b"old", lambda t: t.replace('"old"', '"new"'))
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertEqual(stat.S_IMODE(os.stat("group_vars.yml").st_mode), 0o644)
+
     def test_inline_skipped_without_flag(self):
         self._write_vars_file(("db_password", b"super-secret"))
         found = pilfer_cli.write_vaulted_file_list(include_encrypted_vars=False)
@@ -829,7 +975,9 @@ class TestInlineVault(unittest.TestCase):
         self.assertEqual(self._run("open").returncode, 0)
         with open("group_vars.yml") as handle:
             text = handle.read()
-        self.assertIn("|-", text)
+        # A first line that starts with spaces would set a block's indentation,
+        # so the secret is shown as one double-quoted line instead.
+        self.assertIn('"  return 1;\\n    return 2;"', text)
         text = text.replace("return 1;", "return 9;", 1)
         with open("group_vars.yml", "w") as handle:
             handle.write(text)
@@ -862,16 +1010,10 @@ class TestInlineVault(unittest.TestCase):
         self.assertEqual(self._run("open").returncode, 0)
         with open("group_vars.yml") as handle:
             text = handle.read()
-        content_indent = None
-        for line in text.splitlines():
-            if line.endswith("line1"):
-                content_indent = line[: line.index("line1")]
-                break
-        self.assertIsNotNone(content_indent)
-        old_mid = content_indent + "   "
-        new_mid = content_indent + " "
-        self.assertIn(old_mid, text)
-        text = text.replace(old_mid, new_mid, 1)
+        # Trailing whitespace would not survive an editor's save inside a block,
+        # so this secret is shown double-quoted.
+        self.assertIn('"line1\\n   \\nline3\\n"', text)
+        text = text.replace("\\n   \\n", "\\n \\n", 1)
         with open("group_vars.yml", "w") as handle:
             handle.write(text)
         closed = self._run("close")
@@ -1364,53 +1506,82 @@ class TestInlineUnit(unittest.TestCase):
     def test_no_spans_in_plain_yaml(self):
         self.assertEqual(pilfer_inline.find_inline_vault_spans(b"foo: bar\n"), [])
 
-    def test_parse_block_keeps_blank_lines(self):
-        content = (
-            b"db_password: |  # pilfer:vault:0\n" b"  line1\n" b"\n" b"  line3\n" b"other: x\n"
-        )
-        match = pilfer_inline.MARKER_RE.search(content)
-        self.assertIsNotNone(match)
-        plaintext, _start, end = pilfer_inline._parse_marked_value(content, match)
-        self.assertEqual(plaintext, b"line1\n\nline3\n")
-        self.assertTrue(content[end:].startswith(b"other:"))
+    def _read_one(self, content):
+        (marked,) = pilfer_inline.read_marked_values(content)
+        return marked
 
-    def test_parse_block_keeps_spaces_past_recorded_indent(self):
-        content = (
-            b"db_password: |  # pilfer:vault:0\n"
-            b"  line1\n"
-            b"     \n"
-            b"  line3\n"
-            b"other: x\n"
-        )
-        match = pilfer_inline.MARKER_RE.search(content)
-        self.assertIsNotNone(match)
-        plaintext, _start, end = pilfer_inline._parse_marked_value(
-            content, match, block_indent=b"  "
-        )
-        self.assertEqual(plaintext, b"line1\n   \nline3\n")
-        self.assertTrue(content[end:].startswith(b"other:"))
-        blank = content.replace(b"     \n", b"  \n", 1)
-        match = pilfer_inline.MARKER_RE.search(blank)
-        plaintext, _start, _end = pilfer_inline._parse_marked_value(
-            blank, match, block_indent=b"  "
-        )
-        self.assertEqual(plaintext, b"line1\n\nline3\n")
+    def test_read_block_keeps_blank_lines(self):
+        content = b"db_password: |  # pilfer:vault:0\n  line1\n\n  line3\nother: x\n"
+        marked = self._read_one(content)
+        self.assertEqual(marked.value, b"line1\n\nline3\n")
+        self.assertTrue(content[marked.end :].startswith(b"other:"))
 
-    def test_parse_strip_chomp_does_not_add_a_newline(self):
+    def test_read_block_keeps_spaces_past_the_indent(self):
+        content = b"db_password: |  # pilfer:vault:0\n  line1\n     \n  line3\nother: x\n"
+        self.assertEqual(self._read_one(content).value, b"line1\n   \nline3\n")
+
+    def test_read_strip_chomp_does_not_add_a_newline(self):
         content = b"db_password: |-  # pilfer:vault:0\n  line1\n  line2\nother: x\n"
-        match = pilfer_inline.MARKER_RE.search(content)
-        plaintext, _start, end = pilfer_inline._parse_marked_value(content, match)
-        self.assertEqual(plaintext, b"line1\nline2")
-        self.assertTrue(content[end:].startswith(b"other:"))
+        marked = self._read_one(content)
+        self.assertEqual(marked.value, b"line1\nline2")
+        self.assertTrue(content[marked.end :].startswith(b"other:"))
 
-    def test_parse_keeps_trailing_blank_line_at_block_indent(self):
-        content = b"db_password: |  # pilfer:vault:0\n  line1\n  \nother: x\n"
-        match = pilfer_inline.MARKER_RE.search(content)
-        plaintext, _start, end = pilfer_inline._parse_marked_value(
-            content, match, block_indent=b"  "
-        )
-        self.assertEqual(plaintext, b"line1\n\n")
-        self.assertTrue(content[end:].startswith(b"other:"))
+    def test_read_leaves_the_blank_line_after_a_block(self):
+        content = b"db_password: |  # pilfer:vault:0\n  a\n\nother: x\n"
+        marked = self._read_one(content)
+        self.assertEqual(marked.value, b"a\n")
+        self.assertEqual(content[marked.start : marked.end], b"db_password: |  # pilfer:vault:0\n  a\n")
+
+    def test_read_quoted_values_the_way_yaml_does(self):
+        cases = {
+            b"k: 'it''s'  # pilfer:vault:0\n": b"it's",
+            b'k: "caf\\u00e9"  # pilfer:vault:0\n': "caf\u00e9".encode(),
+            b'k: "\\x41BC"  # pilfer:vault:0\n': b"ABC",
+            b'k: "new"  # rotated 2026-11  # pilfer:vault:0\n': b"new",
+            b"k: plain value  # pilfer:vault:0\n": b"plain value",
+            b"- k: listed  # pilfer:vault:0\n": b"listed",
+        }
+        for content, expected in cases.items():
+            with self.subTest(content=content):
+                marked = self._read_one(content)
+                self.assertEqual(marked.value, expected)
+                self.assertEqual(marked.key_text, "k")
+                self.assertEqual(marked.end, len(content))
+
+    def test_marker_that_is_not_after_a_value_is_refused(self):
+        for content in (
+            b"# pilfer:vault:0\nk: v\n",
+            b"outer: |  # pilfer:vault:1\n  inner: x  # pilfer:vault:2\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(pilfer_inline.OpenedFileError):
+                    pilfer_inline.read_marked_values(content)
+
+    def test_yaml_error_does_not_quote_the_file(self):
+        content = b'k: "hunter2-secret  # pilfer:vault:0\nother: [\n'
+        with self.assertRaises(pilfer_inline.OpenedFileError) as caught:
+            pilfer_inline.read_marked_values(content)
+        self.assertNotIn("hunter2", str(caught.exception))
+
+    def test_every_rendering_reads_back_exactly(self):
+        # Open refuses a span whose rendering does not; this pins the renderer.
+        secrets = [
+            b"plain", b"", b"line1\nline2\n", b"line1\nline2", b"a\n\nb\n", b"a\n\n",
+            b"  lead\nx", b"trail  \nx\n", b"cr\r\nlf\n", b"tab\there", b'q"uote\\back',
+            "nel\x85 ls\u2028 bom\ufeff del\x7f c1\x9f".encode(), "\U0001f600 \u00e9".encode(),
+            b"# pilfer:vault:9 inside", b"{{ jinja }}", b"- dash", b": colon", b"\n\nlead",
+        ]
+        for secret in secrets:
+            with self.subTest(secret=secret):
+                span = pilfer_inline.InlineSpan(0, 0, 0, b"", b"", b"key: ", b"  ")
+                rendered = pilfer_inline.format_open_value(secret, span) + b"next: 1\n"
+                try:
+                    (marked,) = pilfer_inline.read_marked_values(rendered)
+                except pilfer_inline.OpenedFileError:
+                    # Only a secret that contains the marker text itself may refuse.
+                    self.assertIn(b"# pilfer:vault:", secret)
+                    continue
+                self.assertEqual(marked.value, secret)
 
     def test_is_whole_file_vault_tolerates_bom_and_whitespace(self):
         body = b"$ANSIBLE_VAULT;1.1;AES256\naabb\n"
@@ -1525,6 +1696,41 @@ class TestAllowRemovalsAndRekey(unittest.TestCase):
         with open("secret.yml", "rb") as f:
             body = f.read()
         self.assertEqual(new_vault.decrypt(body), b"secret_key: hunter2\n")
+
+    def test_rekey_keeps_the_mode(self):
+        with open("secret.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
+        os.chmod("secret.yml", 0o644)
+        applied = self._run(
+            "rekey", "--old-vault-password-file", "vault_pass",
+            "--new-vault-password-file", "vault_pass_new", "--yes",
+        )
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(stat.S_IMODE(os.stat("secret.yml").st_mode), 0o644)
+
+    def test_rekey_refuses_ciphertext_that_decrypts_to_something_else(self):
+        real_encrypt = VaultLib.encrypt
+
+        def wrong_secret(vault, plaintext, *args, **kwargs):
+            return real_encrypt(vault, b"something else", *args, **kwargs)
+
+        for kind in ("file", "inline"):
+            with self.subTest(kind=kind):
+                if kind == "file":
+                    body = self.vault.encrypt(b"secret_key: hunter2\n")
+                else:
+                    body = ("plain: x\n" + encrypt_string_yaml(self.vault, "db_password", b"hunter2")).encode()
+                with open("secret.yml", "wb") as f:
+                    f.write(body)
+                new_vault = make_vault("new_password")
+                with mock.patch.object(VaultLib, "encrypt", autospec=True, side_effect=wrong_secret):
+                    with self.assertRaises(pilfer_cli.PilferError):
+                        if kind == "file":
+                            pilfer_cli._rekey_whole_file("secret.yml", self.vault, new_vault)
+                        else:
+                            pilfer_cli._rekey_inline_file("secret.yml", self.vault, new_vault)
+                with open("secret.yml", "rb") as f:
+                    self.assertEqual(f.read(), body)
 
     def test_rekey_keeps_vault_id_label(self):
         with open("secret.yml", "wb") as f:

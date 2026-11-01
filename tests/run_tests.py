@@ -60,7 +60,15 @@ def main():
         ),
         (
             "test_vault_set",
-            ["TestVaultSet", "TestVaultSetUnsafe", "TestReadValue", "TestVaultSetCLI"],
+            [
+                "TestVaultSet",
+                "TestVaultSetUnsafe",
+                "TestReadValue",
+                "TestVaultSetCLI",
+                # Every class must be listed: CI runs only this script, and an
+                # unlisted class (this one, until 2.31) never runs there.
+                "TestReviewFollowups",
+            ],
         ),
     ]
 

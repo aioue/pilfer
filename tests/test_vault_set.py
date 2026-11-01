@@ -214,25 +214,27 @@ class TestVaultSet(VaultSetBase):
         self.assertEqual(stat_result.st_gid, gid)
         self.assertEqual(stat_result.st_mode & 0o777, 0o640)
 
-    def test_preserves_acl_when_the_host_has_one(self) -> None:
-        added = subprocess.run(
-            ["chmod", "+a", "group:admin allow read", str(self.vault)],
-            capture_output=True,
-            check=False,
-        )
-        if added.returncode != 0:
-            self.skipTest("chmod +a is not available")
+    def test_keeps_the_group_when_the_user_is_a_member(self) -> None:
+        other = [g for g in os.getgroups() if g != self.vault.stat().st_gid]
+        if not other:
+            self.skipTest("user is in no second group")
+        os.chown(self.vault, -1, other[0])
         self._set("target", SENTINEL)
-        listing = subprocess.check_output(["ls", "-le", str(self.vault)], text=True)
-        self.assertIn("group:admin allow read", listing)
+        self.assertEqual(self.vault.stat().st_gid, other[0])
 
-    def test_refuses_when_the_group_cannot_be_kept(self) -> None:
-        with (
-            mock.patch("pilfer.publish.os.fchown", side_effect=PermissionError(1, "Operation not permitted")),
-            self.assertRaises(PilferError),
+    def test_still_writes_when_the_group_cannot_be_kept(self) -> None:
+        # Only a group member or root can set the group. The vault holds ciphertext,
+        # so the editor's group is an acceptable fallback; the mode is still kept.
+        import pilfer.publish
+
+        target = self.directory / "grouped.bin"
+        target.write_bytes(b"old")
+        with mock.patch(
+            "pilfer.publish.os.fchown", side_effect=PermissionError(1, "Operation not permitted")
         ):
-            self._set("target", SENTINEL)
-        self._assert_untouched()
+            pilfer.publish.write_atomic(target, b"new", mode=0o640, gid=os.getgid() + 12345)
+        self.assertEqual(target.read_bytes(), b"new")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o640)
 
     def test_unrepresentable_value_is_refused(self) -> None:
         # NEL is a YAML 1.1 line break: inside the quoted scalar it would load as a space.
@@ -918,10 +920,7 @@ class TestReviewFollowups(VaultSetBase):
         backup = Path(cli._encrypted_backup_path(str(plain)))
         backup.parent.mkdir(parents=True, exist_ok=True)
         backup.write_bytes(b"$ANSIBLE_VAULT;1.1;AES256\nkeep-this-backup\n")
-        cli._write_session(
-            [{"path": str(plain), "kind": "file"}],
-            password_sha256="not-a-real-fingerprint",
-        )
+        cli._write_session([{"path": str(plain), "kind": "file"}])
         with self.assertRaises(PilferError) as caught:
             cli.decrypt_vault_files(str(self.password))
         self.assertIn("another open", str(caught.exception))
@@ -1003,26 +1002,6 @@ class TestReviewFollowups(VaultSetBase):
             if proc.stdout is not None:
                 proc.stdout.close()
 
-    def test_acl_read_failure_does_not_publish(self) -> None:
-        import ctypes
-        import errno
-
-        import pilfer.publish
-
-        lib = pilfer.publish._load_acl()
-        if lib is None or lib._pilfer_get_np is None:
-            self.skipTest("host acl_get_fd_np is unavailable")
-
-        def boom(_fd, _kind):
-            ctypes.set_errno(errno.EIO)
-            return None
-
-        with mock.patch.object(lib, "_pilfer_get_np", boom):
-            with self.assertRaises(PilferError) as caught:
-                self._set("target", "acl-should-not-land")
-        self.assertNotIn("acl-should-not-land", str(caught.exception))
-        self._assert_untouched()
-
     def test_password_file_decode_error_hides_the_byte(self) -> None:
         from pilfer.cli import _load_password
 
@@ -1047,32 +1026,6 @@ class TestReviewFollowups(VaultSetBase):
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
         self.assertEqual(old.read_text(encoding="utf-8").strip(), "old-secret")
 
-    def test_overlapping_inline_markers_are_not_spliced(self) -> None:
-        from pilfer.inline import recrypt_inline_content
-
-        content = b"outer: |  # pilfer:vault:1\n  inner: x  # pilfer:vault:2\n"
-        records = [
-            {
-                "id": 1,
-                "line_prefix": "outer: ",
-                "body_indent": "  ",
-                "plain_hash": "0" * 64,
-                "encrypted_b64": "",
-                "vault_id": None,
-            },
-            {
-                "id": 2,
-                "line_prefix": "  inner: ",
-                "body_indent": "",
-                "plain_hash": "0" * 64,
-                "encrypted_b64": "",
-                "vault_id": None,
-            },
-        ]
-        with self.assertRaises(ValueError) as caught:
-            recrypt_inline_content(content, records, _vault())
-        self.assertIn("overlapping", str(caught.exception))
-
     def test_strict_vault_id_match_still_decrypts_a_label(self) -> None:
         import ansible.constants as C
 
@@ -1085,7 +1038,7 @@ class TestReviewFollowups(VaultSetBase):
             mock.patch.object(cli, "DEFAULT_VAULT_ID_MATCH", True),
         ):
             vault = cli._make_vault(PASSWORD)
-            cli._match_ciphertext_label(vault, blob)
+            cli.ensure_vault_label(vault, blob)
             self.assertEqual(vault.decrypt(blob), b"target: labeled\n")
 
 
