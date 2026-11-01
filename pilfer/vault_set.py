@@ -205,7 +205,11 @@ def _read_closed_vault(path: Path) -> bytes:
 
 def _load(text: str):
     # _SetLoader is a SafeLoader subclass; it adds only the !unsafe constructor.
-    return yaml.load(text, Loader=_SetLoader)
+    loader = _SetLoader(text)
+    try:
+        return loader.get_single_data()
+    finally:
+        loader.dispose()
 
 
 def _tagged(mapping: dict) -> dict:
