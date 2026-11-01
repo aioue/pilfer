@@ -19,7 +19,7 @@ import sys
 
 # Keep a literal assignment so release CI can triangulate versions across
 # pyproject.toml, pilfer/__init__.py, and this file.
-__version__ = "2.31.0"
+__version__ = "2.32.0"
 
 from pilfer.cli import main
 

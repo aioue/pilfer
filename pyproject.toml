@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pilfer"
-version = "2.31.0"
+version = "2.32.0"
 authors = [
     {name = "Tom Paine", email = "github@aioue.net"},
 ]

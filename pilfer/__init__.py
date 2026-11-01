@@ -11,7 +11,7 @@ Borrows from the excellent, but no longer supported Ansible Toolkit
 (https://github.com/dellis23/ansible-toolkit)
 """
 
-__version__ = "2.31.0"
+__version__ = "2.32.0"
 __author__ = "Tom Paine"
 __email__ = "github@aioue.net"
 __description__ = (
