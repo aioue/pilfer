@@ -683,6 +683,16 @@ class TestVaultSetUnsafe(VaultSetBase):
         self.assertFalse((self.directory / f"{self.vault.name}.pilfer-open").exists())
         self._assert_no_temp()
 
+    def test_planted_lock_symlink_is_refused_and_its_target_keeps_its_mode(self) -> None:
+        victim = self.directory / "victim.sh"
+        victim.write_text("#!/bin/sh\n", encoding="utf-8")
+        victim.chmod(0o755)
+        (self.directory / f"{self.vault.name}.pilfer-lock").symlink_to(victim)
+        with self.assertRaises(PilferError):
+            self._set("target", SENTINEL)
+        self.assertEqual(victim.stat().st_mode & 0o777, 0o755)
+        self._assert_untouched()
+
     def test_set_waits_while_another_process_holds_the_lock(self) -> None:
         import pilfer.publish
 

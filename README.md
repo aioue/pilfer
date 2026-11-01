@@ -264,6 +264,10 @@ non-zero. It does not invent fixes for ambiguous edits.
 vaultedFileList.json
 .vault/
 **/*.pilfer-open
+# Empty lock beside each vault pilfer has opened, closed, rekeyed or set. It stays.
+**/*.pilfer-lock
+# Ciphertext temp a killed set or rekey can leave next to the vault.
+**/.pilfer-rekey-*
 ```
 
 ### Pre-commit hook (suggested)

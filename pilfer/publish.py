@@ -16,6 +16,7 @@ import ctypes.util
 import errno
 import fcntl
 import os
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -42,8 +43,21 @@ def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
     """
     path = Path(path)
     lock_path = path.parent / f"{path.name}{LOCK_SUFFIX}"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    # O_NOFOLLOW: a planted symlink at the lock path would otherwise be followed
+    # and the fchmod below would make whatever it points at 0600, dropping an
+    # exec bit or read access the owner relied on. The sidecar writes refuse
+    # planted links the same way.
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise OSError(exc.errno, "refusing a symlinked pilfer lock", str(lock_path)) from None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            # A FIFO or device at the lock path is not ours to chmod.
+            raise OSError(errno.EINVAL, "pilfer lock is not a regular file", str(lock_path))
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
