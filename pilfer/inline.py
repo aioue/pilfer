@@ -33,6 +33,8 @@ _VAULT_TAG_LINE = re.compile(rb"^(?P<prefix>[ \t]*[^:\n#][^:\n]*:\s*)!vault\s*\|
 
 UTF8_BOM = b"\xef\xbb\xbf"
 VAULT_HEADER_PREFIX = b"$ANSIBLE_VAULT;"
+# ansible-vault encrypt_string indents the !vault body by ten spaces.
+DEFAULT_BODY_INDENT = b"          "
 
 
 class VaultLabelError(ValueError):
@@ -131,9 +133,7 @@ def _line_end(content: bytes, index: int) -> int:
 
 def var_name_from_prefix(line_prefix: str) -> str:
     """Extract YAML key name from a stored line prefix like '  db_password: '."""
-    text = line_prefix.rstrip()
-    text = text.removesuffix(":")
-    return text.strip().lstrip()
+    return line_prefix.rstrip().removesuffix(":").strip()
 
 
 def normalize_vault_ciphertext(indented_block: bytes) -> bytes:
@@ -176,7 +176,7 @@ def find_inline_vault_spans(content: bytes) -> list[InlineSpan]:
     span_id = 0
 
     while True:
-        header_idx = content.find(b"$ANSIBLE_VAULT;", pos)
+        header_idx = content.find(VAULT_HEADER_PREFIX, pos)
         if header_idx < 0:
             break
 
@@ -218,7 +218,7 @@ def find_inline_vault_spans(content: bytes) -> list[InlineSpan]:
         region_start = prev_line_start
         encrypted = content[region_start:vault_body_end]
         ciphertext = normalize_vault_ciphertext(content[vault_body_start:vault_body_end])
-        if not ciphertext.startswith(b"$ANSIBLE_VAULT;"):
+        if not ciphertext.startswith(VAULT_HEADER_PREFIX):
             pos = header_idx + 1
             continue
 
@@ -230,7 +230,7 @@ def find_inline_vault_spans(content: bytes) -> list[InlineSpan]:
                 encrypted=encrypted,
                 ciphertext=ciphertext,
                 line_prefix=line_prefix,
-                body_indent=body_indent or b"          ",
+                body_indent=body_indent or DEFAULT_BODY_INDENT,
                 vault_id=_vault_id_from_ciphertext(ciphertext),
             )
         )
@@ -325,6 +325,32 @@ def ensure_vault_label(vault: VaultLib, data: bytes) -> None:
     vault.secrets.append((label, vault.secrets[0][1]))
 
 
+def vault_decrypt(vault: VaultLib, ciphertext: bytes) -> bytes:
+    """Decrypt ciphertext, registering its vault-id label first (see ensure_vault_label)."""
+    ensure_vault_label(vault, ciphertext)
+    return vault.decrypt(ciphertext)
+
+
+def decrypts(vault: VaultLib, ciphertext: bytes) -> bool:
+    """True if vault_decrypt succeeds. Ansible raises several types for a wrong password."""
+    try:
+        vault_decrypt(vault, ciphertext)
+    except Exception:
+        return False
+    return True
+
+
+def splice(content: bytes, replacements: list[tuple[int, int, bytes]]) -> bytes:
+    """Replace each (start, end) byte range with its blob. Ranges must not overlap."""
+    ordered = sorted(replacements)
+    for prev, nxt in itertools.pairwise(ordered):
+        if prev[1] > nxt[0]:
+            raise ValueError("overlapping vault values; refusing to splice the file")
+    for start, end, blob in reversed(ordered):
+        content = content[:start] + blob + content[end:]
+    return content
+
+
 def decrypt_inline_content(content: bytes, vault: VaultLib) -> tuple[bytes, list[dict]]:
     """Decrypt all inline vault spans. Returns (new_content, span_records)."""
     spans = find_inline_vault_spans(content)
@@ -334,8 +360,7 @@ def decrypt_inline_content(content: bytes, vault: VaultLib) -> tuple[bytes, list
     records = []
     plaintexts = []
     for span in spans:
-        ensure_vault_label(vault, span.ciphertext)
-        plaintext = vault.decrypt(span.ciphertext)
+        plaintext = vault_decrypt(vault, span.ciphertext)
         plaintexts.append(plaintext)
         records.append(
             {
@@ -350,14 +375,13 @@ def decrypt_inline_content(content: bytes, vault: VaultLib) -> tuple[bytes, list
             }
         )
 
-    new_content = content
-    for span, plaintext in sorted(
-        zip(spans, plaintexts, strict=True),
-        key=lambda pair: pair[0].start,
-        reverse=True,
-    ):
-        replacement = format_open_value(plaintext, span)
-        new_content = new_content[: span.start] + replacement + new_content[span.end :]
+    new_content = splice(
+        content,
+        [
+            (span.start, span.end, format_open_value(plaintext, span))
+            for span, plaintext in zip(spans, plaintexts, strict=True)
+        ],
+    )
 
     # close reads values back with the YAML parser. Prove now, before any
     # plaintext is written, that it would read every untouched secret exactly.
@@ -490,7 +514,7 @@ def format_encrypted_block(
     body_indent: bytes,
 ) -> bytes:
     """Format VaultLib.encrypt output as a !vault | block (encrypt_string style)."""
-    indent = body_indent or b"          "
+    indent = body_indent or DEFAULT_BODY_INDENT
     lines = encrypted_ciphertext.strip().splitlines()
     body = b"".join(indent + line + b"\n" for line in lines)
     return line_prefix + b"!vault |\n" + body
@@ -559,20 +583,20 @@ def plaintext_still_in_content(content: bytes, plaintext: bytes) -> bool:
 
 
 def _original_plaintext_from_record(record: dict, vault: VaultLib) -> bytes | None:
-    """Recover opened plaintext from session meta (ciphertext or full !vault block)."""
+    """Recover the opened plaintext from session meta, or None if it no longer decrypts."""
     try:
-        if record.get("ciphertext_b64"):
-            ciphertext = base64.b64decode(record["ciphertext_b64"])
-        else:
-            blob = base64.b64decode(record["encrypted_b64"])
-            idx = blob.find(b"$ANSIBLE_VAULT;")
-            if idx < 0:
-                return None
-            ciphertext = normalize_vault_ciphertext(blob[idx:])
-        ensure_vault_label(vault, ciphertext)
-        return vault.decrypt(ciphertext)
+        return vault_decrypt(vault, base64.b64decode(record["ciphertext_b64"]))
     except Exception:
         return None
+
+
+def _secret_still_present(content: bytes, record: dict, plaintext: bytes) -> bool:
+    """True if the opened secret is still in the file: as raw bytes anywhere
+    (comments included), or as any YAML scalar however it was re-quoted or moved.
+    """
+    return plaintext_still_in_content(content, plaintext) or _secret_in_yaml_scalars(
+        content, record["plain_hash"]
+    )
 
 
 def _key_has_decryptable_vault(content: bytes, var_name: str, vault: VaultLib) -> bool:
@@ -584,12 +608,7 @@ def _key_has_decryptable_vault(content: bytes, var_name: str, vault: VaultLib) -
             continue
         if var_name_from_prefix(prefix) != var_name:
             continue
-        try:
-            ensure_vault_label(vault, span.ciphertext)
-            vault.decrypt(span.ciphertext)
-            return True
-        except Exception:
-            return False
+        return decrypts(vault, span.ciphertext)
     return False
 
 
@@ -620,10 +639,7 @@ def unsafe_missing_marker_names(
             # Corrupt/undecryptable session meta - refuse fail-open removal.
             unsafe.append(name)
             continue
-        if plaintext_still_in_content(content, plaintext):
-            unsafe.append(name)
-            continue
-        if _secret_in_yaml_scalars(content, record["plain_hash"]):
+        if _secret_still_present(content, record, plaintext):
             unsafe.append(name)
             continue
         if _yaml_key_present(content, name):
@@ -693,11 +709,8 @@ def recrypt_inline_content(
         if plain_hash == record["plain_hash"]:
             replacements.append((marked.start, marked.end, original_encrypted))
         else:
-            vault_id = record.get("vault_id") or None
-            if vault_id:
-                new_cipher = vault.encrypt(plaintext, vault_id=vault_id)
-            else:
-                new_cipher = vault.encrypt(plaintext)
+            # vault_id=None writes a 1.1 header, the same as leaving it out.
+            new_cipher = vault.encrypt(plaintext, vault_id=record.get("vault_id") or None)
             line_prefix = record["line_prefix"].encode("utf-8")
             body_indent = record["body_indent"].encode("utf-8")
             replacements.append(
@@ -724,29 +737,14 @@ def recrypt_inline_content(
                 "to treat as intentional removal; restore meta/backups or the "
                 "marker before close."
             )
-        if plaintext_still_in_content(content, plaintext):
-            raise MarkerMissingSecretPresent(name, span_id)
-        if _secret_in_yaml_scalars(content, record["plain_hash"]):
+        if _secret_still_present(content, record, plaintext):
             raise MarkerMissingSecretPresent(name, span_id)
         if not confirm_delete:
             raise SecretLineDeleted(name, span_id)
         removed_vars.append(name)
 
-    new_content = content
-    ordered = sorted(replacements)
-    for prev, nxt in itertools.pairwise(ordered):
-        if prev[1] > nxt[0]:
-            raise ValueError(
-                "overlapping pilfer vault markers; refusing to splice the file"
-            )
-    for start, end, blob in sorted(replacements, key=lambda t: t[0], reverse=True):
-        new_content = new_content[:start] + blob + new_content[end:]
-
-    if removed_vars:
-        modified += len(removed_vars)
-
     return RecryptInlineResult(
-        content=new_content,
-        modified_count=modified,
+        content=splice(content, replacements),
+        modified_count=modified + len(removed_vars),
         removed_vars=removed_vars,
     )

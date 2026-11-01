@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import functools
 import os
 import stat
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -58,7 +59,10 @@ def write_atomic(
 
     publish=False runs every step except the rename, then removes the temp:
     set's check_only uses it to report a read-only directory or a full disk
-    before the caller does something it cannot undo.
+    before the caller does something it cannot undo. A mode or os.access check
+    would miss ACLs, read-only mounts and sandbox denials. Not covered: a
+    sticky directory where the vault belongs to another user, which refuses
+    only the rename itself.
     """
     path = os.fspath(path)
     if os.path.islink(path):
@@ -99,6 +103,40 @@ def write_atomic(
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+def vault_mode_and_group(path: str | os.PathLike) -> dict:
+    """The mode and group a vault should keep when pilfer rewrites it."""
+    st = os.stat(path)
+    return {"mode": stat.S_IMODE(st.st_mode), "gid": st.st_gid}
+
+
+def publish_vault(
+    path: str | os.PathLike,
+    ciphertext: bytes,
+    *,
+    expected: bytes,
+    action: str,
+    restore: dict | None = None,
+    publish: bool = True,
+) -> None:
+    """Write ciphertext to a vault path, keeping the vault's mode and group.
+
+    restore: the mode and group to put back. close passes the ones recorded at
+    open, because open replaced the file with 0600 plaintext. rekey and set
+    leave it out and the file's own are read. Sessions opened by pilfer < 2.31
+    recorded neither; those files stay 0600.
+    """
+    restore = restore if restore is not None else vault_mode_and_group(path)
+    write_atomic(
+        path,
+        ciphertext,
+        mode=restore.get("mode", PRIVATE_MODE),
+        gid=restore.get("gid"),
+        expected=expected,
+        publish=publish,
+        action=action,
+    )
 
 
 def _fsync_directory(directory: str) -> None:
@@ -154,14 +192,25 @@ def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
         os.close(fd)
 
 
+def locked_by_path(func: Callable) -> Callable:
+    """Run func(path, ...) holding vault_file_lock(path), from its first read to its replace."""
+
+    @functools.wraps(func)
+    def wrapper(path, *args, **kwargs):
+        with vault_file_lock(path):
+            return func(path, *args, **kwargs)
+
+    return wrapper
+
+
 @contextmanager
 def project_session_lock() -> Iterator[None]:
     """One open, close, or rekey at a time in this directory.
 
-    The per-file lock does not cover vaultedFileList.json or .vault. Two
-    opens can both pass the session check. The one whose decrypt then fails
-    because the other already published plaintext deletes .vault, which is
-    the only remaining ciphertext.
+    The per-file lock does not cover vaultedFileList.json or .vault. Without
+    this, two opens can both pass the session check. The one that finds every
+    file already decrypted clears the session list, or rewrites it, and the
+    other open's plaintext is left with no session to close it.
     """
     with vault_file_lock(Path.cwd() / ".pilfer-session"):
         yield

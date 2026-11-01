@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1027,10 +1028,37 @@ class TestReviewFollowups(VaultSetBase):
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
         self.assertEqual(old.read_text(encoding="utf-8").strip(), "old-secret")
 
+    def test_password_rotate_installs_new_and_keeps_old(self) -> None:
+        from pilfer.cli import _rotate_password_file
+
+        old = self._password_file("old-pass", "old-secret")
+        new = self._password_file("new-pass", "new-secret")
+        os.chmod(old, 0o644)
+        backup = _rotate_password_file(str(old), str(new))
+        self.assertEqual(Path(backup).read_text(encoding="utf-8").strip(), "old-secret")
+        self.assertEqual(old.read_text(encoding="utf-8").strip(), "new-secret")
+        self.assertEqual(stat.S_IMODE(old.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(Path(backup).stat().st_mode), 0o600)
+        self._assert_no_temp()
+
+    def test_password_rotate_failure_keeps_old_and_drops_backup(self) -> None:
+        from pilfer import cli
+
+        old = self._password_file("old-pass", "old-secret")
+        new = self._password_file("new-pass", "new-secret")
+        with (
+            mock.patch.object(cli, "write_atomic", side_effect=OSError(28, "No space left")),
+            self.assertRaises(OSError),
+        ):
+            cli._rotate_password_file(str(old), str(new))
+        self.assertEqual(old.read_text(encoding="utf-8").strip(), "old-secret")
+        self.assertFalse((self.directory / "old-pass_old").exists())
+
     def test_strict_vault_id_match_still_decrypts_a_label(self) -> None:
         import ansible.constants as C
 
         from pilfer import cli
+        from pilfer.inline import vault_decrypt
 
         secret = VaultSecret(PASSWORD.encode("utf-8"))
         blob = VaultLib([("prod", secret)]).encrypt(b"target: labeled\n", vault_id="prod")
@@ -1039,8 +1067,7 @@ class TestReviewFollowups(VaultSetBase):
             mock.patch.object(cli, "DEFAULT_VAULT_ID_MATCH", True),
         ):
             vault = cli._make_vault(PASSWORD)
-            cli.ensure_vault_label(vault, blob)
-            self.assertEqual(vault.decrypt(blob), b"target: labeled\n")
+            self.assertEqual(vault_decrypt(vault, blob), b"target: labeled\n")
 
 
 if __name__ == "__main__":

@@ -35,7 +35,6 @@ import getpass
 import json
 import os
 import re
-import stat
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -43,10 +42,10 @@ from pathlib import Path
 import yaml
 
 from pilfer.cli import (
-    OPEN_SIDECAR_SUFFIX,
     PilferError,
     _load_password,
     _make_vault,
+    _open_sidecar_path,
 )
 from pilfer.inline import (
     VaultLabelError,
@@ -54,7 +53,7 @@ from pilfer.inline import (
     is_whole_file_vault,
     normalize_whole_file_vault,
 )
-from pilfer.publish import vault_file_lock, write_atomic
+from pilfer.publish import locked_by_path, publish_vault
 
 KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 UNSAFE_TAG = "!unsafe"
@@ -151,22 +150,15 @@ def _check_key(key: str) -> None:
         raise PilferError("refusing key; YAML reads it as a bool or null, not a name")
 
 
+@locked_by_path
 def _set_keys(
     path: Path, values: Mapping[str, str], vault_password_file: str | None, check_only: bool
 ) -> dict[str, str]:
-    with vault_file_lock(path):
-        return _set_keys_locked(path, values, vault_password_file, check_only)
-
-
-def _set_keys_locked(
-    path: Path, values: Mapping[str, str], vault_password_file: str | None, check_only: bool
-) -> dict[str, str]:
+    """The edit itself. No sidecar recheck before the write is needed: this holds
+    vault_file_lock from its first read, and open writes its sidecar under it.
+    """
     original = _read_closed_vault(path)
-    try:
-        password, _ = _load_password(vault_password_file)
-    except UnicodeDecodeError:
-        # The exception text quotes a byte of the password.
-        raise PilferError("vault password file is not valid text") from None
+    password, _ = _load_password(vault_password_file)
     normalized = normalize_whole_file_vault(original)
     vault_id = _vault_id_from_ciphertext(normalized)
     vault = _make_vault(password, [vault_id])
@@ -188,7 +180,7 @@ def _set_keys_locked(
             # A no-op edit used to return before the temp write, so a placeholder
             # that already matched the stored value reported success on a
             # read-only directory.
-            _publish_vault(path, original, original, publish=False)
+            publish_vault(path, original, expected=original, action="set", publish=False)
         return actions
 
     plaintext = edited.encode("utf-8")
@@ -208,7 +200,7 @@ def _set_keys_locked(
     # Prove the bytes decrypt to what we meant before they replace anything.
     if round_trip != plaintext:
         raise PilferError(f"encryption did not round-trip; {path} unchanged")
-    _publish_vault(path, ciphertext, original, publish=not check_only)
+    publish_vault(path, ciphertext, expected=original, action="set", publish=not check_only)
     return actions
 
 
@@ -219,8 +211,7 @@ def _read_closed_vault(path: Path) -> bytes:
         raise PilferError(f"refusing to edit symlink {path}")
     if not path.is_file():
         raise PilferError(f"not a vault file: {path}")
-    # Path.with_suffix(".pilfer-open") would replace .yml. The sidecar keeps the full name.
-    if (path.parent / f"{path.name}{OPEN_SIDECAR_SUFFIX}").exists():
+    if os.path.exists(_open_sidecar_path(str(path))):
         raise PilferError(f"{path} is open in a pilfer session; run 'pilfer close' first")
     original = path.read_bytes()
     if not is_whole_file_vault(original):
@@ -335,29 +326,6 @@ def _edit_plaintext(text: str, key: str, value: str) -> tuple[str, str]:
             f"refusing to write {key}: YAML round-trip did not preserve the value or other keys"
         )
     return new_text, action
-
-
-def _publish_vault(path: Path, data: bytes, expected: bytes, *, publish: bool = True) -> None:
-    """Replace the vault with data, keeping its mode and group, unless it changed meanwhile.
-
-    With publish=False every step runs except os.replace, and the temp is removed:
-    check_only uses it so a read-only directory or a full disk is reported before
-    the real call. A mode or os.access check would miss ACLs, read-only mounts and
-    sandbox denials. Not covered: a sticky directory where the vault belongs to
-    another user, which only refuses the rename itself.
-
-    No sidecar recheck here: the caller holds vault_file_lock from its first
-    read, and open writes its sidecar under the same lock.
-    """
-    st = path.stat()
-    write_atomic(
-        path,
-        data,
-        mode=stat.S_IMODE(st.st_mode),
-        gid=st.st_gid,
-        expected=expected,
-        publish=publish,
-    )
 
 
 def read_value(key: str) -> str:
