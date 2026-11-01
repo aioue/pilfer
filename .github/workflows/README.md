@@ -32,7 +32,6 @@ Settings > Code security; GitHub refuses advanced-setup results while it is on.
 - Runs on push and pull request to main/master, and weekly
 - Results appear in the repository Security tab
 - Config: [`.github/codeql/codeql-config.yml`](../codeql/codeql-config.yml) (`paths-ignore: tests`)
-- [`dismiss-codeql-fp.yml`](dismiss-codeql-fp.yml) dismisses the vault session-binding SHA-256 false positive after each CodeQL run
 - Complements Bandit (Python-specific rules) in `test.yml`
 
 ### `auto-merge.yml` - Dependabot and CodeQL action bumps
