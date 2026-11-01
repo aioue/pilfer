@@ -1,5 +1,5 @@
 # Copyright: (c) 2026, Tom Paine <github@aioue.net>
-# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+# GNU General Public License v3.0+ (see PILFER_LICENSE.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
 """pilfer set: change top-level scalars in a closed whole-file vault.
 
 Decrypts and encrypts in memory, so plaintext never touches disk. The

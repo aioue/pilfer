@@ -1,5 +1,5 @@
 # Copyright: (c) 2026, Tom Paine <github@aioue.net>
-# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+# GNU General Public License v3.0+ (see PILFER_LICENSE.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
 """Shared publish helpers for open, close, rekey, and set.
 
 os.replace swaps in a new inode, so a lock on the vault file does not cover
