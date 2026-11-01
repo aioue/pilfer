@@ -939,6 +939,29 @@ class TestReviewFollowups(VaultSetBase):
         self._assert_untouched()
         self.assertTrue(lock.is_symlink())
 
+    def test_planted_lock_symlink_keeps_the_target_mode(self) -> None:
+        victim = self.directory / "victim.sh"
+        victim.write_text("#!/bin/sh\n", encoding="utf-8")
+        victim.chmod(0o755)
+        (self.directory / f"{self.vault.name}.pilfer-lock").symlink_to(victim)
+        with self.assertRaises(PilferError):
+            set_keys(self.vault, {"target": SENTINEL}, str(self.password))
+        self.assertEqual(victim.stat().st_mode & 0o777, 0o755)
+        self._assert_untouched()
+
+    def test_lock_refuses_a_fifo(self) -> None:
+        import pilfer.publish
+
+        lock = self.directory / f"{self.vault.name}.pilfer-lock"
+        os.mkfifo(lock)
+        mode = lock.stat().st_mode & 0o777
+        with self.assertRaises(OSError) as caught:
+            with pilfer.publish.vault_file_lock(self.vault):
+                pass
+        self.assertIn("not a regular file", str(caught.exception))
+        self.assertEqual(lock.stat().st_mode & 0o777, mode)
+        self._assert_untouched()
+
     def test_project_lock_blocks_a_second_process(self) -> None:
         import pilfer.publish
 
