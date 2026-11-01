@@ -19,9 +19,13 @@ writes 1.1 unless it is given the vault_id, and a dropped label changes which
 
 Ansible runs Jinja over vaulted strings: a vaulted "ab{{ 7*6 }}cd" reaches a play
 as ab42cd (checked on ansible-core 2.21). A value that contains a Jinja delimiter
-is therefore written as `!unsafe "..."`, which Ansible leaves literal. Other
-values stay plain double-quoted scalars, the form line readers such as homelab's
-ha_token.py parse. An existing !unsafe value keeps its tag when it is replaced.
+is therefore written as `!unsafe "..."`, which Ansible leaves literal when the
+text still loads as a string. `!unsafe` re-resolves the scalar, so `!unsafe "0123"`
+becomes the integer 83. An existing !unsafe tag is kept only when Ansible would
+still load the new text as that string. Otherwise the tag is dropped and the
+value is a plain quoted scalar. A value that needs !unsafe and would not stay a
+string is refused. Other values stay plain double-quoted scalars, the form line
+readers such as homelab's ha_token.py parse.
 """
 
 from __future__ import annotations
@@ -45,10 +49,12 @@ from pilfer.cli import (
     _make_vault,
 )
 from pilfer.inline import (
+    VaultLabelError,
     _vault_id_from_ciphertext,
     is_whole_file_vault,
     normalize_whole_file_vault,
 )
+from pilfer.publish import copy_owner_group_and_acls, vault_file_lock
 
 KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 UNSAFE_TAG = "!unsafe"
@@ -101,10 +107,11 @@ def set_keys(
 
     check_only runs every step except the final os.replace: the edit, the encrypt
     and round-trip, and writing the ciphertext to a temp file in the vault's
-    directory, which is then removed. A caller can learn before an irreversible
-    action (minting a token) whether the write will be refused, including for a
-    read-only directory or a full disk. Pass a placeholder shaped like the real
-    value. A concurrent change between the check and the real call is still
+    directory, which is then removed. An edit that does not change the text still
+    writes that temp, so a read-only directory or a full disk is reported before
+    the real call. A caller can learn before an irreversible action (minting a
+    token) whether the write will be refused. Pass a placeholder shaped like the
+    real value. A concurrent change between the check and the real call is still
     refused then.
     """
     path = Path(path)
@@ -119,6 +126,8 @@ def set_keys(
 
     try:
         return _set_keys(path, values, vault_password_file, check_only)
+    except VaultLabelError as exc:
+        raise PilferError(str(exc)) from None
     except OSError as exc:
         # Callers in scripts catch PilferError; an unreadable password file or an
         # unwritable directory must not escape as a bare PermissionError. Name the
@@ -134,14 +143,22 @@ def set_keys(
 
 def _check_key(key: str) -> None:
     if not isinstance(key, str) or not KEY_RE.fullmatch(key):
-        raise PilferError(f"refusing key {key!r}; use a single YAML identifier")
+        # The key slot is where a pasted secret shows up. Do not echo it.
+        raise PilferError("refusing key; use a single YAML identifier")
     # YAML 1.1 reads yes/no/on/off/true/false/null keys as bools or None, so
     # `yes: x` would never be the key "yes" a playbook asks for.
     if yaml.safe_load(key) != key:
-        raise PilferError(f"refusing key {key!r}; YAML reads it as a bool or null, not a name")
+        raise PilferError("refusing key; YAML reads it as a bool or null, not a name")
 
 
 def _set_keys(
+    path: Path, values: Mapping[str, str], vault_password_file: str | None, check_only: bool
+) -> dict[str, str]:
+    with vault_file_lock(path):
+        return _set_keys_locked(path, values, vault_password_file, check_only)
+
+
+def _set_keys_locked(
     path: Path, values: Mapping[str, str], vault_password_file: str | None, check_only: bool
 ) -> dict[str, str]:
     original = _read_closed_vault(path)
@@ -167,16 +184,27 @@ def _set_keys(
     for key, value in values.items():
         edited, actions[key] = _edit_plaintext(edited, key, value)
     if edited == text:
+        if check_only:
+            # A no-op edit used to return before the temp write, so a placeholder
+            # that already matched the stored value reported success on a
+            # read-only directory.
+            _replace_if_unchanged(path, original, original, publish=False)
         return actions
 
     plaintext = edited.encode("utf-8")
     try:
         ciphertext = vault.encrypt(plaintext, vault_id=vault_id)
-        round_trip = vault.decrypt(ciphertext) if is_whole_file_vault(ciphertext) else None
     except Exception as exc:
         # Ansible's messages here do not quote plaintext, but name only the type:
         # the contract is that no PilferError carries vault content.
         raise PilferError(f"could not encrypt {path} ({type(exc).__name__}); unchanged") from None
+    if is_whole_file_vault(ciphertext):
+        try:
+            round_trip = vault.decrypt(ciphertext)
+        except Exception:
+            raise PilferError(f"encryption did not round-trip; {path} unchanged") from None
+    else:
+        round_trip = None
     # Prove the bytes decrypt to what we meant before they replace anything.
     if round_trip != plaintext:
         raise PilferError(f"encryption did not round-trip; {path} unchanged")
@@ -201,6 +229,25 @@ def _read_closed_vault(path: Path) -> bytes:
             "Run 'pilfer close', then set the key on the encrypted file"
         )
     return original
+
+
+def _ansible_keeps_string(value: str) -> bool:
+    """True when Ansible's !unsafe constructor still yields this exact string.
+
+    The constructor resolves the scalar again, so quotes do not protect 0123,
+    yes, null, or a date. A plain JSON-quoted scalar does not take that path.
+    """
+    from ansible.parsing.yaml.loader import AnsibleLoader
+
+    rendered = json.dumps(value, ensure_ascii=False)
+    try:
+        loaded = AnsibleLoader(f"k: !unsafe {rendered}\n").get_single_data()
+    except Exception:
+        return False
+    if not isinstance(loaded, dict):
+        return False
+    got = loaded.get("k")
+    return isinstance(got, str) and got == value
 
 
 def _load(text: str):
@@ -237,16 +284,24 @@ def _edit_plaintext(text: str, key: str, value: str) -> tuple[str, str]:
         raise PilferError(f"{key} appears {len(nodes)} times; refusing to guess")
 
     unsafe = any(delimiter in value for delimiter in JINJA_DELIMITERS)
+    tagged = False
     if nodes:
         node = nodes[0]
         if not isinstance(node, yaml.ScalarNode) or node.style in ("|", ">"):
             raise PilferError(f"{key} is not a flow scalar; edit it in a pilfer open session")
-        # Someone tagged this value on purpose; keep the tag even if the new value
-        # has no delimiter.
         tagged = node.tag == UNSAFE_TAG
-        unsafe = unsafe or tagged
-        if old.get(key) == value and tagged == unsafe:
-            return text, "unchanged"
+    # !unsafe re-resolves the scalar as a plain YAML value. Keep the tag only
+    # when Ansible would still load this string. Call the loader only when the
+    # tag would otherwise be written.
+    if unsafe or tagged:
+        stays = _ansible_keeps_string(value)
+        if unsafe and not stays:
+            raise PilferError(
+                f"refusing to write {key}: !unsafe would change the value Ansible loads"
+            )
+        unsafe = unsafe or (tagged and stays)
+    if nodes and old.get(key) == value and tagged == unsafe:
+        return text, "unchanged"
     # json.dumps gives a double-quoted scalar, so YAML 1.1 does not coerce yes/no/numbers.
     rendered = json.dumps(value, ensure_ascii=False)
     if unsafe:
@@ -301,13 +356,19 @@ def _replace_if_unchanged(
     fd, tmp = tempfile.mkstemp(prefix=REKEY_TEMP_PREFIX, dir=path.parent)
     replaced = False
     try:
-        os.fchmod(fd, mode)
+        # New inode. Copy uid, gid, mode, and ACLs, or a 0640 file would be
+        # owned by the editor's primary group. Failure leaves the vault in place.
+        copy_owner_group_and_acls(path, fd, mode)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         if path.is_symlink() or path.read_bytes() != expected:
             raise PilferError(f"{path} changed during the edit; nothing written. Retry")
+        # open writes the sidecar before plaintext. Recheck under the same lock
+        # the open holds, so a session that appeared after the first read is refused.
+        if (path.parent / f"{path.name}{OPEN_SIDECAR_SUFFIX}").exists():
+            raise PilferError(f"{path} is open in a pilfer session; run 'pilfer close' first")
         if publish:
             os.replace(tmp, path)
             replaced = True

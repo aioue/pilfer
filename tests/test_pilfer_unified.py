@@ -1292,6 +1292,25 @@ class TestCompatibility(unittest.TestCase):
         self.assertEqual(pilfer_cli.recrypt_vault_files("vault_pass"), 0)
         self.assertEqual(cli_decrypted, b"test: value\n")
 
+        script = os.path.join(os.path.dirname(__file__), "..", "pilfer.py")
+        opened = subprocess.run(
+            [sys.executable, script, "open", "-p", "vault_pass"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        with open("test_vault.yml", "rb") as f:
+            script_decrypted = f.read()
+        self.assertEqual(script_decrypted, cli_decrypted)
+        closed = subprocess.run(
+            [sys.executable, script, "close", "-p", "vault_pass"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+
 
 class TestInlineUnit(unittest.TestCase):
     """Pure unit tests for span finding / normalize without full CLI."""

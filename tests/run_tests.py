@@ -35,8 +35,7 @@ def run_test_classes(module_name, test_classes):
 def main():
     """Main test runner"""
     print("Pilfer Test Suite")
-    print("Testing both standalone pilfer.py and CLI versions")
-    print("Verifying hash consistency and line ending preservation")
+    print("CLI matrix, plus a pilfer.py open/close smoke test")
 
     # Add the tests directory to Python path
     tests_dir = os.path.dirname(os.path.abspath(__file__))
@@ -112,8 +111,9 @@ def main():
         return 1
 
     if total_failures == 0 and total_errors == 0:
-        print("\n✅ All tests passed! Both pilfer versions work correctly.")
-        print("   ✓ CLI and standalone versions behave identically")
+        print("\n✅ All tests passed.")
+        print("   ✓ CLI matrix, plus pilfer.py open/close smoke")
+        print("   ✓ Compatibility test compares CLI and pilfer.py plaintext")
         print("   ✓ Hash consistency maintained for unchanged files")
         print("   ✓ Line endings preserved during re-encryption")
         print("   ✓ Modified file detection working properly")

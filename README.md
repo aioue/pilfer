@@ -60,7 +60,7 @@ vault_password_file = ~/.ansible-vault/.vault-file
 - **ansible.cfg integration** - Automatically reads `vault_password_file` from your ansible.cfg
 - **Change detection** - Only re-encrypts files that were actually modified (using SHA256)
 - **Safe operation** - Preserves original encrypted content for unchanged files
-- **No third-party dependencies** - Uses Ansible's official vault implementation directly
+- **Ansible vault** - Calls Ansible's VaultLib. `pip install pilfer` installs Ansible; a checkout needs Ansible on `PATH`
 - **Binary data preservation** - Preserves exact line endings and formatting (critical for certificates)
 - **Inline `encrypt_string` support** - Opt-in via `pilfer open --include-encrypted-vars`; decrypts YAML `!vault` scalars in place (with `# pilfer:vault:N` markers); `close` always re-encrypts whatever the session opened
 - **Fail-closed sessions** - Refuses double-`open`, keeps session state if `close` partially fails, non-zero exit codes on errors
@@ -96,7 +96,7 @@ printf '%s' "$TOKEN" | pilfer set secrets.yml db_password
 
 Piped input drops one trailing newline, so `echo` works too. You can pass the value as the final argument, but it may appear in shell history and process listings. Put `--` before a value that starts with `-`.
 
-The value stays in memory and is saved as a string, even if it looks like a YAML boolean or number. New keys are appended; replacing an existing scalar preserves any inline comment on its line. Values containing `{{`, `{%` or `{#` are tagged `!unsafe` so Ansible uses them as typed. An existing `!unsafe` value keeps its tag.
+The value stays in memory and is saved as a string, even if it looks like a YAML boolean or number. New keys are appended; replacing an existing scalar preserves any inline comment on its line. Values containing `{{`, `{%` or `{#` are tagged `!unsafe` so Ansible uses them as typed. An existing `!unsafe` tag is kept when the new text would still load as a string. `!unsafe "0123"`, `!unsafe "yes"`, and `!unsafe` dates are stored as plain quoted strings, because Ansible would otherwise retype them.
 
 Pilfer refuses plaintext files, files in an open Pilfer session, and key names that YAML reads as a boolean or null, such as `yes`, `on` and `null`. If the operation fails, the original ciphertext remains unchanged. Pilfer replaces the file while preserving its mode; hard links continue to point to the old content.
 
@@ -177,7 +177,7 @@ still present in the file (including in comments).
 
 ### Vault password file
 
-Pilfer finds the vault password in this order: `-p`, then `vault_password_file` in `ansible.cfg`, then common paths (`~/.ansible-vault/.vault-file`, `.vault_password`, and others).
+Pilfer finds the vault password in this order: `-p`, then `vault_password_file` in `ansible.cfg`, then `~/.ansible-vault/.vault-file`, `.vault_password`, `vault_password_file`, and finally `../../vault_password_file`.
 
 ### Examples
 

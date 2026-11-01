@@ -8,7 +8,7 @@ Pilfer - Decrypt all ansible vault files in a project recursively for search/edi
 Thin entry script that delegates to the packaged implementation (pilfer.cli).
 
 Usage (from a clone of this repository):
-    python pilfer.py [open|close] [-p VAULT_PASSWORD_FILE]
+    python pilfer.py [open|close|rekey|set] [-p VAULT_PASSWORD_FILE]
 
 For installation (recommended):
     pipx install pilfer
