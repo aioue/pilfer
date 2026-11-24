@@ -1070,5 +1070,26 @@ class TestReviewFollowups(VaultSetBase):
             self.assertEqual(vault_decrypt(vault, blob), b"target: labeled\n")
 
 
+class TestVaultPasswordClient(VaultSetBase):
+    def test_password_file_executes_client_script(self) -> None:
+        from pilfer.cli import _load_password
+
+        clientscript = self.directory / "password-helper-script"
+        clientscript.write_text("#!/bin/sh\necho 'thisisthepassword'")
+        clientscript.chmod(0o0700)
+        password, _ = _load_password(str(clientscript))
+        assert password == "thisisthepassword"
+
+    def test_password_file_client_script_fails(self) -> None:
+        from pilfer.cli import _load_password
+
+        badclientscript = self.directory / "password-helper-script"
+        badclientscript.write_text("#!/bin/sh\nexit 1")
+        badclientscript.chmod(0o700)
+        with self.assertRaises(PilferError) as caught:
+            _load_password(str(badclientscript))
+        self.assertIn("failed to execute", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

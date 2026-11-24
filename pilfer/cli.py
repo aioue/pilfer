@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -174,12 +175,29 @@ def _resolve_password_file(vault_password_file_path=None):
 
 def _load_password(vault_password_file_path=None):
     vault_file = _resolve_password_file(vault_password_file_path)
-    try:
-        with open(vault_file) as vault_password_file:
-            password = vault_password_file.read().strip()
-    except UnicodeDecodeError:
-        # The exception text quotes a byte of the password.
-        raise PilferError("vault password file is not valid text") from None
+    if not os.access(vault_file, os.X_OK):
+        try:
+            with open(vault_file) as vault_password_file:
+                password = vault_password_file.read().strip()
+        except UnicodeDecodeError:
+            # The exception text quotes a byte of the password.
+            raise PilferError("vault password file is not valid text") from None
+    else:
+        try:
+            password = (
+                subprocess.check_output([vault_file], timeout=30).decode().strip()
+            )
+        except subprocess.CalledProcessError:
+            raise PilferError(
+                "vault password file is executable but failed to execute"
+            ) from None
+        except subprocess.TimeoutExpired:
+            raise PilferError(
+                "vault password file script failed to return within set timeout"
+            ) from None
+        except UnicodeDecodeError:
+            # The exception text quotes a byte of the password.
+            raise PilferError("vault password file is not valid text") from None
     return password, vault_file
 
 
