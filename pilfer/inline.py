@@ -2,10 +2,9 @@
 # GNU General Public License v3.0+ (see PILFER_LICENSE.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
 """In-place handling of ansible-vault encrypt_string (!vault) blobs."""
 
-from __future__ import annotations
-
 import base64
 import bisect
+import collections
 import hashlib
 import itertools
 import json
@@ -14,6 +13,8 @@ from dataclasses import dataclass, field
 
 import yaml
 from ansible.parsing.vault import VaultLib
+
+from pilfer.vault_secrets import decrypts, encrypt_like, vault_label
 
 # Marker comment left beside a decrypted value so close can find spans after edits.
 # It is a YAML comment: close reads the value itself with the YAML parser.
@@ -33,15 +34,6 @@ UTF8_BOM = b"\xef\xbb\xbf"
 VAULT_HEADER_PREFIX = b"$ANSIBLE_VAULT;"
 # ansible-vault encrypt_string indents the !vault body by ten spaces.
 DEFAULT_BODY_INDENT = b"          "
-
-
-class VaultLabelError(ValueError):
-    """The vault-id label cannot be written back.
-
-    Ansible's is_encrypted() rejects any non-ASCII byte in the blob, so a
-    UTF-8 label (or a U+FFFD substituted for one) becomes a file Ansible
-    will not decrypt. Callers leave the original ciphertext in place.
-    """
 
 
 def strip_leading_vault_noise(data: bytes) -> bytes:
@@ -158,22 +150,6 @@ def normalize_vault_ciphertext(indented_block: bytes) -> bytes:
     return b"\n".join(lines) + b"\n"
 
 
-def _vault_id_from_ciphertext(ciphertext: bytes) -> str | None:
-    """Parse vault-id from `$ANSIBLE_VAULT;1.2;AES256;prod` headers (if present)."""
-    first = ciphertext.splitlines()[0] if ciphertext else b""
-    parts = first.split(b";")
-    # $ANSIBLE_VAULT;1.2;AES256;vault_id
-    if len(parts) >= 4 and parts[0] == b"$ANSIBLE_VAULT":
-        try:
-            vault_id = parts[3].decode("ascii").strip()
-        except UnicodeDecodeError:
-            raise VaultLabelError(
-                "vault header label is not ASCII; Ansible would reject the re-encrypted file"
-            ) from None
-        return vault_id or None
-    return None
-
-
 def find_inline_vault_spans(content: bytes) -> list[InlineSpan]:
     """Locate `key: !vault |` encrypt_string regions (not whole-file vaults).
 
@@ -243,13 +219,65 @@ def find_inline_vault_spans(content: bytes) -> list[InlineSpan]:
                 ciphertext=ciphertext,
                 line_prefix=line_prefix,
                 body_indent=body_indent or DEFAULT_BODY_INDENT,
-                vault_id=_vault_id_from_ciphertext(ciphertext),
+                vault_id=vault_label(ciphertext),
             )
         )
         span_id += 1
         pos = vault_body_end
 
     return spans
+
+
+def _ansible_vault_values(content: bytes) -> list[bytes]:
+    """Ciphertext of every !vault value Ansible's YAML loader reads, normalized like spans.
+
+    Empty when Ansible cannot load the file as YAML: it would not read those
+    values either. Errors are dropped, not shown: YAML errors quote the line.
+    """
+    from ansible.parsing.vault import VaultHelper
+    from ansible.parsing.yaml.loader import AnsibleLoader
+
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    loader = AnsibleLoader(text)
+    documents = []
+    try:
+        while loader.check_data():
+            documents.append(loader.get_data())
+    except Exception:
+        return []
+    finally:
+        loader.dispose()
+    found, stack, seen = [], documents, set()
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict | list):
+            # An alias can make a collection contain itself.
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            stack.extend([*value.keys(), *value.values()] if isinstance(value, dict) else value)
+            continue
+        ciphertext = VaultHelper.get_ciphertext(value, with_tags=False)
+        if ciphertext:
+            found.append(normalize_vault_ciphertext(ciphertext.encode("utf-8")))
+    return found
+
+
+def vault_values_pilfer_skips(content: bytes) -> int:
+    """How many !vault values Ansible reads in content that find_inline_vault_spans does not.
+
+    pilfer opens only `key: !vault |` blocks; a list item, a `|-` block or a
+    flow scalar stays encrypted. Open reports them. Rekey refuses, because
+    rotating the password would leave them on the old one.
+    """
+    if VAULT_HEADER_PREFIX not in content or is_whole_file_vault(content):
+        return 0
+    remaining = collections.Counter(_ansible_vault_values(content))
+    remaining.subtract(span.ciphertext for span in find_inline_vault_spans(content))
+    return sum(count for count in remaining.values() if count > 0)
 
 
 def _yaml_double_quoted(text: str) -> str:
@@ -294,37 +322,6 @@ def format_open_value(plaintext: bytes, span: InlineSpan) -> bytes:
     return span.line_prefix + quoted + b"  " + marker + b"\n"
 
 
-def ensure_vault_label(vault: VaultLib, data: bytes) -> None:
-    """Register this ciphertext's label when Ansible matches vault ids strictly.
-
-    DEFAULT_VAULT_ID_MATCH is a bool. When it is true, a secret registered
-    under that bool does not decrypt a `prod` or `default` header.
-    """
-    from ansible.constants import DEFAULT_VAULT_ID_MATCH
-
-    if not DEFAULT_VAULT_ID_MATCH or not vault.secrets:
-        return
-    label = _vault_id_from_ciphertext(data) or "default"
-    if any(vault_id == label for vault_id, _secret in vault.secrets):
-        return
-    vault.secrets.append((label, vault.secrets[0][1]))
-
-
-def vault_decrypt(vault: VaultLib, ciphertext: bytes) -> bytes:
-    """Decrypt ciphertext, registering its vault-id label first (see ensure_vault_label)."""
-    ensure_vault_label(vault, ciphertext)
-    return vault.decrypt(ciphertext)
-
-
-def decrypts(vault: VaultLib, ciphertext: bytes) -> bool:
-    """True if vault_decrypt succeeds. Ansible raises several types for a wrong password."""
-    try:
-        vault_decrypt(vault, ciphertext)
-    except Exception:
-        return False
-    return True
-
-
 def splice(content: bytes, replacements: list[tuple[int, int, bytes]]) -> bytes:
     """Replace each (start, end) byte range with its blob. Ranges must not overlap."""
     ordered = sorted(replacements)
@@ -345,7 +342,7 @@ def decrypt_inline_content(content: bytes, vault: VaultLib) -> tuple[bytes, list
     records = []
     plaintexts = []
     for span in spans:
-        plaintext = vault_decrypt(vault, span.ciphertext)
+        plaintext = vault.decrypt(span.ciphertext)
         plaintexts.append(plaintext)
         records.append(
             {
@@ -534,7 +531,7 @@ def _canonical(node: yaml.Node, secret_keys: set[int], vault: VaultLib, active: 
         if node.tag == "!vault":
             ciphertext = normalize_vault_ciphertext(node.value.encode("utf-8"))
             try:
-                return ("secret", vault_decrypt(vault, ciphertext))
+                return ("secret", vault.decrypt(ciphertext))
             except Exception:
                 return ("!vault", ciphertext)
         return (node.tag, node.value)
@@ -655,7 +652,7 @@ def plaintext_still_in_content(content: bytes, plaintext: bytes) -> bool:
 def _original_plaintext_from_record(record: dict, vault: VaultLib) -> bytes | None:
     """Recover the opened plaintext from session meta, or None if it no longer decrypts."""
     try:
-        return vault_decrypt(vault, base64.b64decode(record["ciphertext_b64"]))
+        return vault.decrypt(base64.b64decode(record["ciphertext_b64"]))
     except Exception:
         return None
 
@@ -781,8 +778,8 @@ def recrypt_inline_content(
         if plain_hash == record["plain_hash"]:
             replacements.append((marked.start, marked.end, original_encrypted))
         else:
-            # vault_id=None writes a 1.1 header, the same as leaving it out.
-            new_cipher = vault.encrypt(plaintext, vault_id=record.get("vault_id") or None)
+            # The secret and label of the ciphertext this value was opened from.
+            new_cipher = encrypt_like(vault, plaintext, base64.b64decode(record["ciphertext_b64"]))
             line_prefix = record["line_prefix"].encode("utf-8")
             body_indent = record["body_indent"].encode("utf-8")
             replacements.append(

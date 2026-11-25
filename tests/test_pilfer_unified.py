@@ -17,6 +17,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# Before anything imports ansible: see the module.
+import _ansible_isolation  # noqa: F401
 import yaml
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.errors import AnsibleError
@@ -1735,15 +1737,15 @@ class TestAllowRemovalsAndRekey(ProjectDirTest):
                     ).encode()
                 with open("secret.yml", "wb") as f:
                     f.write(body)
-                new_vault = make_vault("new_password")
+                new = pilfer_cli.NewSecret(VaultSecret(b"new_password"), None)
                 with mock.patch.object(
                     VaultLib, "encrypt", autospec=True, side_effect=wrong_secret
                 ):
                     with self.assertRaises(pilfer_cli.PilferError):
                         if kind == "file":
-                            pilfer_cli._rekey_whole_file("secret.yml", self.vault, new_vault)
+                            pilfer_cli._rekey_whole_file("secret.yml", self.vault, new)
                         else:
-                            pilfer_cli._rekey_inline_file("secret.yml", self.vault, new_vault)
+                            pilfer_cli._rekey_inline_file("secret.yml", self.vault, new)
                 with open("secret.yml", "rb") as f:
                     self.assertEqual(f.read(), body)
 

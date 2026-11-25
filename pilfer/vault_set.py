@@ -14,9 +14,11 @@ never encrypts in place, so a failed encrypt leaves the original ciphertext.
 plaintext, so a sidecar or a plaintext file means a session is open. set refuses
 both rather than walking vaultedFileList.json.
 
-A `$ANSIBLE_VAULT;1.2;AES256;<label>` header keeps its label: VaultLib.encrypt
-writes 1.1 unless it is given the vault_id, and a dropped label changes which
---vault-id ansible-vault later matches.
+The new ciphertext is made with the secret that decrypts the old one, under
+its `$ANSIBLE_VAULT;1.2;AES256;<label>` label, as ansible-vault edit does
+(vault_secrets.encrypt_like). VaultLib.encrypt writes 1.1 unless it is given
+the vault_id, and a dropped label changes which --vault-id ansible-vault later
+matches.
 
 Ansible runs Jinja over vaulted strings: a vaulted "ab{{ 7*6 }}cd" reaches a play
 as ab42cd (checked on ansible-core 2.21). A value that contains a Jinja delimiter
@@ -29,8 +31,6 @@ string is refused. Other values stay plain double-quoted scalars, the form line
 readers such as homelab's ha_token.py parse.
 """
 
-from __future__ import annotations
-
 import getpass
 import json
 import os
@@ -40,20 +40,22 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import yaml
+from ansible.parsing.vault import VaultLib
 
-from pilfer.cli import (
-    PilferError,
-    _load_password,
-    _make_vault,
-    _open_sidecar_path,
-)
+from pilfer.cli import PilferError, _open_sidecar_path
 from pilfer.inline import (
-    VaultLabelError,
-    _vault_id_from_ciphertext,
+    find_inline_vault_spans,
     is_whole_file_vault,
     normalize_whole_file_vault,
 )
 from pilfer.publish import locked_by_path, publish_vault
+from pilfer.vault_secrets import (
+    RoundTripError,
+    VaultLabelError,
+    encrypt_like,
+    load_vault,
+    vault_label,
+)
 
 KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 UNSAFE_TAG = "!unsafe"
@@ -93,11 +95,15 @@ _SetLoader.add_constructor(UNSAFE_TAG, _construct_unsafe)
 def set_keys(
     path: str | os.PathLike,
     values: Mapping[str, str],
-    vault_password_file: str | None = None,
+    vault_password_file=None,
     *,
     check_only: bool = False,
 ) -> dict[str, str]:
     """Insert or replace top-level scalars in one encrypt. Returns key -> added/updated/unchanged.
+
+    vault_password_file is a password file or script path, a
+    pilfer.vault_secrets.VaultSources, or a VaultLib already loaded. None uses
+    Ansible's config as of import, then pilfer's fallback paths.
 
     All keys land in one write, so a crash cannot leave some of them set. A new
     key is appended at the end. If nothing changes, the file bytes are left alone
@@ -152,16 +158,19 @@ def _check_key(key: str) -> None:
 
 @locked_by_path
 def _set_keys(
-    path: Path, values: Mapping[str, str], vault_password_file: str | None, check_only: bool
+    path: Path, values: Mapping[str, str], vault_password_file, check_only: bool
 ) -> dict[str, str]:
     """The edit itself. No sidecar recheck before the write is needed: this holds
     vault_file_lock from its first read, and open writes its sidecar under it.
     """
     original = _read_closed_vault(path)
-    password, _ = _load_password(vault_password_file)
     normalized = normalize_whole_file_vault(original)
-    vault_id = _vault_id_from_ciphertext(normalized)
-    vault = _make_vault(password, [vault_id])
+    # Before the password loads: a label that cannot be written back is refused as such.
+    vault_label(normalized)
+    if isinstance(vault_password_file, VaultLib):
+        vault = vault_password_file
+    else:
+        vault = load_vault(vault_password_file)
     try:
         # Decrypt the bytes just read, not the path, so the compare-before-replace
         # below is against exactly the ciphertext this edit is based on.
@@ -185,7 +194,9 @@ def _set_keys(
 
     plaintext = edited.encode("utf-8")
     try:
-        ciphertext = vault.encrypt(plaintext, vault_id=vault_id)
+        ciphertext = encrypt_like(vault, plaintext, normalized)
+    except RoundTripError:
+        raise PilferError(f"encryption did not round-trip; {path} unchanged") from None
     except Exception as exc:
         # Ansible's messages here do not quote plaintext, but name only the type:
         # the contract is that no PilferError carries vault content.
@@ -215,10 +226,17 @@ def _read_closed_vault(path: Path) -> bytes:
         raise PilferError(f"{path} is open in a pilfer session; run 'pilfer close' first")
     original = path.read_bytes()
     if not is_whole_file_vault(original):
-        raise PilferError(
-            f"{path} is not a whole-file vault; refusing to write plaintext. "
-            "Run 'pilfer close', then set the key on the encrypted file"
-        )
+        # A file pilfer opened has its sidecar, refused above. This one was
+        # never encrypted, or was decrypted by something other than pilfer.
+        message = f"{path} is not a whole-file vault; refusing to write plaintext."
+        if find_inline_vault_spans(original):
+            message += (
+                " It holds inline !vault values: change those in a "
+                "'pilfer open --include-encrypted-vars' session."
+            )
+        else:
+            message += " pilfer set edits whole-file vaults only."
+        raise PilferError(message)
     return original
 
 

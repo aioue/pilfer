@@ -14,8 +14,6 @@ from a `|` block at the end of the file, and a tab-only line left behind after
 a closed block.
 """
 
-from __future__ import annotations
-
 import contextlib
 import io
 import json
@@ -30,6 +28,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# Before anything imports ansible: see the module.
+import _ansible_isolation  # noqa: F401
 import yaml
 from ansible.parsing.vault import VaultLib, VaultSecret
 

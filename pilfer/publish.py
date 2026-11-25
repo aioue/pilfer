@@ -12,8 +12,6 @@ the file another pilfer process is about to publish. The lock lives on a
 sibling that is never replaced.
 """
 
-from __future__ import annotations
-
 import errno
 import fcntl
 import functools

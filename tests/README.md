@@ -28,10 +28,15 @@ python -m unittest test_pilfer_unified.TestPilferCLI.test_line_endings_preserved
 - `test_inline_randomized.py`: generated secrets, edits and editor saves
   through open and close, checked against what YAML reads from the edited
   file. Fixed seeds; `PILFER_RANDOM_CASES=5000` runs more.
+- `test_vault_sources.py`: password scripts, `-client` scripts, Ansible's config,
+  several vault ids, and rekey and rotation with those sources. Runs pilfer in
+  a subprocess, because Ansible reads its config at import.
+- `_ansible_isolation.py`: imported first by every test module. Points
+  `ANSIBLE_CONFIG` at an empty file so the machine's own Ansible config stays out.
 - `test_vault_set.py`: `pilfer set` and `set_keys`. Results are read back
   through the `ansible-vault` CLI, not through pilfer.
 
 ## Requirements
 
-- Python 3.10+
-- `ansible-core`, for `VaultLib`, and `ansible-vault` on `PATH`
+- Python 3.12+
+- `ansible-core` 2.21+, for `VaultLib`, and `ansible-vault` on `PATH`

@@ -1,7 +1,5 @@
 """pilfer set keeps plaintext off disk and out of output, and stores the exact value."""
 
-from __future__ import annotations
-
 import json
 import os
 import shutil
@@ -13,11 +11,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+# Before anything imports ansible: see the module.
+import _ansible_isolation  # noqa: F401
 import yaml
 from ansible.parsing.yaml.loader import AnsibleLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import ansible.constants as C
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.errors import AnsibleError
 from ansible.parsing.vault import VaultLib, VaultSecret
@@ -94,6 +95,22 @@ class VaultSetBase(unittest.TestCase):
 
     def _set(self, key: str, value: str, path: Path | None = None) -> str:
         return set_keys(path or self.vault, {key: value}, str(self.password))[key]
+
+    def _cli(self, *args: str, stdin: bytes = b"", env: dict | None = None):
+        """Run pilfer.py in self.directory with Ansible's config search left on.
+
+        ansible.constants reads the config at import, so a test of ansible.cfg
+        handling needs a fresh process. Without ANSIBLE_CONFIG, ./ansible.cfg wins.
+        """
+        base = {k: v for k, v in os.environ.items() if k != "ANSIBLE_CONFIG"}
+        return subprocess.run(
+            [sys.executable, str(PILFER_SCRIPT), *args],
+            capture_output=True,
+            check=False,
+            cwd=self.directory,
+            input=stdin,
+            env={**base, **(env or {})},
+        )
 
     def _view(self, path: Path | None = None) -> str:
         """Read through the ansible-vault CLI, not the code under test."""
@@ -248,22 +265,26 @@ class TestVaultSet(VaultSetBase):
 
     # Password resolution
 
-    def test_dash_p_wins_over_ansible_cfg(self) -> None:
-        # pilfer reads ansible.cfg from cwd. A decoy there must not be used when -p is given.
+    def test_dash_p_beside_an_ansible_cfg_decoy(self) -> None:
+        # Ansible loads both, -p first. The edit must be encrypted with the one
+        # that decrypts the file, not the decoy ansible.cfg names.
         decoy = self._password_file("decoy-password", "decoy")
         (self.directory / "ansible.cfg").write_text(
             f"[defaults]\nvault_password_file = {decoy}\n", encoding="utf-8"
         )
-        self._set("target", SENTINEL)
+        result = self._cli("set", "-p", str(self.password), str(self.vault), "target", SENTINEL)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(self._view(), _expected_target(SENTINEL))
         with self.assertRaises(AnsibleError):
             _vault("decoy").decrypt(self.vault.read_bytes())
 
     def test_ansible_cfg_password_without_dash_p(self) -> None:
+        # A relative path resolves against the config file's directory, as in Ansible.
         (self.directory / "ansible.cfg").write_text(
-            f"[defaults]\nvault_password_file = {self.password}\n", encoding="utf-8"
+            f"[defaults]\nvault_password_file = {self.password.name}\n", encoding="utf-8"
         )
-        set_keys(self.vault, {"target": SENTINEL})
+        result = self._cli("set", str(self.vault), "target", SENTINEL)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(self._view(), _expected_target(SENTINEL))
 
     # Failure leaves the original ciphertext
@@ -737,7 +758,7 @@ class TestVaultSetUnsafe(VaultSetBase):
         self.assertEqual(self._view(), _expected_target("from-other-process"))
 
     def test_home_password_path_beats_the_parent_fallback(self) -> None:
-        from pilfer.cli import get_vault_password_file
+        from pilfer.vault_secrets import fallback_password_file
 
         home = os.path.expanduser("~/.ansible-vault/.vault-file")
         parent = os.path.normpath(os.path.join(os.getcwd(), "../../vault_password_file"))
@@ -745,19 +766,19 @@ class TestVaultSetUnsafe(VaultSetBase):
         def exists(path: str) -> bool:
             return path in (home, parent, "../../vault_password_file")
 
-        with mock.patch("pilfer.cli.os.path.exists", side_effect=exists):
-            self.assertEqual(get_vault_password_file(), home)
+        with mock.patch("pilfer.vault_secrets.os.path.exists", side_effect=exists):
+            self.assertEqual(fallback_password_file(), home)
 
     def test_parent_password_fallback_is_last(self) -> None:
-        from pilfer.cli import get_vault_password_file
+        from pilfer.vault_secrets import fallback_password_file
 
         parent = "../../vault_password_file"
 
         def exists(path: str) -> bool:
             return path == parent
 
-        with mock.patch("pilfer.cli.os.path.exists", side_effect=exists):
-            self.assertEqual(get_vault_password_file(), parent)
+        with mock.patch("pilfer.vault_secrets.os.path.exists", side_effect=exists):
+            self.assertEqual(fallback_password_file(), parent)
 
 
 class TestReadValue(unittest.TestCase):
@@ -1004,15 +1025,13 @@ class TestReviewFollowups(VaultSetBase):
             if proc.stdout is not None:
                 proc.stdout.close()
 
-    def test_password_file_decode_error_hides_the_byte(self) -> None:
-        from pilfer.cli import _load_password
-
-        bad = self.directory / "bad-pass"
-        bad.write_bytes(b"\xff\xfe")
-        with self.assertRaises(PilferError) as caught:
-            _load_password(str(bad))
-        self.assertNotIn("xff", str(caught.exception).lower())
-        self.assertIn("not valid text", str(caught.exception))
+    def test_non_utf8_password_is_bytes_as_in_ansible(self) -> None:
+        # Ansible reads a password file as bytes; pilfer used to refuse non-UTF-8.
+        self.password.write_bytes(b"pass\xffword\n")
+        secret = VaultSecret(b"pass\xffword")
+        self.vault.write_bytes(VaultLib([("default", secret)]).encrypt(FIXTURE.encode("utf-8")))
+        self.assertEqual(self._set("target", SENTINEL), "updated")
+        self.assertEqual(self._view(), _expected_target(SENTINEL))
 
     def test_password_rotate_refuses_a_symlink_backup(self) -> None:
         from pilfer.cli import _rotate_password_file
@@ -1054,20 +1073,30 @@ class TestReviewFollowups(VaultSetBase):
         self.assertEqual(old.read_text(encoding="utf-8").strip(), "old-secret")
         self.assertFalse((self.directory / "old-pass_old").exists())
 
-    def test_strict_vault_id_match_still_decrypts_a_label(self) -> None:
-        import ansible.constants as C
-
-        from pilfer import cli
-        from pilfer.inline import vault_decrypt
+    def test_strict_vault_id_match_follows_ansible(self) -> None:
+        # vault_id_match = True: a prod file needs a prod secret. pilfer used to
+        # register a -p password under every label; now it does what Ansible does.
+        from pilfer.vault_secrets import VaultSources
 
         secret = VaultSecret(PASSWORD.encode("utf-8"))
-        blob = VaultLib([("prod", secret)]).encrypt(b"target: labeled\n", vault_id="prod")
-        with (
-            mock.patch.object(C, "DEFAULT_VAULT_ID_MATCH", True),
-            mock.patch.object(cli, "DEFAULT_VAULT_ID_MATCH", True),
-        ):
-            vault = cli._make_vault(PASSWORD)
-            self.assertEqual(vault_decrypt(vault, blob), b"target: labeled\n")
+        labelled = VaultLib([("prod", secret)]).encrypt(FIXTURE.encode("utf-8"), vault_id="prod")
+        self.vault.write_bytes(labelled)
+        strict = {**os.environ, "ANSIBLE_VAULT_ID_MATCH": "True"}
+        refused = subprocess.run(
+            ["ansible-vault", "view", str(self.vault), "--vault-password-file", str(self.password)],
+            capture_output=True,
+            env=strict,
+            check=False,
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        with mock.patch.object(C, "DEFAULT_VAULT_ID_MATCH", True):
+            with self.assertRaises(PilferError):
+                set_keys(self.vault, {"target": SENTINEL}, str(self.password))
+            self.assertEqual(self.vault.read_bytes(), labelled)
+            prod = VaultSources(vault_ids=(f"prod@{self.password}",))
+            self.assertEqual(set_keys(self.vault, {"target": SENTINEL}, prod)["target"], "updated")
+        self.assertTrue(self.vault.read_bytes().startswith(b"$ANSIBLE_VAULT;1.2;AES256;prod\n"))
+        self.assertEqual(self._view(), _expected_target(SENTINEL))
 
 
 if __name__ == "__main__":

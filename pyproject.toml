@@ -13,7 +13,8 @@ readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["PILFER_LICENSE.txt"]
 
-requires-python = ">=3.10"
+# ansible-core 2.21, the oldest core pilfer supports, needs 3.12.
+requires-python = ">=3.12"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
@@ -21,16 +22,18 @@ classifiers = [
     "Intended Audience :: System Administrators",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Security",
     "Topic :: System :: Systems Administration",
     "Topic :: Utilities",
 ]
 dependencies = [
-    "ansible>=2.9.0",
+    # Core only: pilfer imports nothing from the collections in `ansible`.
+    # 2.21 is the floor CI tests: CLI.setup_vault_secrets(initialize_context=)
+    # and VaultHelper are recent. No upper bound; CI also tests the latest core.
+    "ansible-core>=2.21",
 ]
 keywords = [
     "ansible",
