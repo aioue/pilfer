@@ -58,6 +58,7 @@ vault_password_file = ~/.ansible-vault/.vault-file
 ## Features
 
 - **Ansible's password sources** - Loads vault passwords the way `ansible-vault` does: `vault_password_file` and `vault_identity_list` from Ansible's config, `--vault-id`, password scripts and `-client` scripts
+- **System keyring** - `pilfer[keyring]` adds `pilfer-vault-keyring-client`, a vault password client script for the macOS Keychain, Secret Service or Windows Credential Locker
 - **Change detection** - Only re-encrypts files that were actually modified (using SHA256)
 - **Safe operation** - Preserves original encrypted content for unchanged files
 - **Ansible vault** - Calls Ansible's VaultLib. `pip install pilfer` installs ansible-core; a checkout needs it installed
@@ -200,10 +201,10 @@ still present in the file (including in comments).
 
 Pilfer loads vault passwords with Ansible's own code, the same call `ansible-vault decrypt` makes. Sources load in this order: `vault_identity_list` from Ansible's config, `--vault-id`, `-p`, then `vault_password_file` from the config. The config is found as Ansible finds it: `ANSIBLE_CONFIG`, `./ansible.cfg`, `~/.ansible.cfg`, `/etc/ansible/ansible.cfg`, and the `ANSIBLE_VAULT_*` environment variables override it.
 
-An executable password file is run and its output is the password, as in [storing passwords in third-party tools](https://docs.ansible.com/projects/ansible/latest/vault_guide/vault_managing_passwords.html#storing-passwords-in-third-party-tools-with-vault-password-client-scripts). A script named `*-client` (for example `vault-keyring-client.py`) is passed `--vault-id`. Each command runs a script once.
+An executable password file is run and its output is the password, as in [storing passwords in third-party tools](https://docs.ansible.com/projects/ansible/latest/vault_guide/vault_managing_passwords.html#storing-passwords-in-third-party-tools-with-vault-password-client-scripts). A script named `*-client` is passed `--vault-id`. Each command runs a script once.
 
 ```bash
-pilfer open --vault-id dev@~/bin/vault-keyring-client.py --vault-id prod@prompt
+pilfer open --vault-id dev@~/.local/bin/pilfer-vault-keyring-client --vault-id prod@prompt
 ```
 
 `close` and `pilfer set` encrypt each value with the password that decrypted it, under its existing vault-id label, as `ansible-vault edit` does. A tree on several vault ids opens and closes in one session, and `close` needs every password that `open` used.
@@ -211,6 +212,30 @@ pilfer open --vault-id dev@~/bin/vault-keyring-client.py --vault-id prod@prompt
 Ansible loads the config's `vault_password_file` even when `-p` or `--vault-id` is given, so a wrong `-p` does not fail by itself. `open` and `set` warn when a password you passed decrypts none of the files, and `close` refuses it: close never changes a file's password, and `pilfer rekey` does.
 
 When neither the flags nor Ansible's config name a source, pilfer tries `~/.ansible-vault/.vault-file`, `.vault_password`, `vault_password_file`, and finally `../../vault_password_file`.
+
+#### Passwords in the system keyring
+
+`pipx install 'pilfer[keyring]'` adds `pilfer-vault-keyring-client`, a client script that reads the vault password from the system keyring: the macOS Keychain, Secret Service on Linux, or the Windows Credential Locker. Ansible runs it like any client script, so `ansible-playbook` and `ansible-vault` read the same password.
+
+From the project directory, store the password, then point the config at the path `command -v pilfer-vault-keyring-client` prints:
+
+```bash
+pilfer-vault-keyring-client --set
+```
+
+```ini
+[defaults]
+vault_password_file = ~/.local/bin/pilfer-vault-keyring-client
+
+; Optional. The keyring service defaults to "ansible", the account to your login name.
+[vault]
+keyname = myproject
+username = ops
+```
+
+A labelled source reads the service named by its label: `--vault-id prod@~/.local/bin/pilfer-vault-keyring-client` reads `prod`, and `--vault-id prod --set` stores it. An unlabelled source such as `vault_password_file` reads `keyname`. A missing password exits 2, which Ansible reports as "did not find a secret". The macOS login keychain is locked in SSH sessions, so the script fails there.
+
+The script ports [`vault-keyring-client.py`](https://github.com/ansible-community/contrib-scripts/blob/main/vault/vault-keyring-client.py) from ansible-community, which no longer imports on ansible-core 2.21. It also reads `keyname` for an unlabelled source, where the original looked up a service called `default`.
 
 ### Examples
 
@@ -256,7 +281,12 @@ pilfer rekey ... --rotate-password-file
 
 The old password loads like `open`: `--old-vault-password-file` and `--old-vault-id`, plus Ansible's config. The new password comes from the single `--new-vault-password-file` or `--new-vault-id` (`--new-vault-id prompt` asks for it). Values keep their vault-id label unless `--new-vault-id` names one. Rekey refuses a tree encrypted with more than one vault password; use `ansible-vault rekey` per vault id for that. It also refuses `!vault` values in a form pilfer cannot rewrite, such as list items or `|-` blocks, because they would stay on the old password.
 
-`--rotate-password-file` needs one plain password file on each side. It refuses password scripts: Ansible runs those, so the password lives somewhere else, such as a keyring. Change it there instead.
+`--rotate-password-file` needs one plain password file on each side. It refuses password scripts: Ansible runs those, so the password lives somewhere else, such as a keyring. Change it there instead. With `pilfer-vault-keyring-client`, rekey to a typed password while the keyring still holds the old one, then store the new one:
+
+```bash
+pilfer rekey --new-vault-id prompt
+pilfer-vault-keyring-client --set
+```
 
 Refuse to rekey while a pilfer session is open. Nested git checkouts are skipped
 (run `pilfer rekey` from those directories separately). Prefer `--dry-run` first.

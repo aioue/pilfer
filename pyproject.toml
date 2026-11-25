@@ -52,6 +52,12 @@ keywords = [
     "yaml",
 ]
 
+[project.optional-dependencies]
+# pilfer-vault-keyring-client: a vault password client script on the system
+# keyring (macOS Keychain, Secret Service, Windows Credential Locker).
+# 25.x is the current major; the script calls only get_password and set_password.
+keyring = ["keyring>=25"]
+
 [project.urls]
 Homepage = "https://aioue.net/2026/08/07/pilfer-bulk-ansible-vault-edit/"
 Documentation = "https://aioue.net/2026/08/07/pilfer-bulk-ansible-vault-edit/"
@@ -61,6 +67,8 @@ Changelog = "https://github.com/aioue/pilfer/releases"
 
 [project.scripts]
 pilfer = "pilfer.cli:main"
+# Ansible passes --vault-id only to a password script whose name ends in -client.
+pilfer-vault-keyring-client = "pilfer.keyring_client:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

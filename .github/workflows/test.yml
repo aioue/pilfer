@@ -52,7 +52,7 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install "ansible-core${{ matrix.ansible-core }}"
-        pip install -e .     # Install pilfer in development mode
+        pip install -e '.[keyring]'     # Development mode; the extra runs test_keyring_client
         ansible --version
         
     - name: Verify installation
@@ -150,7 +150,7 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install ansible-core coverage
-        pip install -e .
+        pip install -e '.[keyring]'
         
     - name: Run tests with coverage
       run: |
