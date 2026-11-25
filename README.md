@@ -217,11 +217,7 @@ When neither the flags nor Ansible's config name a source, pilfer tries `~/.ansi
 
 `pipx install 'pilfer[keyring]'` adds `pilfer-vault-keyring-client`, a client script that reads the vault password from the system keyring: the macOS Keychain or Secret Service on Linux. Ansible runs it like any client script, so `ansible-playbook` and `ansible-vault` read the same password. An existing pipx install takes it with `pipx inject pilfer keyring`.
 
-From the project directory, store the password, then point the config at the path `command -v pilfer-vault-keyring-client` prints:
-
-```bash
-pilfer-vault-keyring-client --set
-```
+Point the project's `ansible.cfg` at the path `command -v pilfer-vault-keyring-client` prints:
 
 ```ini
 [defaults]
@@ -233,11 +229,17 @@ keyname = myproject
 username = ops
 ```
 
-A labelled source reads the service named by its label: `--vault-id prod@~/.local/bin/pilfer-vault-keyring-client` reads `prod`, and `--vault-id prod --set` stores it. An unlabelled source such as `vault_password_file` reads `keyname`. A missing password exits 2, which Ansible reports as "did not find a secret". `--set` asks before it replaces a stored password.
+Then, from the project directory so it reads the same `[vault]` settings, store the password. It prints the key and user it stores under:
+
+```bash
+pilfer-vault-keyring-client --set
+```
+
+A labelled source reads the service named by its label: `--vault-id prod@~/.local/bin/pilfer-vault-keyring-client` reads `prod`, and `--vault-id prod --set` stores it. An unlabelled source such as `vault_password_file` reads `keyname`, and so does a label equal to the default vault id (`default`, or `vault_identity`). A missing password exits 2, which Ansible reports as "did not find a secret". `--set` asks before it replaces a stored password.
 
 The macOS login keychain is locked in SSH sessions, so the script fails there. Keychain access is granted to the Python interpreter that runs the script: install pilfer in its own pipx venv, because "Always Allow" lets anything that interpreter runs read the password.
 
-The script ports [`vault-keyring-client.py`](https://github.com/ansible-community/contrib-scripts/blob/main/vault/vault-keyring-client.py) from ansible-community, which no longer imports on ansible-core 2.21. It also reads `keyname` for an unlabelled source, where the original looked up a service called `default`.
+The script ports [`vault-keyring-client.py`](https://github.com/ansible-community/contrib-scripts/blob/main/vault/vault-keyring-client.py) from ansible-community, which no longer imports on ansible-core 2.21. It also reads `keyname` for an unlabelled source, where the original looked up a service called `default`: store a password the original saved there again with `--set`.
 
 ### Examples
 
@@ -287,10 +289,10 @@ The old password loads like `open`: `--old-vault-password-file` and `--old-vault
 
 ```bash
 pilfer rekey --new-vault-id prompt
-pilfer-vault-keyring-client --set
+pilfer-vault-keyring-client --set    # answer y to replace the old password
 ```
 
-For a labelled source, name the label on both: `--new-vault-id prod@prompt`, then `--vault-id prod --set`.
+For a labelled source, name the label on both: `--new-vault-id prod@prompt`, then `--vault-id prod --set`. Until `--set` succeeds, the files are on the new password and the keyring holds the old one; run `--set` again if it was interrupted or kept the old password.
 
 Refuse to rekey while a pilfer session is open. Nested git checkouts are skipped
 (run `pilfer rekey` from those directories separately). Prefer `--dry-run` first.

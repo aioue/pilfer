@@ -25,7 +25,6 @@ import sys
 import ansible.constants as C
 from ansible.errors import AnsibleError
 from ansible.module_utils.common.text.converters import to_bytes, to_text
-from ansible.parsing.vault import PromptVaultSecret
 
 PROG = "pilfer-vault-keyring-client"
 # ansible.parsing.vault.ClientScriptVaultSecret.VAULT_ID_UNKNOWN_RC: Ansible
@@ -46,15 +45,15 @@ _VAULT_OPTIONS = {
 
 def vault_settings() -> tuple[str | None, str | None]:
     """(keyname, username) from [vault] in the ansible.cfg Ansible loaded, or None each."""
-    plugin_type, plugin_name = _OPTIONS_OWNER
-    C.config.initialize_plugin_configuration_definitions(plugin_type, plugin_name, _VAULT_OPTIONS)
+    C.config.initialize_plugin_configuration_definitions(*_OPTIONS_OWNER, _VAULT_OPTIONS)
+    options = C.config.get_plugin_options(*_OPTIONS_OWNER)
+    # str(): a plain string, not Ansible's tagged str subclass.
+    return tuple(str(options[name]) if options[name] else None for name in ("keyname", "username"))
 
-    def option(name: str) -> str | None:
-        value = C.config.get_config_value(name, plugin_type=plugin_type, plugin_name=plugin_name)
-        # str(): a plain string, not Ansible's tagged str subclass.
-        return str(value) if value else None
 
-    return option("keyname"), option("username")
+def _printable(text) -> str:
+    """text with control characters escaped: names and paths come from ansible.cfg and its directory."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in str(text))
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -70,8 +69,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Get an Ansible vault password from the system keyring (an Ansible vault password client script).",
         epilog=(
             "The keyring service is the vault id, else [vault] keyname in ansible.cfg, else 'ansible'. "
-            "The id Ansible gives an unlabelled password file ('default', or the vault_identity setting) "
-            "also uses keyname."
+            "The id Ansible gives an unlabelled password file, the configured default vault id "
+            "('default' unless vault_identity is set), also uses keyname."
         ),
     )
     parser.add_argument(
@@ -92,23 +91,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _store(keyring, keyname: str, username: str, where: str) -> int:
-    sys.stdout.write(
-        f"Storing password in the keyring as {where} (config: {C.CONFIG_FILE or 'none'})\n"
-    )
+    # Here, not at the top: Display() runs on import, and the lookup that
+    # writes the password to stdout has no use for it.
+    from ansible.parsing.vault import PromptVaultSecret
+
+    config = _printable(C.CONFIG_FILE or "none")
     # Not in the original. Replacing the entry loses the password files may
     # still be encrypted with: `pilfer rekey` first, then --set.
     if keyring.get_password(keyname, username) is not None:
         try:
-            answer = input("A password is already stored there. Replace it? [y/N] ")
+            answer = input(
+                f"A password is already stored as {where} (config: {config}). Replace it? [y/N] "
+            )
         except EOFError:
             answer = ""
         if answer.strip().lower() not in ("y", "yes"):
             sys.stderr.write(f"{PROG}: kept the stored password\n")
             return 1
-    # Ansible's own prompt, as `ansible-vault --ask-vault-pass` asks: refuses an
-    # empty password, strips whitespace, confirms, and turns ctrl-d into an error.
+    else:
+        sys.stdout.write(f"Storing a password as {where} (config: {config})\n")
+    # Ansible's own prompt, as `ansible-vault --ask-vault-pass` asks: strips
+    # whitespace, confirms, and turns ctrl-d into an error.
     secret = PromptVaultSecret(
-        vault_id=keyname,
+        vault_id=_printable(keyname),
         prompt_formats=[
             "New vault password (%(vault_id)s): ",
             "Confirm new vault password (%(vault_id)s): ",
@@ -117,9 +122,20 @@ def _store(keyring, keyname: str, username: str, where: str) -> int:
     try:
         secret.load()
     except AnsibleError as exc:
-        sys.stderr.write(f"{PROG}: {exc}\n")
+        sys.stderr.write(f"{PROG}: {_printable(exc)}\n")
         return 1
-    keyring.set_password(keyname, username, to_text(secret.bytes, errors="strict"))
+    # PromptVaultSecret refuses an empty answer before it strips, so spaces
+    # alone would store "" over the old password.
+    if not secret.bytes:
+        sys.stderr.write(f"{PROG}: refusing an empty password; kept what was stored\n")
+        return 1
+    password = to_text(secret.bytes, errors="strict")
+    keyring.set_password(keyname, username, password)
+    # Read it back: a backend can drop writes (keyring's null backend does).
+    if keyring.get_password(keyname, username) != password:
+        backend = _printable(keyring.get_keyring().name)
+        sys.stderr.write(f"{PROG}: the keyring backend {backend!r} did not keep the password\n")
+        return 1
     return 0
 
 
@@ -152,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         secret = keyring.get_password(keyname, username)
     except KeyringError as exc:
         # Not in the original, which let a traceback through.
-        sys.stderr.write(f"{PROG}: keyring error for {where}: {exc}\n")
+        sys.stderr.write(f"{PROG}: keyring error for {where}: {_printable(exc)}\n")
         return 1
     except KeyboardInterrupt:
         sys.stderr.write(f"{PROG}: interrupted\n")
