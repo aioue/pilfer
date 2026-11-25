@@ -31,7 +31,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install ansible-core
-          # The keyring extra: without it test_keyring_client skips.
+          # The keyring extra: test_keyring_client fails under CI without it.
           pip install 'keyring>=25'
           pip install -r requirements-dev.txt
 

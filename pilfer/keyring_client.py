@@ -1,6 +1,7 @@
 """Vault password client script that reads the password from the system keyring.
 
-Installed as ``pilfer-vault-keyring-client`` by ``pip install 'pilfer[keyring]'``.
+Installed with pilfer as ``pilfer-vault-keyring-client``; it needs the keyring
+extra, ``pip install 'pilfer[keyring]'``.
 Ansible runs an executable named ``*-client`` as a vault password client script,
 passing ``--vault-id NAME`` when the source has an id, and uses its stdout as the
 password. ansible-vault, ansible-playbook and pilfer all load it that way.
@@ -60,7 +61,7 @@ class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         # argparse exits 2, which Ansible would report as "did not find a secret".
         self.print_usage(sys.stderr)
-        self.exit(1, f"{self.prog}: error: {message}\n")
+        self.exit(1, f"{self.prog}: error: {_printable(message)}\n")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -85,7 +86,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         dest="set_password",
-        help="set the password instead of getting it",
+        help="set the password instead of getting it; asks before replacing a stored one",
     )
     return parser
 
@@ -101,7 +102,9 @@ def _store(keyring, keyname: str, username: str, where: str) -> int:
     if keyring.get_password(keyname, username) is not None:
         try:
             answer = input(
-                f"A password is already stored as {where} (config: {config}). Replace it? [y/N] "
+                f"A password is already stored as {where} (config: {config}). "
+                "Files still encrypted with it will not open after this (pilfer rekey first). "
+                "Replace it? [y/N] "
             )
         except EOFError:
             answer = ""
@@ -124,17 +127,34 @@ def _store(keyring, keyname: str, username: str, where: str) -> int:
     except AnsibleError as exc:
         sys.stderr.write(f"{PROG}: {_printable(exc)}\n")
         return 1
-    # PromptVaultSecret refuses an empty answer before it strips, so spaces
-    # alone would store "" over the old password.
+    # Not in the original. PromptVaultSecret refuses an empty answer before it
+    # strips, so spaces alone would store "" over the old password.
     if not secret.bytes:
-        sys.stderr.write(f"{PROG}: refusing an empty password; kept what was stored\n")
+        sys.stderr.write(f"{PROG}: refusing an empty password\n")
         return 1
     password = to_text(secret.bytes, errors="strict")
-    keyring.set_password(keyname, username, password)
-    # Read it back: a backend can drop writes (keyring's null backend does).
-    if keyring.get_password(keyname, username) != password:
-        backend = _printable(keyring.get_keyring().name)
-        sys.stderr.write(f"{PROG}: the keyring backend {backend!r} did not keep the password\n")
+    # Not in the original: confirm the write. A backend can drop it (keyring's
+    # null backend does), and macOS replaces by delete then add, so a failure
+    # from here on may already have removed the old password.
+    from keyring.errors import KeyringError
+
+    try:
+        keyring.set_password(keyname, username, password)
+        stored = keyring.get_password(keyname, username)
+        problem = (
+            None
+            if stored == password
+            else "nothing is stored"
+            if stored is None
+            else "a different value is stored"
+        )
+    except (KeyringError, KeyboardInterrupt) as exc:
+        problem = _printable(exc) or type(exc).__name__
+    if problem:
+        sys.stderr.write(
+            f"{PROG}: could not confirm the new password for {where} ({problem}); the old one may be gone. "
+            "Check with a lookup (no --set) and run --set again\n"
+        )
         return 1
     return 0
 

@@ -58,7 +58,7 @@ vault_password_file = ~/.ansible-vault/.vault-file
 ## Features
 
 - **Ansible's password sources** - Loads vault passwords the way `ansible-vault` does: `vault_password_file` and `vault_identity_list` from Ansible's config, `--vault-id`, password scripts and `-client` scripts
-- **System keyring** - `pilfer[keyring]` adds `pilfer-vault-keyring-client`, a vault password client script for the macOS Keychain or Secret Service
+- **System keyring** - `pilfer-vault-keyring-client`, a vault password client script for the macOS Keychain or Secret Service; needs the `pilfer[keyring]` extra
 - **Change detection** - Only re-encrypts files that were actually modified (using SHA256)
 - **Safe operation** - Preserves original encrypted content for unchanged files
 - **Ansible vault** - Calls Ansible's VaultLib. `pip install pilfer` installs ansible-core; a checkout needs it installed
@@ -215,7 +215,7 @@ When neither the flags nor Ansible's config name a source, pilfer tries `~/.ansi
 
 #### Passwords in the system keyring
 
-`pipx install 'pilfer[keyring]'` adds `pilfer-vault-keyring-client`, a client script that reads the vault password from the system keyring: the macOS Keychain or Secret Service on Linux. Ansible runs it like any client script, so `ansible-playbook` and `ansible-vault` read the same password. An existing pipx install takes it with `pipx inject pilfer keyring`.
+`pilfer-vault-keyring-client`, installed with pilfer, is a client script that reads the vault password from the system keyring: the macOS Keychain or Secret Service on Linux. Ansible runs it like any client script, so `ansible-playbook` and `ansible-vault` read the same password. It needs the keyring extra: `pipx install 'pilfer[keyring]'`, or `pipx inject pilfer keyring` for an existing install.
 
 Point the project's `ansible.cfg` at the path `command -v pilfer-vault-keyring-client` prints:
 
@@ -237,7 +237,7 @@ pilfer-vault-keyring-client --set
 
 A labelled source reads the service named by its label: `--vault-id prod@~/.local/bin/pilfer-vault-keyring-client` reads `prod`, and `--vault-id prod --set` stores it. An unlabelled source such as `vault_password_file` reads `keyname`, and so does a label equal to the default vault id (`default`, or `vault_identity`). A missing password exits 2, which Ansible reports as "did not find a secret". `--set` asks before it replaces a stored password.
 
-The macOS login keychain is locked in SSH sessions, so the script fails there. Keychain access is granted to the Python interpreter that runs the script: install pilfer in its own pipx venv, because "Always Allow" lets anything that interpreter runs read the password.
+The macOS login keychain is locked in SSH sessions, so the script fails there. macOS grants keychain access to the Python interpreter, and a venv runs its base interpreter, so "Always Allow" lets every script that Python build runs read the password; answer "Allow" each time instead. Secret Service has no per-program access: any program in your session can read the entry.
 
 The script ports [`vault-keyring-client.py`](https://github.com/ansible-community/contrib-scripts/blob/main/vault/vault-keyring-client.py) from ansible-community, which no longer imports on ansible-core 2.21. It also reads `keyname` for an unlabelled source, where the original looked up a service called `default`: store a password the original saved there again with `--set`.
 

@@ -4,7 +4,8 @@ The keyring is _file_keyring.FileKeyring, a JSON file per test, or keyring's
 own fail and null backends, selected with PYTHON_KEYRING_BACKEND (or patched
 in-process), so nothing here reads or writes the real keychain. Lookups run
 the client the way Ansible does, as an executable named *-client in its own
-process; --set calls main() in-process to feed the prompts.
+process. --set mostly runs main() in-process to feed the prompts; tests that
+need the real process pipe the answers to run_client(input=...).
 """
 
 import builtins
@@ -28,15 +29,16 @@ from test_vault_sources import ProjectTest, only
 
 try:
     import keyring
-except ImportError:  # keyring is the optional pilfer[keyring] extra
+except ImportError as exc:  # keyring is the optional pilfer[keyring] extra
     # Every CI job installs it; a skip there would hide this module's tests.
     if os.environ.get("CI"):
-        raise
+        raise ImportError("CI needs the keyring extra: pip install -e '.[keyring]'") from exc
     keyring = None
 else:
     # Outside the guard: a broken test backend must fail, not skip.
     import keyring.backends.fail
     import keyring.backends.null
+    import keyring.errors
     from _file_keyring import FileKeyring
 
 REPO = Path(__file__).resolve().parents[1]
@@ -260,16 +262,22 @@ class TestSet(KeyringTest):
             self.assertIn("kept", err)
             self.assertEqual(self.stored(), {f"ansible/{USER}": "old"})
 
+    def assert_one_line_error(self, err: str) -> None:
+        # The text after the prefix is ansible-core's (PromptVaultSecret), and
+        # its wording is not pilfer's to pin across core versions.
+        self.assertTrue(err.startswith(f"{CLIENT_NAME}: "), err)
+        self.assertEqual(len(err.strip().splitlines()), 1, err)
+
     def test_set_refuses_a_mismatch(self):
         code, _, err = self.set_in_process(typed=("pw", "typo"))
         self.assertEqual(code, 1)
-        self.assertIn("do not match", err)
+        self.assert_one_line_error(err)
         self.assertEqual(self.stored(), {})
 
     def test_set_refuses_an_empty_password(self):
         code, _, err = self.set_in_process(typed=("", ""))
         self.assertEqual(code, 1)
-        self.assertIn("Invalid vault password", err)
+        self.assert_one_line_error(err)
         self.assertEqual(self.stored(), {})
 
     def test_set_refuses_spaces_only_and_keeps_the_old_password(self):
@@ -282,8 +290,19 @@ class TestSet(KeyringTest):
     def test_set_ctrl_d_is_an_error_not_a_traceback(self):
         code, _, err = self.set_in_process(typed=(EOFError(),))
         self.assertEqual(code, 1)
-        self.assertIn("EOFError", err)
+        self.assert_one_line_error(err)
         self.assertEqual(self.stored(), {})
+
+    def test_set_ctrl_c_exits_130_and_stores_nothing(self):
+        for where in ("replace", "prompt"):
+            self.store("ansible", "old")
+            if where == "replace":
+                code, _, err = self.set_in_process(replace=KeyboardInterrupt())
+            else:
+                code, _, err = self.set_in_process(typed=(KeyboardInterrupt(),), replace="y")
+            self.assertEqual(code, 130, where)
+            self.assertIn("interrupted", err)
+            self.assertEqual(self.stored(), {f"ansible/{USER}": "old"})
 
     def test_set_without_a_usable_backend(self):
         code, _, err = self.set_in_process(backend=keyring.backends.fail.Keyring())
@@ -293,7 +312,29 @@ class TestSet(KeyringTest):
     def test_set_fails_when_the_backend_drops_the_write(self):
         code, _, err = self.set_in_process(backend=keyring.backends.null.Keyring())
         self.assertEqual(code, 1)
-        self.assertIn("did not keep the password", err)
+        self.assertIn("could not confirm the new password", err)
+        self.assertIn("nothing is stored", err)
+
+    def test_set_says_the_old_password_may_be_gone_when_the_read_back_fails(self):
+        # macOS replaces by delete then add: past the write, the old one may be gone.
+        class LocksAfterWrite(FileKeyring):
+            written = False
+
+            def set_password(self, service, username, password):
+                super().set_password(service, username, password)
+                self.written = True
+
+            def get_password(self, service, username):
+                if self.written:
+                    raise keyring.errors.KeyringLocked("locked after the write")
+                return super().get_password(service, username)
+
+        self.store("ansible", "old")
+        code, _, err = self.set_in_process(replace="y", backend=LocksAfterWrite())
+        self.assertEqual(code, 1)
+        self.assertIn("the old one may be gone", err)
+        self.assertIn("locked after the write", err)
+        self.assertEqual(self.stored(), {f"ansible/{USER}": "pw"})
 
 
 class TestThroughAnsible(KeyringTest):
