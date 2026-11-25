@@ -1,11 +1,9 @@
 """Vault password client script that reads the password from the system keyring.
 
 Installed as ``pilfer-vault-keyring-client`` by ``pip install 'pilfer[keyring]'``.
-Ansible treats an executable named ``*-client`` as a vault password client
-script: it runs it with ``--vault-id NAME`` and reads the password from stdout.
-ansible-vault, ansible-playbook and pilfer all load it the same way, from
-``vault_password_file``, ``vault_identity_list``, ``--vault-id label@PATH`` or
-``--vault-password-file PATH``.
+Ansible runs an executable named ``*-client`` as a vault password client script,
+passing ``--vault-id NAME`` when the source has an id, and uses its stdout as the
+password. ansible-vault, ansible-playbook and pilfer all load it that way.
 
 Ported from vault-keyring-client.py in ansible-community/contrib-scripts
 (GPL-3.0-or-later):
@@ -13,69 +11,67 @@ Ported from vault-keyring-client.py in ansible-community/contrib-scripts
     (c) 2014, Matt Martz <matt@sivel.net>
     (c) 2016, Justin Mayer <https://justinmayer.com/>
 
-It keeps that script's interface: the keyring service is the vault id, or the
-``keyname`` option in ansible.cfg's ``[vault]`` section, or ``ansible``; the
-account is ``--username``, ``[vault] username``, or the login name; ``--set``
-stores a password; exit code 2 means no password is stored, which Ansible
-reports as "did not find a secret for vault-id". Changes from the original:
-
-- It reads ``[vault]`` from ``ansible.constants.CONFIG_FILE`` with configparser.
-  The original imports ``get_ini_config_value`` from ansible.config.manager,
-  which ansible-core 2.21 no longer has (it became the private
-  ``ConfigManager._get_ini_config_value``), so it fails to import.
-- ``--vault-id default`` uses ``keyname``. Ansible always passes ``--vault-id``,
-  and a password file with no label gets the id ``default``, so with
-  ``vault_password_file = .../pilfer-vault-keyring-client`` the original
-  looked up a service called ``default`` and ignored ``keyname``.
-- Values in ``[vault]`` are unquoted as Ansible unquotes its own ini settings,
-  so ``username = 'ansible-vault'`` (the original's own example) means
-  ``ansible-vault``, not ``'ansible-vault'`` with the quotes.
-- A keyring error (a locked keychain, no usable backend) exits 1 with one line
-  on stderr instead of a traceback, and ``--set`` refuses an empty password,
-  which Ansible would refuse to use.
+Same interface: the keyring service is the vault id, else ``keyname`` in
+ansible.cfg's ``[vault]`` section, else ``ansible``; the account is
+``--username``, else ``[vault] username``, else the login name; ``--set`` stores
+a password; exit code 2 means none is stored. Where this differs from the
+original, the comment at that line says why.
 """
 
 import argparse
-import configparser
 import getpass
 import sys
 
-from ansible.parsing.quoting import unquote
+import ansible.constants as C
+from ansible.errors import AnsibleError
+from ansible.module_utils.common.text.converters import to_bytes, to_text
+from ansible.parsing.vault import PromptVaultSecret
 
+PROG = "pilfer-vault-keyring-client"
 # ansible.parsing.vault.ClientScriptVaultSecret.VAULT_ID_UNKNOWN_RC: Ansible
 # reports this exit code as "did not find a secret for vault-id=...".
 KEYNAME_UNKNOWN_RC = 2
 DEFAULT_KEYNAME = "ansible"
-# ansible.constants.DEFAULT_VAULT_IDENTITY, the id Ansible gives a password
-# file or script that has no label. Not a keyring service name.
-UNLABELLED_VAULT_ID = "default"
+
+# The [vault] options, declared to Ansible's ConfigManager as a plugin declares
+# its options, so the file Ansible loaded is read with Ansible's own parsing:
+# encoding, quotes, inline comments. The original imported
+# ansible.config.manager.get_ini_config_value, which ansible-core 2.21 removed.
+_OPTIONS_OWNER = ("vault", "pilfer_keyring_client")
+_VAULT_OPTIONS = {
+    name: {"type": "str", "default": None, "ini": [{"section": "vault", "key": name}]}
+    for name in ("keyname", "username")
+}
 
 
-def vault_settings(config_file: str | None) -> tuple[str | None, str | None]:
-    """(keyname, username) from the [vault] section of an ansible.cfg, or None each."""
-    if not config_file:
-        return None, None
-    # Parsed as ansible.config.manager parses it, so a file Ansible already
-    # loaded parses here too.
-    parser = configparser.ConfigParser(inline_comment_prefixes=(";",))
-    parser.read(config_file, encoding="utf-8")
+def vault_settings() -> tuple[str | None, str | None]:
+    """(keyname, username) from [vault] in the ansible.cfg Ansible loaded, or None each."""
+    plugin_type, plugin_name = _OPTIONS_OWNER
+    C.config.initialize_plugin_configuration_definitions(plugin_type, plugin_name, _VAULT_OPTIONS)
 
-    def option(key: str) -> str | None:
-        value = parser.get("vault", key, raw=True, fallback=None)
-        if value is None:
-            return None
-        return unquote(value.strip()) or None
+    def option(name: str) -> str | None:
+        value = C.config.get_config_value(name, plugin_type=plugin_type, plugin_name=plugin_name)
+        # str(): a plain string, not Ansible's tagged str subclass.
+        return str(value) if value else None
 
     return option("keyname"), option("username")
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse exits 2, which Ansible would report as "did not find a secret".
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="pilfer-vault-keyring-client",
+    parser = _ArgumentParser(
+        prog=PROG,
         description="Get an Ansible vault password from the system keyring (an Ansible vault password client script).",
         epilog=(
             "The keyring service is the vault id, else [vault] keyname in ansible.cfg, else 'ansible'. "
-            "Ansible passes --vault-id default for an unlabelled password file; that also uses keyname."
+            "The id Ansible gives an unlabelled password file ('default', or the vault_identity setting) "
+            "also uses keyname."
         ),
     )
     parser.add_argument(
@@ -95,64 +91,83 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _config_file() -> str | None:
-    # The config file Ansible itself would load: ANSIBLE_CONFIG, ./ansible.cfg,
-    # ~/.ansible.cfg, /etc/ansible/ansible.cfg. Ansible runs this script in its
-    # own working directory and environment, so it finds the same file.
-    import ansible.constants as C
-
-    return C.CONFIG_FILE
+def _store(keyring, keyname: str, username: str, where: str) -> int:
+    sys.stdout.write(
+        f"Storing password in the keyring as {where} (config: {C.CONFIG_FILE or 'none'})\n"
+    )
+    # Not in the original. Replacing the entry loses the password files may
+    # still be encrypted with: `pilfer rekey` first, then --set.
+    if keyring.get_password(keyname, username) is not None:
+        try:
+            answer = input("A password is already stored there. Replace it? [y/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            sys.stderr.write(f"{PROG}: kept the stored password\n")
+            return 1
+    # Ansible's own prompt, as `ansible-vault --ask-vault-pass` asks: refuses an
+    # empty password, strips whitespace, confirms, and turns ctrl-d into an error.
+    secret = PromptVaultSecret(
+        vault_id=keyname,
+        prompt_formats=[
+            "New vault password (%(vault_id)s): ",
+            "Confirm new vault password (%(vault_id)s): ",
+        ],
+    )
+    try:
+        secret.load()
+    except AnsibleError as exc:
+        sys.stderr.write(f"{PROG}: {exc}\n")
+        return 1
+    keyring.set_password(keyname, username, to_text(secret.bytes, errors="strict"))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
+        # Imported here: keyring is the optional extra, and --help and this hint
+        # must work without it.
         import keyring
         from keyring.errors import KeyringError
     except ImportError:
         sys.stderr.write(
-            "pilfer-vault-keyring-client needs the keyring package: pip install 'pilfer[keyring]'\n"
+            f"{PROG} needs the keyring package: pip install 'pilfer[keyring]' (or: pipx inject pilfer keyring)\n"
         )
         return 1
 
-    config_keyname, config_username = vault_settings(_config_file())
+    config_keyname, config_username = vault_settings()
     username = args.username or config_username or getpass.getuser()
-    vault_id = args.vault_id if args.vault_id != UNLABELLED_VAULT_ID else None
+    # An unlabelled vault_password_file gets Ansible's own id,
+    # C.DEFAULT_VAULT_IDENTITY ("default" unless vault_identity is set). The
+    # original looked that up as a service name and ignored keyname.
+    vault_id = None if args.vault_id == C.DEFAULT_VAULT_IDENTITY else args.vault_id
     keyname = vault_id or config_keyname or DEFAULT_KEYNAME
+    # repr: the names come from ansible.cfg and must not inject terminal codes.
+    where = f"key={keyname!r} user={username!r}"
 
     try:
         if args.set_password:
-            sys.stdout.write(
-                f'Storing password in "{username}" user keyring using key name: {keyname}\n'
-            )
-            password = getpass.getpass()
-            confirm = getpass.getpass("Confirm password: ")
-            if password != confirm:
-                sys.stderr.write("Passwords do not match\n")
-                return 1
-            if not password:
-                sys.stderr.write(
-                    "Refusing an empty password: Ansible rejects an empty vault password\n"
-                )
-                return 1
-            keyring.set_password(keyname, username, password)
-            return 0
-
+            return _store(keyring, keyname, username, where)
         secret = keyring.get_password(keyname, username)
     except KeyringError as exc:
-        sys.stderr.write(
-            f"pilfer-vault-keyring-client: keyring error for key={keyname!r} user={username!r}: {exc}\n"
-        )
+        # Not in the original, which let a traceback through.
+        sys.stderr.write(f"{PROG}: keyring error for {where}: {exc}\n")
         return 1
+    except KeyboardInterrupt:
+        sys.stderr.write(f"{PROG}: interrupted\n")
+        return 130
 
     if secret is None:
         sys.stderr.write(
-            f'pilfer-vault-keyring-client could not find key="{keyname}" for user="{username}" '
-            f'via backend="{keyring.get_keyring().name}"\n'
+            f"{PROG} could not find {where} via backend={keyring.get_keyring().name!r}\n"
         )
         return KEYNAME_UNKNOWN_RC
 
-    sys.stdout.write(f"{secret}\n")
+    # Ansible reads bytes. UTF-8 whatever stdout's encoding, as a password file
+    # or Ansible's prompt would give.
+    sys.stdout.buffer.write(to_bytes(secret, errors="strict") + b"\n")
+    sys.stdout.flush()
     return 0
 
 

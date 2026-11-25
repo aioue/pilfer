@@ -3,6 +3,8 @@
 Selected with PYTHON_KEYRING_BACKEND=_file_keyring.FileKeyring (tests/ on
 PYTHONPATH) and PILFER_TEST_KEYRING=<path>. A file rather than memory because
 the client script under test runs in its own process, started by Ansible.
+keyring ships no file backend (keyrings.alt has one, but is another
+dependency); its fail and null backends cover the error paths.
 """
 
 import json
@@ -10,9 +12,7 @@ import os
 from pathlib import Path
 
 from keyring.backend import KeyringBackend
-from keyring.errors import KeyringLocked, PasswordDeleteError
-
-LOCKED = "locked"
+from keyring.errors import PasswordDeleteError
 
 
 class FileKeyring(KeyringBackend):
@@ -23,13 +23,7 @@ class FileKeyring(KeyringBackend):
         return Path(os.environ["PILFER_TEST_KEYRING"])
 
     def _load(self) -> dict:
-        if not self._path.exists():
-            return {}
-        data = json.loads(self._path.read_text())
-        # A keyring the test marked locked, as the macOS login keychain is in an SSH session.
-        if data.get(LOCKED):
-            raise KeyringLocked("test keyring is locked")
-        return data
+        return json.loads(self._path.read_text()) if self._path.exists() else {}
 
     def get_password(self, service, username):
         return self._load().get(f"{service}/{username}")
