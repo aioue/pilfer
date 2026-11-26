@@ -1057,6 +1057,29 @@ class TestReviewFollowups(VaultSetBase):
         self.assertEqual(old.read_text(encoding="utf-8").strip(), "old-secret")
         self.assertFalse((self.directory / "old-pass_old").exists())
 
+    def test_password_rotate_interrupted_after_the_replace_keeps_the_backup(self) -> None:
+        # ctrl-c in write_atomic's directory fsync arrives after os.replace: the
+        # live file already holds the new password, so the backup is the only
+        # copy of the old one.
+        from pilfer import cli, publish
+
+        old = self._password_file("old-pass", "old-secret")
+        new = self._password_file("new-pass", "new-secret")
+        real_fsync = publish._fsync_directory
+
+        def interrupt(directory):
+            real_fsync(directory)
+            raise KeyboardInterrupt
+
+        with (
+            mock.patch.object(publish, "_fsync_directory", side_effect=interrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            cli._rotate_password_file(str(old), str(new))
+        self.assertEqual(old.read_text(encoding="utf-8").strip(), "new-secret")
+        backup = self.directory / "old-pass_old"
+        self.assertEqual(backup.read_text(encoding="utf-8").strip(), "old-secret")
+
     def test_strict_vault_id_match_follows_ansible(self) -> None:
         # vault_id_match = True: a prod file needs a prod secret. pilfer used to
         # register a -p password under every label; now it does what Ansible does.

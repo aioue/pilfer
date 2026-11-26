@@ -60,7 +60,6 @@ from pilfer.vault_secrets import (
     is_plain_password_file,
     load_new_secret,
     load_vault,
-    password_file_paths,
     password_file_secret,
     secret_for,
     single_secret_vault,
@@ -1344,6 +1343,15 @@ def _rekey_inline_file(path: str, old_vault: VaultLib, new: NewSecret) -> int:
     return len(replacements)
 
 
+def _stat_or_none(path: str | None) -> os.stat_result | None:
+    if path is None:
+        return None
+    try:
+        return os.stat(path)
+    except OSError:
+        return None
+
+
 def _rotation_paths(old: VaultSources, new: VaultSources) -> tuple[str, str]:
     """The two password files --rotate-password-file swaps, or a refusal.
 
@@ -1369,7 +1377,9 @@ def _rotation_paths(old: VaultSources, new: VaultSources) -> tuple[str, str]:
             )
     _check_rotation_targets(old_path, new_path)
     for path, which in ((old_path, "old"), (new_path, "new")):
-        if is_encrypted(_read_no_follow(path, f"{which} password file")):
+        # Core strips the file before it looks for the header (a leading blank
+        # line is still a vault), so the test strips it too.
+        if is_encrypted(_read_no_follow(path, f"{which} password file").strip()):
             raise PilferError(
                 f"--rotate-password-file refused: the {which} password file is vault-encrypted. "
                 "Rotation copies password files, so both must be plain text."
@@ -1397,10 +1407,6 @@ def _check_rotation_targets(old_path: str, new_path: str) -> None:
         raise PilferError(f"cannot write the password backup: {directory} is not writable")
 
 
-# True once rekey has started rewriting files, so ctrl-c can say a re-run resumes.
-_rekey_writing = False
-
-
 def rekey_vault_files(
     old_password_file,
     new_password_file,
@@ -1420,8 +1426,6 @@ def rekey_vault_files(
     Resumable: files already decryptable with the new password are skipped.
     Returns number of files rewritten (0 on dry-run / already complete).
     """
-    global _rekey_writing
-    _rekey_writing = False
     old_sources = VaultSources.of(old_password_file)
     new_sources = VaultSources.of(new_password_file)
     # A leftover temp from a killed open can hold plaintext with markers, which
@@ -1472,13 +1476,17 @@ def rekey_vault_files(
 
     # A password file that is itself a target would be re-keyed under the
     # password it holds: the new password would then exist only encrypted with
-    # itself.
-    target_paths = {os.path.realpath(entry["path"]) for entry in targets}
-    for which, sources in (("old", old_sources), ("new", new_sources)):
-        if any(os.path.realpath(path) in target_paths for path in password_file_paths(sources)):
-            raise PilferError(
-                f"the {which} password file is a vault in this tree; move it out first."
-            )
+    # itself. The files are the ones that loaded (so ansible.cfg's count), and
+    # are compared by device and inode: "~", "$VAR" and a different-case
+    # spelling on a case-insensitive disk all name the same file.
+    target_stats = [st for st in (_stat_or_none(entry["path"]) for entry in targets) if st]
+    for which, secrets in (("old", [sec for _id, sec in old_secrets]), ("new", [new_secret])):
+        for secret in secrets:
+            info = _stat_or_none(getattr(secret, "filename", None))
+            if info and any(os.path.samestat(info, target) for target in target_stats):
+                raise PilferError(
+                    f"the {which} password file is a vault in this tree; move it out first."
+                )
 
     cwd = Path.cwd().resolve()
 
@@ -1544,7 +1552,6 @@ def rekey_vault_files(
         print("ℹ️  All targets already decrypt with the new password; nothing to rewrite.")
         if rotate_password_file:
             _confirm_rekey(yes, action="rotate the vault password file")
-            _rekey_writing = True
             _rotate_password_file(old_path, new_path)
             _log_vault_password_file_rotated()
         return 0
@@ -1554,7 +1561,6 @@ def rekey_vault_files(
         action += " and rotate the vault password file"
     _confirm_rekey(yes, action=action)
 
-    _rekey_writing = True
     succeeded = []
     failed = []
     for path, kind, _n, status in plan:
@@ -1615,7 +1621,6 @@ def _rotate_password_file(old_path: str, new_path: str) -> None:
     old_contents = _read_no_follow(old_path, "old password file")
     # O_EXCL so a dangling symlink at the backup path is not created through.
     backup_fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    installed = False
     try:
         with os.fdopen(backup_fd, "wb") as handle:
             handle.write(old_contents)
@@ -1624,9 +1629,8 @@ def _rotate_password_file(old_path: str, new_path: str) -> None:
         # Replace, never rename the live file away first: that left Ansible
         # with no password file if the process was cancelled in between.
         write_atomic(old_path, new_contents)
-        installed = True
     finally:
-        if not installed:
+        if _still_holds(old_path, old_contents):
             # The live file still holds the old password; the backup is a spare
             # copy. Not _remove_file: its warning would print a password-file
             # path, which CodeQL reports as logging sensitive data.
@@ -1634,6 +1638,20 @@ def _rotate_password_file(old_path: str, new_path: str) -> None:
                 os.remove(backup)
             except OSError:
                 pass
+
+
+def _still_holds(path: str, contents: bytes) -> bool:
+    """True only when path is readable and holds contents.
+
+    Decided by content, not by whether write_atomic returned: ctrl-c in its
+    directory fsync arrives after os.replace, with the new password already
+    live and the backup the only copy of the old one. A read error keeps the
+    backup too.
+    """
+    try:
+        return _read_no_follow(path, "password file") == contents
+    except PilferError:
+        return False
 
 
 def _read_no_follow(path: str, what: str) -> bytes:
@@ -1955,11 +1973,15 @@ def _build_argument_parser():
 
 
 def _interrupted_hint(action: str) -> str:
-    """What to do after ctrl-c, for the command that was running."""
+    """What to do after ctrl-c, for the command that was running.
+
+    Static per command: rekey may or may not have started writing, and a
+    re-run is safe either way (files already on the new password are skipped).
+    """
     if action in ("open", "close") and _session_is_open():
-        return " Plaintext may remain: run 'pilfer close'."
-    if action == "rekey" and _rekey_writing:
-        return " Re-run the same rekey to finish (it resumes)."
+        return " A session is still open: run 'pilfer close' to finish."
+    if action == "rekey":
+        return " If rekey had started writing, re-run the same command to resume."
     return ""
 
 

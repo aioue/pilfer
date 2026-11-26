@@ -555,8 +555,35 @@ class TestSessionSafety(ProjectDirTest):
         ):
             result = pilfer_cli.main(["open", "-p", "vault_pass"])
         self.assertEqual(result, 130)
-        self.assertIn("Plaintext may remain: run 'pilfer close'", stderr.getvalue())
+        self.assertIn("pilfer close", stderr.getvalue())
         self.assertEqual(self._run("close").returncode, 0)
+
+    def test_ctrl_c_during_a_rekey_write_says_to_re_run(self):
+        stderr = io.StringIO()
+        with open("new_pass", "w") as f:
+            f.write("new_password\n")
+        real = pilfer_cli._rekey_whole_file
+
+        def interrupt(*args, **kwargs):
+            real(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        with (
+            mock.patch.object(pilfer_cli, "_rekey_whole_file", side_effect=interrupt),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = pilfer_cli.main(
+                [
+                    "rekey",
+                    "--old-vault-password-file",
+                    "vault_pass",
+                    "--new-vault-password-file",
+                    "new_pass",
+                    "--yes",
+                ]
+            )
+        self.assertEqual(result, 130)
+        self.assertIn("re-run", stderr.getvalue())
 
     def test_close_after_an_interrupted_multi_file_open(self):
         # open lists every target first. ctrl-c part way leaves entries it never

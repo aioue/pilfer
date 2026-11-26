@@ -21,6 +21,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -436,6 +437,41 @@ class TestInlineRandomized(unittest.TestCase):
                 continue
             problems.append(f"seed {seed}: {outcome}: {detail}")
         self.assertEqual(problems, [], "\n".join(problems))
+
+
+class TestDuplicateKeyWarning(unittest.TestCase):
+    def test_warning_does_not_quote_the_file(self):
+        """Ansible's duplicate-key warning must not carry the file's lines.
+
+        The scan gives Ansible's loader no file name on purpose: with a real
+        origin Ansible reads the file and quotes the offending lines, and the
+        duplicate key here holds plaintext. The file must exist on disk (an
+        origin that cannot be read is never quoted) and the scan runs in a
+        child process, so output written through any channel is caught.
+        """
+        secret = "PLAINTEXT-must-not-leak-9f3a"
+        cipher = VAULT.encrypt(b"inline secret").decode()
+        indented = "".join(f"  {line}\n" for line in cipher.splitlines())
+        content = f"dup: {secret}\nother: x\ndup: !vault |\n{indented}"
+        script = (
+            "import _ansible_isolation\n"
+            "from pilfer import cli\n"
+            "cli.scan_project(include_encrypted_vars=True)\n"
+        )
+        here = os.path.dirname(os.path.abspath(__file__))
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "vars.yml"), "w", encoding="utf-8") as f:
+                f.write(content)
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True,
+                cwd=directory,
+                env={**os.environ, "PYTHONPATH": os.pathsep.join([here, os.path.dirname(here)])},
+                check=True,
+            )
+        self.assertIn(b"duplicate mapping key", result.stderr)
+        self.assertNotIn(secret.encode(), result.stderr)
+        self.assertNotIn(secret.encode(), result.stdout)
 
 
 if __name__ == "__main__":

@@ -160,7 +160,7 @@ python -m build
 python -m twine check dist/*
 ```
 
-Use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`) so release notes stay readable. A breaking commit (`feat!:`) puts its upgrade notes in the body: for a new major version, `./scripts/release-notes.sh` also prints the README's `Upgrading to X.0` section. Run it before tagging.
+Use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`) so release notes stay readable. For a new major version, `./scripts/release-notes.sh` appends the README's `## Upgrading to X.0` section, so write the upgrade notes there. It prints nothing extra if the section is missing. Run it before tagging.
 
 Manual publish when trusted publishing is unavailable:
 

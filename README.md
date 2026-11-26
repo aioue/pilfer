@@ -277,11 +277,15 @@ pilfer rekey \
 pilfer rekey ... --rotate-password-file
 ```
 
-`--rotate-password-file` keeps the old password in `<file>_old` (mode 0600). Delete it, or move it out of the tree, once nothing needs it. Before it rewrites anything, it refuses a password file that is a symlink, is vault-encrypted (rotation copies password files, so both must be plain) or is itself a vault target in the tree, an existing `<file>_old`, and a password-file directory that is not writable.
+`--rotate-password-file` keeps the old password in `<file>_old` (mode 0600). Delete it, or move it out of the tree, once nothing needs it. It needs a plain password file on each side: not vault-encrypted, not a script. Before it rewrites anything, it also refuses:
 
-The old password loads like `open`: `--old-vault-password-file` and `--old-vault-id`, plus Ansible's config. The new password comes from the single `--new-vault-password-file` or `--new-vault-id` (`--new-vault-id prompt` asks for it). The new password file can itself be vault-encrypted; `--rotate-password-file` refuses that. Rekey warns about an `--old-*` flag that decrypts nothing. Values keep their vault-id label unless `--new-vault-id` names one. Rekey refuses a tree encrypted with more than one vault password; use `ansible-vault rekey` per vault id for that. It also refuses `!vault` values in a form pilfer cannot rewrite, such as list items or `|-` blocks, because they would stay on the old password.
+- a password file that is a symlink
+- an existing `<file>_old`
+- a password-file directory that is not writable
 
-`--rotate-password-file` needs one plain password file on each side. It refuses password scripts: Ansible runs those, so the password lives somewhere else, such as a keyring. Change it there instead. With `pilfer-vault-keyring-client`, rekey to a typed password while the keyring still holds the old one, then store the same password over it:
+The old password loads like `open`: `--old-vault-password-file` and `--old-vault-id`, plus Ansible's config. The new password comes from the single `--new-vault-password-file` or `--new-vault-id` (`--new-vault-id prompt` asks for it). Rekey refuses an old or new password file that is itself a vault in the tree. The new password file can otherwise be vault-encrypted. A new label must be ASCII, with no `;`, control characters or surrounding spaces. Rekey warns about an `--old-*` flag that decrypts nothing. Values keep their vault-id label unless `--new-vault-id` names one. Rekey refuses a tree encrypted with more than one vault password; use `ansible-vault rekey` per vault id for that. It also refuses `!vault` values in a form pilfer cannot rewrite, such as list items or `|-` blocks, because they would stay on the old password.
+
+`--rotate-password-file` refuses password scripts: Ansible runs those, so the password lives somewhere else, such as a keyring. Change it there instead. With `pilfer-vault-keyring-client`, rekey to a typed password while the keyring still holds the old one, then store the same password over it:
 
 ```bash
 pilfer rekey --new-vault-id prompt
@@ -321,6 +325,7 @@ non-zero. It does not invent fixes for ambiguous edits.
 - **`close` is progressive** - files that succeed are encrypted and dropped from the session; failures stay plaintext until you fix and retry. Not an all-or-nothing transaction.
 - **Intentional var removal** requires `pilfer close --confirm-delete`.
 - **Short secrets** can block close if the same bytes appear elsewhere in the file (docs/comments) - fail closed.
+- **Lock wait and ctrl-c:** a second pilfer run in the same tree waits for the first and prints `Waiting for another pilfer run (lock <path>)...`. Ctrl-c exits 130. After an interrupted `open` or `close`, pilfer says to run `pilfer close`. An interrupted `rekey` resumes when you re-run it.
 - **Nested git checkouts** are skipped; run pilfer from those roots if needed.
 - **Password check on close:** `close` proves the password by decrypting a `.vault` backup. The session list stores no hash of the password.
 - **File modes:** opened plaintext is `0600`. `close` puts back the mode and group the file had at `open`; `rekey` and `set` keep the file's own. The group is kept only when you are a member of it.

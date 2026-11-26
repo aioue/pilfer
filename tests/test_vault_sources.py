@@ -302,13 +302,43 @@ class TestRekeySources(ProjectTest):
         self.ok(self.rekey("--new-vault-password-file", str(client)))
         self.assertEqual(self.runs(client), ["--vault-id default"])
 
-    def test_new_vault_id_label_with_a_semicolon_or_control_character_is_refused(self):
+    def test_new_vault_id_label_that_core_cannot_write_back_is_refused(self):
+        # ';' ends the header, a non-ASCII byte makes is_encrypted reject the
+        # blob, and spaces at the ends are stripped on read (so "   " would
+        # silently become no label).
         before = (self.dir / "plain.yml").read_bytes()
-        for label in ("a;b", "a\x01b", "a\nb"):
+        for label in ("a;b", "a\x01b", "a\nb", "a\tb", "é", " dev", "dev ", "   "):
             with self.subTest(label=label):
                 result = self.rekey("--new-vault-id", f"{label}@new-pass")
-                self.refused(result, "not a valid vault id")
+                self.refused(result, "labels must be ASCII")
                 self.assertEqual((self.dir / "plain.yml").read_bytes(), before)
+
+    def test_new_vault_id_labels_core_can_write_back_are_accepted(self):
+        for label in ("dev", "prod-1", "a.b"):
+            with self.subTest(label=label):
+                self.ok(
+                    self.pilfer(
+                        "rekey",
+                        "--old-vault-password-file",
+                        "old-pass",
+                        "--yes",
+                        "--new-vault-id",
+                        f"{label}@new-pass",
+                    )
+                )
+                data = (self.dir / "plain.yml").read_bytes()
+                self.assertTrue(data.startswith(f"$ANSIBLE_VAULT;1.2;AES256;{label}\n".encode()))
+                # Back to the old password for the next label.
+                self.ok(
+                    self.pilfer(
+                        "rekey",
+                        "--old-vault-password-file",
+                        "new-pass",
+                        "--yes",
+                        "--new-vault-password-file",
+                        "old-pass",
+                    )
+                )
 
     def test_new_equal_to_the_ansible_cfg_password_is_refused(self):
         # ansible.cfg's password loads on the old side too; equal to new, rekey
@@ -416,8 +446,9 @@ class TestUnusedExplicitPassword(ProjectTest):
         self.ok(self.pilfer("open"))
         self.edit("secret.yml", "old", "new")
         result = self.pilfer("close", "-p", "other-pass")
-        # The unused-flag refusal, not the one for a password that decrypts no backup.
-        self.refused(result, "decrypts none of the session's backups")
+        # The unused-flag refusal, not the one for a password that decrypts no backup
+        # ("Use the same -p").
+        self.refused(result, "drop the flag")
         self.assertEqual((self.dir / "secret.yml").read_text(), "token: new\n")
         self.assertTrue((self.dir / "vaultedFileList.json").exists())
         # The password open used, given explicitly or not, closes.
@@ -429,7 +460,7 @@ class TestUnusedExplicitPassword(ProjectTest):
         self.ok(self.pilfer("open"))
         self.edit("secret.yml", "old", "new")
         result = self.pilfer("close", "-p", "no-such-file")
-        self.refused(result, "could not be loaded")
+        self.refused(result, "fix or drop the flag")
         self.assertTrue((self.dir / "vaultedFileList.json").exists())
 
     def test_close_refuses_a_vault_id_that_opened_nothing(self):
@@ -740,10 +771,73 @@ class TestRekeyPreconditions(ProjectTest):
                     "--yes",
                     *extra,
                 )
-                self.refused(result, "vault-encrypted")
+                self.refused(result, "must be plain text")
                 self.assertEqual(result.returncode, 1)
                 self.assert_untouched()
                 self.assertFalse((self.dir / "old-pass_old").exists())
+
+    def test_a_vault_encrypted_password_file_with_a_leading_blank_line_is_refused(self):
+        # Core strips the file before reading it, so the blank line does not
+        # make it plain text; the blob must not be installed as a password.
+        elsewhere = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, elsewhere)
+        encrypted = elsewhere / "new-pass.vault"
+        encrypted.write_bytes(b"\n" + only("old-password").encrypt(b"brand-new\n"))
+        result = self.pilfer(
+            "rekey",
+            "--old-vault-password-file",
+            "old-pass",
+            "--new-vault-password-file",
+            str(encrypted),
+            "--rotate-password-file",
+            "--yes",
+        )
+        self.refused(result, "must be plain text")
+        self.assert_untouched()
+        self.assertFalse((self.dir / "old-pass_old").exists())
+
+    def test_a_new_password_file_named_by_an_env_var_inside_the_tree_is_refused(self):
+        # Ansible expands "$VAR" in a password file path; a comparison of the
+        # flag's text with the targets' paths missed it.
+        encrypted = self.write("new-pass.vault", only("old-password").encrypt(b"brand-new\n"))
+        before = encrypted.read_bytes()
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                result = self.pilfer(
+                    "rekey",
+                    "--old-vault-password-file",
+                    "old-pass",
+                    "--new-vault-id",
+                    "x@$PILFER_TEST_DIR/new-pass.vault",
+                    "--yes",
+                    *extra,
+                    env={"PILFER_TEST_DIR": str(self.dir)},
+                )
+                self.refused(result, "move it out first")
+                self.assert_untouched()
+                self.assertEqual(encrypted.read_bytes(), before)
+
+    def test_an_ansible_cfg_password_file_inside_the_tree_is_refused(self):
+        # vault_password_file in ansible.cfg loads beside -p. Here it is itself a
+        # vault under the old password, so rekey would re-key the password the
+        # tree is on under the new one and leave the config pointing at a blob.
+        cfg_pass = self.write("cfg-pass.vault", only("old-password").encrypt(b"cfg-password\n"))
+        self.write_cfg("vault_password_file = cfg-pass.vault\n")
+        before = cfg_pass.read_bytes()
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                result = self.pilfer(
+                    "rekey",
+                    "--old-vault-password-file",
+                    "old-pass",
+                    "--new-vault-password-file",
+                    "new-pass",
+                    "--yes",
+                    *extra,
+                )
+                self.refused(result, "move it out first")
+                self.assert_untouched()
+                self.assertEqual(cfg_pass.read_bytes(), before)
 
     def test_a_new_password_file_inside_the_tree_is_refused(self):
         # It would be re-keyed under itself: the new password would then exist

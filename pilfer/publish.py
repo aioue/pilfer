@@ -193,13 +193,9 @@ def _names_inode(lock_path: Path, fd: int) -> bool:
 def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
     """Block other pilfer publishes of this path until the with-block ends.
 
-    flock is on a sibling, held from the first read through os.replace. On
-    local filesystems flock belongs to the open file description, so two
-    threads that each open the lock file exclude each other as well as two
-    processes. The sibling is removed on the way out; only a killed pilfer
-    leaves one, and the next run reuses it and removes it. Every pilfer that
-    takes this lock must use this protocol: an older pilfer without the
-    re-check below could end up holding a lock on a dead inode.
+    flock is on a sibling, held from the first read through os.replace. The
+    sibling is removed on the way out; only a killed pilfer leaves one, and the
+    next run reuses it and removes it.
 
     Removing a flock file needs two steps, or two holders can coexist:
     - The holder unlinks while it still holds the lock. If it unlocked first,
@@ -240,7 +236,8 @@ def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
         yield
     finally:
         try:
-            # Unlink before unlock, and only if the path is still our inode.
+            # Unlink while still holding the lock (closing the fd is what
+            # releases it), and only if the path is still our inode.
             # Best effort: a stale lock in a directory we cannot write opens
             # fine but cannot be unlinked, and that must not replace the
             # block's result or its PilferError. The file stays reusable, and
@@ -251,10 +248,7 @@ def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
             except OSError:
                 pass
         finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
+            os.close(fd)
 
 
 def locked_by_path(func: Callable) -> Callable:

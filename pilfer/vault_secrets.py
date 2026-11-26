@@ -2,12 +2,9 @@
 # GNU General Public License v3.0+ (see PILFER_LICENSE.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
 """Vault secrets, loaded and used the way ansible-vault does it.
 
-pilfer used to read one password file itself. That missed password scripts
-(an executable whose stdout is the password, issue #18), `-client` scripts
-that are passed --vault-id, vault_identity_list, prompts, and Ansible's config
-search (ANSIBLE_CONFIG, ./ansible.cfg, ~/.ansible.cfg, ANSIBLE_VAULT_* env).
-Loading is now CLI.setup_vault_secrets, the call `ansible-vault decrypt`
-makes, fed from ansible.constants.
+Loading is CLI.setup_vault_secrets, the call `ansible-vault decrypt` makes,
+fed from ansible.constants, so password scripts, `-client` scripts,
+vault_identity_list, prompts and Ansible's config search all behave as there.
 
 ansible.constants reads the config once, when Ansible is first imported. A
 library caller gets the config of the directory it imported pilfer from, as
@@ -30,7 +27,9 @@ from ansible.parsing.vault import (
     PromptVaultSecret,
     VaultLib,
     VaultSecret,
+    format_vaulttext_envelope,
     get_file_vault_secret,
+    is_encrypted,
     parse_vaulttext_envelope,
 )
 from ansible.utils.path import unfrackpath
@@ -56,6 +55,10 @@ NO_SOURCE_MESSAGE = (
 )
 
 Secrets = list[tuple[str, VaultSecret]]
+
+# The prompt sources of a vault id. Core hard-codes the same tuple in
+# setup_vault_secrets, so a different spelling here would load no prompt.
+PROMPT_SOURCES = ("prompt", "prompt_ask_vault_pass")
 
 
 class RoundTripError(PilferError):
@@ -131,10 +134,9 @@ def _read_plain_password_file(path: str) -> VaultSecret:
 def load_secrets(sources=None) -> Secrets:
     """Every secret Ansible would load for these flags, as [(vault_id, secret)].
 
-    The order is build_vault_ids': vault_identity_list, then --vault-id, then
-    the -p files, then ansible.cfg's vault_password_file (setup_vault_secrets
-    appends it), and -J's prompt last. A password file that fails is a warning
-    while another loads, as in ansible-vault; a failing prompt is an error.
+    The order is core's build_vault_ids' (see the --help epilog). A password
+    file that fails is a warning while another loads, as in ansible-vault; a
+    failing prompt is an error.
     Each source is read or run once per call, so a command calls this once.
     With no source at all, the first existing FALLBACK_PASSWORD_FILES entry is
     read as a plain password file and never run.
@@ -240,7 +242,7 @@ def _explicit_secrets(sources: VaultSources, secrets: Secrets) -> list[ExplicitS
     for slug in sources.vault_ids:
         label, source = _cli().split_vault_id(slug)
         vault_id = label or default
-        if source in ("prompt", "prompt_ask_vault_pass"):
+        if source in PROMPT_SOURCES:
             found.append(ExplicitSource(f"--vault-id {slug}", vault_id, by_prompt(vault_id)))
         else:
             found.append(ExplicitSource(f"--vault-id {slug}", vault_id, by_file(vault_id, source)))
@@ -257,6 +259,29 @@ def load_vault(sources=None) -> SourceVault:
     sources = VaultSources.of(sources)
     secrets = load_secrets(sources)
     return SourceVault(secrets, _explicit_secrets(sources, secrets))
+
+
+def _require_writable_label(label: str) -> None:
+    """Refuse a label that does not survive core's header format and parse.
+
+    The label goes into every value's header. Core's own round trip catches
+    ';' (it ends the header), non-ASCII (is_encrypted rejects the blob) and
+    whitespace at the ends (the parse strips it); the printable test adds the
+    control characters inside a label, which core would write and read back
+    but a line-based reader would cut at.
+    """
+    if not label:
+        return
+    envelope = format_vaulttext_envelope(b"x", "AES256", vault_id=label)
+    if not (
+        label.isprintable()
+        and is_encrypted(envelope)
+        and parse_vaulttext_envelope(envelope)[3] == label
+    ):
+        raise PilferError(
+            f"'{label}' is not a valid vault id: labels must be ASCII, with no ';', "
+            "no spaces at either end and no control characters"
+        )
 
 
 def load_new_secret(sources, old_secrets: Secrets = ()) -> tuple[str, VaultSecret]:
@@ -277,15 +302,10 @@ def load_new_secret(sources, old_secrets: Secrets = ()) -> tuple[str, VaultSecre
     if len(slugs) != 1:
         raise PilferError("rekey needs exactly one new vault password source")
     label, source = _cli().split_vault_id(slugs[0])
-    # The label goes into every value's header, where ';' ends it and a control
-    # character is cut off on read. Core's VaultCLI refuses ';' for --vault-id.
-    if label and (";" in label or any(not c.isprintable() for c in label)):
-        raise PilferError(
-            f"'{label}' is not a valid vault id: ';' and control characters are not allowed"
-        )
+    _require_writable_label(label)
     vault_id = label or default
     try:
-        if source in ("prompt", "prompt_ask_vault_pass"):
+        if source in PROMPT_SOURCES:
             secret = PromptVaultSecret(
                 prompt_formats=[
                     "New vault password (%(vault_id)s): ",
@@ -303,17 +323,6 @@ def load_new_secret(sources, old_secrets: Secrets = ()) -> tuple[str, VaultSecre
     except AnsibleError as exc:
         raise PilferError(f"new vault password: {exc}") from None
     return vault_id, secret
-
-
-def password_file_paths(sources) -> list[str]:
-    """The files a set of flags names: -p files and the file part of each --vault-id."""
-    sources = VaultSources.of(sources)
-    paths = list(sources.password_files)
-    for slug in sources.vault_ids:
-        _label, source = _cli().split_vault_id(slug)
-        if source not in ("prompt", "prompt_ask_vault_pass"):
-            paths.append(source)
-    return paths
 
 
 def is_plain_password_file(path: str) -> bool:
