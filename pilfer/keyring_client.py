@@ -93,8 +93,8 @@ def _store(backend, keyname: str, username: str, where: str) -> int:
     # Names and paths come from ansible.cfg and its directory: repr keeps
     # control characters out of the terminal.
     config = repr(C.CONFIG_FILE) if C.CONFIG_FILE else "none found"
-    # Not in the original. Replacing the entry loses the password files may
-    # still be encrypted with: `pilfer rekey` first, then --set.
+    # Not in the original. Replacing the entry loses the password that files
+    # may still be encrypted with: `pilfer rekey` first, then --set.
     replacing = backend.get_password(keyname, username) is not None
     # Notices and questions go to stderr with the password prompts: piped,
     # stdout is block-buffered and would print them out of order (and input()

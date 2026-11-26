@@ -10,6 +10,7 @@ run_client(input=...).
 """
 
 import builtins
+import contextlib
 import getpass
 import io
 import json
@@ -83,6 +84,7 @@ class KeyringTest(ProjectTest):
             PILFER_TEST_KEYRING=str(self.keyring_file),
             PYTHONPATH=os.pathsep.join([str(TESTS), str(REPO)]),
         )
+        self._no_real_security_tool()
         # What the console script does, under the name Ansible keys on.
         self.client = self.write(
             CLIENT_NAME,
@@ -112,6 +114,23 @@ class KeyringTest(ProjectTest):
             # of opening /dev/tty.
             start_new_session=True,
         )
+
+    def _no_real_security_tool(self):
+        """Safety net: no test may run the real /usr/bin/security, whatever else it mocks.
+
+        keyring_client.subprocess is the subprocess module, so this wraps
+        subprocess.run for every test; anything but the security tool runs for real.
+        """
+        real_run = subprocess.run
+
+        def run(argv, *args, **kwargs):
+            if argv and argv[0] == "/usr/bin/security":
+                raise AssertionError(f"test ran the real security tool: {argv}")
+            return real_run(argv, *args, **kwargs)
+
+        patcher = mock.patch.object(keyring_client.subprocess, "run", run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def run_in_process(
         self, *args: str, backend=None, typed: tuple = ("pw", "pw"), replace=None
@@ -406,21 +425,28 @@ class TestMacOSReplace(KeyringTest):
     def set_with_security(self, *, macos=True, returncode=0, stored=True):
         if stored:
             self.store("ansible", "old")
-        with (
-            mock.patch.object(keyring_client, "_is_macos_backend", return_value=macos),
-            mock.patch.object(
-                keyring_client.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], returncode),
-            ) as run,
-        ):
+        with contextlib.ExitStack() as stack:
+            run = stack.enter_context(
+                mock.patch.object(
+                    keyring_client.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], returncode),
+                )
+            )
+            if macos:
+                # Only here is the gate patched; the other cases run on the
+                # test's FileKeyring, a real non-macOS backend.
+                stack.enter_context(
+                    mock.patch.object(keyring_client, "_is_macos_backend", return_value=True)
+                )
             result = self.set_in_process(replace="y" if stored else None)
         return run, result
 
     def test_replacing_deletes_with_the_security_tool_then_stores(self):
         run, (code, _, _) = self.set_with_security()
         self.assertEqual(code, 0)
-        run.assert_called_once_with(list(self.DELETE), capture_output=True, check=False)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], list(self.DELETE))
         self.assertEqual(self.stored(), {entry("ansible", USER): "pw"})
 
     def test_no_security_tool_for_a_fresh_store_or_another_backend(self):

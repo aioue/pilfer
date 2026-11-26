@@ -6,6 +6,7 @@
 # pilfer [open|close|rekey|set]
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 
 import ansible.constants as C
 from ansible.parsing.vault import VaultLib, VaultSecret
+from ansible.utils.path import unfrackpath
 
 from pilfer import __version__
 from pilfer.errors import PilferError
@@ -57,7 +59,6 @@ from pilfer.vault_secrets import (
     encrypt_with,
     is_plain_password_file,
     load_new_secret,
-    load_secrets,
     load_vault,
     password_file_secret,
     secret_for,
@@ -407,7 +408,7 @@ def _abandon_incomplete_session() -> bool:
     return True
 
 
-def _require_close_password(entries, vault: VaultLib) -> None:
+def _require_close_password(entries, vault: SourceVault) -> None:
     """Refuse close unless these secrets decrypt every .vault backup from the open.
 
     close re-encrypts each edited value with the secret that decrypts its
@@ -419,6 +420,7 @@ def _require_close_password(entries, vault: VaultLib) -> None:
     guess offline than the vault's own key derivation.
     """
     checked = 0
+    labels: set[str] = set()
     for entry in entries:
         backup = _encrypted_backup_path(entry["path"])
         if not os.path.isfile(backup):
@@ -436,19 +438,26 @@ def _require_close_password(entries, vault: VaultLib) -> None:
                 "(would re-key modified files under a different password). Use the same "
                 "-p / --vault-id / ansible.cfg password as open."
             )
+        labels.update(label for label in map(vault_label, ciphertexts) if label)
         checked += 1
     if checked:
         # Another source (ansible.cfg's password, say) decrypted the backups.
-        # A flag that decrypts none of them is most likely a new password
-        # meant as a rotation; close never changes passwords, so say so.
-        unused = vault.unused_explicit() if isinstance(vault, SourceVault) else []
-        if unused:
-            raise PilferError(
-                f"Vault password from {unused[0]} does not match the password used for "
-                "'pilfer open': it decrypts none of the session's backups, which another "
-                "source (ansible.cfg, vault_identity_list or another flag) does. Refusing "
-                "to close. close keeps each file's password; use 'pilfer rekey' to change it."
-            )
+        # A flag that decrypts none of them may be a new password meant as a
+        # rotation; close never changes passwords, so refuse. Only a flag that
+        # could be that: an unlabelled one, or one whose label a backup carries.
+        # `--vault-id dev@X --vault-id prod@X` on a session that holds only dev
+        # files opened fine, and its prod flag is merely unused.
+        unused = vault.unused_explicit()
+        for source in unused:
+            if source.vault_id == C.DEFAULT_VAULT_IDENTITY or source.vault_id in labels:
+                raise PilferError(
+                    f"Vault password from {source.flag} does not match the password used for "
+                    "'pilfer open': it decrypts none of the session's backups, which another "
+                    "source (ansible.cfg, vault_identity_list or another flag) does. Refusing "
+                    "to close. close keeps each file's password; use 'pilfer rekey' to change "
+                    "it, or drop the flag if it is not meant to decrypt anything in this session."
+                )
+        _warn_unused_sources(vault, "the session's files")
         return
     raise PilferError(
         "No .vault backup left to check the password against. Restore .vault "
@@ -581,7 +590,7 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
             if kind:
                 result.targets.append({"kind": kind, "path": file_path})
             if include_encrypted_vars and kind != "file":
-                skipped = vault_values_pilfer_skips(data)
+                skipped = vault_values_pilfer_skips(data, file_path)
                 if skipped:
                     result.skipped_vault_values.append((file_path, skipped))
     return result
@@ -775,16 +784,22 @@ def open_vault_files(
         raise
 
 
-def _warn_unused_sources(vault: VaultLib, what: str) -> None:
+def _warn_unused_sources(vault: SourceVault, what: str) -> None:
     """Warn for each -p / --vault-id / -J whose password decrypted none of `what`."""
-    if not isinstance(vault, SourceVault):
-        return
-    for flag in vault.unused_explicit():
+    for source in vault.unused_explicit():
         print(
-            f"⚠️  Vault password from {flag} decrypted none of {what}; another source "
+            f"⚠️  Vault password from {source.flag} decrypted none of {what}; another source "
             "(ansible.cfg, vault_identity_list or another flag) did.",
             file=sys.stderr,
         )
+
+
+def _holds_plaintext(path: str, plaintext: bytes) -> bool:
+    """True if path now holds plaintext, so its replace landed. Never follows a symlink."""
+    try:
+        return _read_no_follow(path, path) == plaintext
+    except PilferError:
+        return False
 
 
 def _publish_opened(
@@ -798,6 +813,10 @@ def _publish_opened(
     never rewrites the target. expected=original: if the file changed while it
     was decrypted (an editor, or a tool other than pilfer), publishing this
     plaintext would throw that change away.
+
+    An interrupt can land after write_atomic's os.replace (in its directory
+    fsync). The target then holds the plaintext, and the backups and sidecar
+    are the only record of how to close it: they stay, and close restores it.
     """
     written = []
     try:
@@ -809,8 +828,9 @@ def _publish_opened(
         _write_open_sidecar(vaulted_file_path, kind)
         write_atomic(vaulted_file_path, plaintext, expected=original, action="open")
     except BaseException:
-        for path in written:
-            _remove_file(path)
+        if not _holds_plaintext(vaulted_file_path, plaintext):
+            for path in written:
+                _remove_file(path)
         raise
 
 
@@ -1119,6 +1139,30 @@ def _cleanup_entry_backups(vaulted_file_path: str) -> None:
         pass  # not empty: close reports what is left in .vault
 
 
+def _drop_never_opened(entries):
+    """Leave out entries an interrupted open never reached.
+
+    open lists every target before decrypting any. After ctrl-c, the ones it
+    had not reached have no backup, sidecar or metadata and are still
+    ciphertext: there is nothing to close, and failing on them would leave the
+    session open for no reason.
+    """
+    kept = []
+    for entry in entries:
+        path = entry["path"]
+        if not _entry_has_open_artifacts(entry):
+            try:
+                with open(path, "rb") as handle:
+                    data = handle.read()
+            except OSError:
+                data = None
+            if data is not None and _path_still_vault_ciphertext(entry, data):
+                print(f"ℹ️  Skipping {path}: it was never opened.")
+                continue
+        kept.append(entry)
+    return kept
+
+
 def recrypt_vault_files(vault_password_file_path=None, confirm_delete: bool = False):
     """Re-encrypt vault entries. Only clears the session if every file succeeds.
 
@@ -1132,7 +1176,7 @@ def recrypt_vault_files(vault_password_file_path=None, confirm_delete: bool = Fa
     if not _session_is_open():
         raise PilferError("No vault file list found. Run 'pilfer open' first.")
 
-    entries = _load_session()
+    entries = _drop_never_opened(_load_session())
     vault = load_vault(vault_password_file_path)
     if entries:
         _require_close_password(entries, vault)
@@ -1307,7 +1351,28 @@ def _rotation_paths(old: VaultSources, new: VaultSources) -> tuple[str, str]:
                 "that Ansible runs, not a file it reads. Change the password where the "
                 "script gets it, and rekey without --rotate-password-file."
             )
+    _check_rotation_targets(old_path, new_path)
     return old_path, new_path
+
+
+def _check_rotation_targets(old_path: str, new_path: str) -> None:
+    """Refuse a rotation that cannot finish, before anything is written.
+
+    Rotation is the last step of rekey, after every target is re-keyed, so a
+    failure here would leave the tree on the new password and the live password
+    file on the old one. A second rotation is the usual case: the first left
+    <old>_old. Called early (before --dry-run returns) and again by
+    _rotate_password_file, which is the destructive write.
+    """
+    backup = f"{old_path}_old"
+    for path in (old_path, new_path, backup):
+        if os.path.islink(path):
+            raise PilferError(f"refusing symlink password file: {path}")
+    if os.path.lexists(backup):
+        raise PilferError(f"Password backup already exists: {backup}. Move it aside first.")
+    directory = os.path.dirname(old_path) or "."
+    if not os.access(directory, os.W_OK | os.X_OK):
+        raise PilferError(f"cannot write the password backup: {directory} is not writable")
 
 
 def rekey_vault_files(
@@ -1348,8 +1413,10 @@ def rekey_vault_files(
     if rotate_password_file:
         old_path, new_path = _rotation_paths(old_sources, new_sources)
 
-    old_secrets = load_secrets(old_sources)
-    new_label, new_secret = load_new_secret(new_sources)
+    # A SourceVault, so a flag that decrypts nothing is reported as open does.
+    old_vault = load_vault(old_sources)
+    old_secrets = old_vault.secrets
+    new_label, new_secret = load_new_secret(new_sources, old_secrets)
     # Every loaded old secret, ansible.cfg's included: one equal to the new
     # password would make "already on the new password" true of old files.
     if any(secret.bytes == new_secret.bytes for _id, secret in old_secrets):
@@ -1357,7 +1424,6 @@ def rekey_vault_files(
             "The new vault password is the same as an old one (from the flags or ansible.cfg)."
         )
     new = NewSecret(new_secret, None if new_label == C.DEFAULT_VAULT_IDENTITY else new_label)
-    old_vault = VaultLib(old_secrets)
 
     # One walk: orphan signals and rekey targets. A second scan_project here
     # used to re-read every file in the tree.
@@ -1388,6 +1454,11 @@ def rekey_vault_files(
         plan.append((path, kind, span_count, status))
         used_secrets |= used
 
+    if used_secrets:
+        # Another source (ansible.cfg's password, say) may have done the work.
+        # Skipped when every target is already on the new password: then no old
+        # flag decrypted anything, and that is not a mistake in the flags.
+        _warn_unused_sources(old_vault, "the files to rekey")
     if len(used_secrets) > 1:
         raise PilferError(
             f"Rekey refused: the targets are encrypted with {len(used_secrets)} different "
@@ -1399,7 +1470,7 @@ def rekey_vault_files(
     if (
         rotate_password_file
         and used_secrets
-        and used_secrets != {password_file_secret(old_path).bytes}
+        and used_secrets != {password_file_secret(old_path, old_secrets).bytes}
     ):
         raise PilferError(
             "--rotate-password-file refused: the targets are not encrypted with the "
@@ -1493,21 +1564,13 @@ def _log_vault_password_file_rotated() -> None:
     print("ℹ️  Vault passphrase file rotation complete.")
 
 
-def _rotate_password_file(old_path: str, new_path: str) -> str:
-    """Archive old password file and install new password at the old path.
+def _rotate_password_file(old_path: str, new_path: str) -> None:
+    """Archive the old password file as old_path + '_old' and install the new one at old_path.
 
-    Returns the backup path (old_path + '_old'). Refuses a password script on
-    either side (see _rotation_paths), so a direct call is guarded too.
+    Script password files were refused up front by _rotation_paths.
     """
-    for path in (old_path, new_path):
-        if not os.path.islink(path) and not is_plain_password_file(path):
-            raise PilferError("refusing to rotate a password script; Ansible runs it")
+    _check_rotation_targets(old_path, new_path)
     backup = f"{old_path}_old"
-    for path in (old_path, new_path, backup):
-        if os.path.islink(path):
-            raise PilferError(f"refusing symlink password file: {path}")
-    if os.path.lexists(backup):
-        raise PilferError(f"Password backup already exists: {backup}. Move it aside first.")
     new_contents = _read_no_follow(new_path, "new password file")
     old_contents = _read_no_follow(old_path, "old password file")
     # O_EXCL so a dangling symlink at the backup path is not created through.
@@ -1531,7 +1594,6 @@ def _rotate_password_file(old_path: str, new_path: str) -> str:
                 os.remove(backup)
             except OSError:
                 pass
-    return backup
 
 
 def _read_no_follow(path: str, what: str) -> bytes:
@@ -1549,13 +1611,15 @@ _HELP_EPILOG = """
 Vault passwords load as ansible-vault loads them: vault_identity_list, then
 --vault-id, then -p files, then vault_password_file from Ansible's config
 (ANSIBLE_CONFIG, ./ansible.cfg, ~/.ansible.cfg, ANSIBLE_VAULT_* variables).
-An executable password file is run and its output used; a *-client script is
-passed --vault-id. With no source at all, pilfer tries
-~/.ansible-vault/.vault-file, .vault_password, vault_password_file, and
-finally ../../vault_password_file.
+An executable password file named by a flag or config is run and its output
+used; a *-client script is passed --vault-id. With no source at all, pilfer
+tries ~/.ansible-vault/.vault-file, .vault_password, vault_password_file, and
+finally ../../vault_password_file, reading each as a plain password file:
+those are never run, even when executable.
 
-Never commit while a session is open. Add vaultedFileList.json, .vault/, and
-*.pilfer-open sidecars to your project's .gitignore. Check the exit code of close.
+Never commit while a session is open. Add vaultedFileList.json, .vault/,
+*.pilfer-open sidecars and *.pilfer-lock files (left only when pilfer is
+killed) to your project's .gitignore. Check the exit code of close.
 
 Run 'pilfer COMMAND --help' for command-specific options and examples.
 """
@@ -1637,13 +1701,12 @@ def _hides_unrecognized_set_value(message: str) -> bool:
     return any(token.startswith("-") and not token.startswith("--") for token in tokens)
 
 
-def _unfrack_path():
-    # ansible-vault's own type for --vault-password-file: ~ and $VARS expanded,
-    # made absolute, a final symlink left alone so an adjacent script config
-    # still resolves. Imported late: ansible.cli can raise SystemExit on import.
-    from ansible.cli.arguments.option_helpers import unfrack_path
-
-    return unfrack_path(follow=False)
+# ansible-vault's own type for --vault-password-file: ~ and $VARS expanded, made
+# absolute, a final symlink left alone so an adjacent script config still
+# resolves. Built from ansible.utils.path, not ansible.cli's unfrack_path:
+# importing ansible.cli exits under a non-UTF-8 locale, and --help and
+# --version must not need it.
+_UNFRACK_PATH = functools.partial(unfrackpath, follow=False)
 
 
 def _add_vault_options(parser, help_text: str) -> None:
@@ -1665,7 +1728,7 @@ def _add_vault_options(parser, help_text: str) -> None:
         default=[],
         dest="vault_password_files",
         metavar="VAULT_PASSWORD_FILE",
-        type=_unfrack_path(),
+        type=_UNFRACK_PATH,
         help=help_text,
     )
     group.add_argument(
@@ -1782,7 +1845,7 @@ def _build_argument_parser():
         default=[],
         dest="old_vault_password_files",
         metavar="OLD_VAULT_PASSWORD_FILE",
-        type=_unfrack_path(),
+        type=_UNFRACK_PATH,
         help="current vault password file or script; repeatable (default: Ansible's config)",
     )
     rekey_parser.add_argument(
@@ -1796,7 +1859,7 @@ def _build_argument_parser():
     new_group = rekey_parser.add_mutually_exclusive_group(required=True)
     new_group.add_argument(
         "--new-vault-password-file",
-        type=_unfrack_path(),
+        type=_UNFRACK_PATH,
         help="new vault password file or script",
     )
     new_group.add_argument(
@@ -1902,6 +1965,12 @@ def main(argv=None):
                 )
                 if not args.dry_run:
                     print(f"✅  Rekeyed {count} file(s).")
+    except KeyboardInterrupt:
+        # ctrl-c at a password prompt or during a slow password script. The
+        # finally blocks have already run; what open or close left is kept for
+        # the next close, as after any other failure.
+        print("Interrupted.", file=sys.stderr)
+        return 130
     except Exception as exc:
         # PilferError for refusals, OSError and anything else for the rest.
         # Blank line after per-file ⚠️ blocks; keep a plain Error: summary line.
@@ -1916,6 +1985,10 @@ def _run_set(args) -> int:
     from pilfer.vault_set import read_value, set_keys
 
     value = args.value
+    # Before the password loads: a mistyped path should not cost a prompt or a
+    # script run, and should name the vault, not its x.yml.pilfer-lock sibling.
+    if not os.path.isfile(args.file):
+        raise PilferError(f"Vault file does not exist or is not a regular file: {args.file}")
     # Loaded once: the check and the write both need it, and a password
     # script or prompt should run one time.
     vault = load_vault(_sources(args))

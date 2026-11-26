@@ -9,7 +9,8 @@ new one, never a truncated one.
 
 os.replace swaps in a new inode, so a lock on the vault file does not cover
 the file another pilfer process is about to publish. The lock lives on a
-sibling that is never replaced.
+sibling that os.replace never swaps; it is removed when the lock is released
+(a killed pilfer leaves one behind, and the next run reuses it).
 """
 
 import errno
@@ -17,6 +18,7 @@ import fcntl
 import functools
 import os
 import stat
+import sys
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -159,9 +161,8 @@ def _fsync_directory(directory: str) -> None:
 def _open_lock_file(lock_path: Path) -> int:
     """Open (creating) the lock file as a private regular file, refusing symlinks."""
     # O_NOFOLLOW: a planted sibling symlink must not be chmod'd or created through.
+    # os.open fds are non-inheritable (PEP 446), so no O_CLOEXEC is needed.
     flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
     try:
         fd = os.open(lock_path, flags, 0o600)
     except OSError as exc:
@@ -185,8 +186,7 @@ def _names_inode(lock_path: Path, fd: int) -> bool:
         on_disk = os.stat(lock_path, follow_symlinks=False)
     except FileNotFoundError:
         return False
-    held = os.fstat(fd)
-    return (on_disk.st_dev, on_disk.st_ino) == (held.st_dev, held.st_ino)
+    return os.path.samestat(on_disk, os.fstat(fd))
 
 
 @contextmanager
@@ -211,10 +211,24 @@ def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
     """
     path = Path(path)
     lock_path = path.parent / f"{path.name}{LOCK_SUFFIX}"
+    announced = False
     while True:
         fd = _open_lock_file(lock_path)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # The holder may be waiting on a prompt, a keyring unlock or a
+                # slow password script; without this a second run looks hung.
+                # Print once, not on each inode-recheck retry.
+                if not announced:
+                    print(
+                        f"Waiting for another pilfer run (lock {lock_path})...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    announced = True
+                fcntl.flock(fd, fcntl.LOCK_EX)
             if _names_inode(lock_path, fd):
                 break
         except BaseException:

@@ -201,16 +201,8 @@ def _set_keys(
         # Ansible's messages here do not quote plaintext, but name only the type:
         # the contract is that no PilferError carries vault content.
         raise PilferError(f"could not encrypt {path} ({type(exc).__name__}); unchanged") from None
-    if is_whole_file_vault(ciphertext):
-        try:
-            round_trip = vault.decrypt(ciphertext)
-        except Exception:
-            raise PilferError(f"encryption did not round-trip; {path} unchanged") from None
-    else:
-        round_trip = None
-    # Prove the bytes decrypt to what we meant before they replace anything.
-    if round_trip != plaintext:
-        raise PilferError(f"encryption did not round-trip; {path} unchanged")
+    # encrypt_like already proved the ciphertext decrypts to plaintext with the
+    # secret it was made with (RoundTripError above), so no second decrypt here.
     publish_vault(path, ciphertext, expected=original, action="set", publish=not check_only)
     return actions
 
