@@ -99,7 +99,8 @@ def _store(keyring, keyname: str, username: str, where: str) -> int:
     config = _printable(C.CONFIG_FILE or "none")
     # Not in the original. Replacing the entry loses the password files may
     # still be encrypted with: `pilfer rekey` first, then --set.
-    if keyring.get_password(keyname, username) is not None:
+    replacing = keyring.get_password(keyname, username) is not None
+    if replacing:
         try:
             answer = input(
                 f"A password is already stored as {where} (config: {config}). "
@@ -141,22 +142,20 @@ def _store(keyring, keyname: str, username: str, where: str) -> int:
     try:
         keyring.set_password(keyname, username, password)
         stored = keyring.get_password(keyname, username)
-        problem = (
-            None
-            if stored == password
-            else "nothing is stored"
-            if stored is None
-            else "a different value is stored"
-        )
-    except (KeyringError, KeyboardInterrupt) as exc:
+        if stored == password:
+            return 0
+        problem = "nothing is stored" if stored is None else "a different value is stored"
+    except KeyboardInterrupt:
+        # 1, not 130: past this point "interrupted" would wrongly suggest nothing changed.
+        problem = "interrupted"
+    except KeyringError as exc:
         problem = _printable(exc) or type(exc).__name__
-    if problem:
-        sys.stderr.write(
-            f"{PROG}: could not confirm the new password for {where} ({problem}); the old one may be gone. "
-            "Check with a lookup (no --set) and run --set again\n"
-        )
-        return 1
-    return 0
+    lost = "; the old one may be gone" if replacing else ""
+    sys.stderr.write(
+        f"{PROG}: could not confirm the new password for {where} ({problem}){lost}. "
+        "Check with a lookup (no --set) and run --set again\n"
+    )
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:

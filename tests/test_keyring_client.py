@@ -314,6 +314,8 @@ class TestSet(KeyringTest):
         self.assertEqual(code, 1)
         self.assertIn("could not confirm the new password", err)
         self.assertIn("nothing is stored", err)
+        # Nothing was stored before either, so nothing can have been lost.
+        self.assertNotIn("old one", err)
 
     def test_set_says_the_old_password_may_be_gone_when_the_read_back_fails(self):
         # macOS replaces by delete then add: past the write, the old one may be gone.
@@ -335,6 +337,18 @@ class TestSet(KeyringTest):
         self.assertIn("the old one may be gone", err)
         self.assertIn("locked after the write", err)
         self.assertEqual(self.stored(), {f"ansible/{USER}": "pw"})
+
+    def test_set_ctrl_c_during_the_write_exits_1_and_warns(self):
+        # Not 130: once the write has started, "interrupted" alone would
+        # suggest nothing changed.
+        class InterruptedWrite(FileKeyring):
+            def set_password(self, service, username, password):
+                raise KeyboardInterrupt
+
+        self.store("ansible", "old")
+        code, _, err = self.set_in_process(replace="y", backend=InterruptedWrite())
+        self.assertEqual(code, 1)
+        self.assertIn("(interrupted); the old one may be gone", err)
 
 
 class TestThroughAnsible(KeyringTest):
