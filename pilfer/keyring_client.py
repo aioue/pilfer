@@ -20,6 +20,7 @@ Where this differs from the original, the comment at that line says why.
 
 import argparse
 import getpass
+import subprocess
 import sys
 
 import ansible.constants as C
@@ -72,6 +73,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="set the password instead of getting it; asks before replacing a stored one",
     )
     return parser
+
+
+def _is_macos_backend(backend) -> bool:
+    # keyring.backends.macOS imports on any platform; it guards its own
+    # Security framework import.
+    from keyring.backends import macOS
+
+    return isinstance(backend, macOS.Keyring)
 
 
 def _store(backend, keyname: str, username: str, where: str) -> int:
@@ -136,6 +145,21 @@ def _store(backend, keyname: str, username: str, where: str) -> int:
     # from here on may already have removed the old password. set_password can
     # also block on a keychain unlock or access dialog, so ctrl-c lands here too.
     try:
+        if replacing and _is_macos_backend(backend):
+            # Not in the original. After a Python upgrade the new binary is not
+            # on the old item's access list, so keyring's SecItemDelete fails
+            # at once with -25244 (errSecInvalidOwnerEdit) and --set can never
+            # replace it. Apple's security tool may delete it; the new build's
+            # SecItemAdd then owns the new item. Result ignored: not found
+            # (44) is fine, and set_password and the read-back confirm the
+            # write. Absolute path so PATH cannot substitute the tool; the
+            # password is never on the command line.
+            # https://developer.apple.com/forums/thread/69841
+            subprocess.run(
+                ["/usr/bin/security", "delete-generic-password", "-s", keyname, "-a", username],
+                capture_output=True,
+                check=False,
+            )
         backend.set_password(keyname, username, password)
         stored = backend.get_password(keyname, username)
         if stored == password:

@@ -398,6 +398,46 @@ class TestSet(KeyringTest):
         self.assertIn("may be gone", err)
 
 
+class TestMacOSReplace(KeyringTest):
+    """macOS refuses the new Python build's own delete (-25244): --set deletes with `security`."""
+
+    DELETE = ("/usr/bin/security", "delete-generic-password", "-s", "ansible", "-a", USER)
+
+    def set_with_security(self, *, macos=True, returncode=0, stored=True):
+        if stored:
+            self.store("ansible", "old")
+        with (
+            mock.patch.object(keyring_client, "_is_macos_backend", return_value=macos),
+            mock.patch.object(
+                keyring_client.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], returncode),
+            ) as run,
+        ):
+            result = self.set_in_process(replace="y" if stored else None)
+        return run, result
+
+    def test_replacing_deletes_with_the_security_tool_then_stores(self):
+        run, (code, _, _) = self.set_with_security()
+        self.assertEqual(code, 0)
+        run.assert_called_once_with(list(self.DELETE), capture_output=True, check=False)
+        self.assertEqual(self.stored(), {entry("ansible", USER): "pw"})
+
+    def test_no_security_tool_for_a_fresh_store_or_another_backend(self):
+        run, (code, _, _) = self.set_with_security(stored=False)
+        self.assertEqual(code, 0)
+        run.assert_not_called()
+        run, (code, _, _) = self.set_with_security(macos=False)
+        self.assertEqual(code, 0)
+        run.assert_not_called()
+
+    def test_a_failed_delete_still_stores_and_the_read_back_decides(self):
+        run, (code, _, _) = self.set_with_security(returncode=1)
+        self.assertEqual(code, 0)
+        run.assert_called_once()
+        self.assertEqual(self.stored(), {entry("ansible", USER): "pw"})
+
+
 class TestThroughAnsible(KeyringTest):
     def ansible_vault(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(
