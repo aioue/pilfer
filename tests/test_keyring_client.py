@@ -295,8 +295,11 @@ class TestSet(KeyringTest):
 
     def test_set_asks_before_replacing_and_keeps_on_no(self):
         self.store("ansible", "old")
-        code, _, err = self.set_in_process(replace="n")
+        code, out, err = self.set_in_process(replace="n")
         self.assertEqual(code, 1)
+        # The question is on stderr with the prompts; stdout stays empty.
+        self.assertIn("Replace it?", err)
+        self.assertEqual(out, "")
         self.assertIn("kept", err)
         self.assertEqual(self.stored(), {entry("ansible", USER): "old"})
 
@@ -335,6 +338,8 @@ class TestSet(KeyringTest):
                 *_, error = err.splitlines()
                 self.assertTrue(error.startswith(f"{CLIENT_NAME}: "), err)
                 self.assertEqual(len(err.splitlines()), 2, err)
+                if case != "mismatch":
+                    self.assertIn("not valid UTF-8", error)
                 self.assertEqual(self.stored(), {})
 
     def test_set_refuses_spaces_only_and_keeps_the_old_password(self):

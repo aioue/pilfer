@@ -87,21 +87,24 @@ def _store(backend, keyname: str, username: str, where: str) -> int:
     # Not in the original. Replacing the entry loses the password files may
     # still be encrypted with: `pilfer rekey` first, then --set.
     replacing = backend.get_password(keyname, username) is not None
+    # Notices and questions go to stderr with the password prompts: piped,
+    # stdout is block-buffered and would print them out of order (and input()
+    # writes its prompt to stdout).
     if replacing:
+        sys.stderr.write(
+            f"A password is already stored as {where} (config: {config}) via {backend.name!r}. "
+            "Files still encrypted with it will not open after this (pilfer rekey first). "
+            "Replace it? [y/N] "
+        )
+        sys.stderr.flush()
         try:
-            answer = input(
-                f"A password is already stored as {where} (config: {config}) via {backend.name!r}. "
-                "Files still encrypted with it will not open after this (pilfer rekey first). "
-                "Replace it? [y/N] "
-            )
+            answer = input()
         except EOFError:
             answer = ""
         if answer.strip().lower() not in ("y", "yes"):
             sys.stderr.write(f"{PROG}: kept the stored password\n")
             return 1
     else:
-        # stderr with the prompts, not stdout: piped, stdout is block-buffered
-        # and the notice would arrive after them.
         sys.stderr.write(f"Storing a password as {where} (config: {config}) via {backend.name!r}\n")
     # Ansible's own prompt, as `ansible-vault --ask-vault-pass` asks: strips
     # whitespace, confirms, and turns ctrl-d into an error.
@@ -117,13 +120,15 @@ def _store(backend, keyname: str, username: str, where: str) -> int:
         # Not in the original. PromptVaultSecret refuses an empty answer before
         # it strips, so spaces alone would store "" over the old password.
         verify_secret_is_not_empty(secret.bytes, "refusing an empty password")
-    except (AnsibleError, UnicodeError) as exc:
-        # UnicodeError: an answer that is not UTF-8 fails in getpass (decode,
-        # on a terminal) or in PromptVaultSecret's strict encode (piped input).
-        # str, not repr: these messages are fixed strings or embed
-        # repr(keyname); a Unicode error names one escaped byte and its
-        # position, not the password.
+    except AnsibleError as exc:
+        # str, not repr: these messages are fixed strings or embed repr(keyname).
         sys.stderr.write(f"{PROG}: {exc}\n")
+        return 1
+    except UnicodeError as exc:
+        # An answer that is not UTF-8 fails in getpass (decode, on a terminal)
+        # or in PromptVaultSecret's strict encode (piped input). The message
+        # names one escaped byte and its position, not the password.
+        sys.stderr.write(f"{PROG}: the password is not valid UTF-8 ({exc})\n")
         return 1
     password = secret.bytes.decode()
     # Not in the original: confirm the write. A backend can drop it (keyring's
