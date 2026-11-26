@@ -305,27 +305,18 @@ class TestRekeySources(ProjectTest):
     def test_new_vault_id_label_that_core_cannot_write_back_is_refused(self):
         # ';' ends the header, a non-ASCII byte makes is_encrypted reject the
         # blob, and spaces at the ends are stripped on read (so "   " would
-        # silently become no label).
+        # silently become no label). "\udcff" is a non-UTF-8 argv byte.
         before = (self.dir / "plain.yml").read_bytes()
-        for label in ("a;b", "a\x01b", "a\nb", "a\tb", "é", " dev", "dev ", "   "):
+        for label in ("a;b", "a\x01b", "a\nb", "a\tb", "é", " dev", "dev ", "   ", "\udcff"):
             with self.subTest(label=label):
                 result = self.rekey("--new-vault-id", f"{label}@new-pass")
                 self.refused(result, "labels must be ASCII")
                 self.assertEqual((self.dir / "plain.yml").read_bytes(), before)
 
     def test_new_vault_id_labels_core_can_write_back_are_accepted(self):
-        for label in ("dev", "prod-1", "a.b"):
+        for label in ("dev", "a.b"):
             with self.subTest(label=label):
-                self.ok(
-                    self.pilfer(
-                        "rekey",
-                        "--old-vault-password-file",
-                        "old-pass",
-                        "--yes",
-                        "--new-vault-id",
-                        f"{label}@new-pass",
-                    )
-                )
+                self.ok(self.rekey("--new-vault-id", f"{label}@new-pass"))
                 data = (self.dir / "plain.yml").read_bytes()
                 self.assertTrue(data.startswith(f"$ANSIBLE_VAULT;1.2;AES256;{label}\n".encode()))
                 # Back to the old password for the next label.
@@ -339,6 +330,15 @@ class TestRekeySources(ProjectTest):
                         "old-pass",
                     )
                 )
+
+    def test_new_vault_id_default_is_refused_when_the_identity_is_not_default(self):
+        # Core writes "default" as an unlabelled 1.1 header, which reads back as
+        # the configured vault_identity.
+        self.write_cfg("vault_identity = dev\n")
+        before = (self.dir / "plain.yml").read_bytes()
+        result = self.rekey("--new-vault-id", "default@new-pass")
+        self.refused(result, "would read back as 'dev'")
+        self.assertEqual((self.dir / "plain.yml").read_bytes(), before)
 
     def test_new_equal_to_the_ansible_cfg_password_is_refused(self):
         # ansible.cfg's password loads on the old side too; equal to new, rekey

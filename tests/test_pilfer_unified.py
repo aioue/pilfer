@@ -2202,5 +2202,14 @@ class TestVersion(unittest.TestCase):
         self.assertIn(f"pilfer {pilfer_version}", result.stdout)
 
 
+class TestInterruptedHint(unittest.TestCase):
+    def test_rekey_hint_covers_a_finished_rotation(self):
+        # After ctrl-c inside the password-file swap the work is done, and a
+        # re-run is refused because <file>_old exists.
+        hint = pilfer_cli._interrupted_hint("rekey")
+        self.assertIn("re-run the same command", hint)
+        self.assertIn("_old now exists, the rotation finished", hint)
+
+
 if __name__ == "__main__":
     unittest.main()

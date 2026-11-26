@@ -60,7 +60,6 @@ from pilfer.vault_secrets import (
     is_plain_password_file,
     load_new_secret,
     load_vault,
-    password_file_secret,
     secret_for,
     single_secret_vault,
     vault_label,
@@ -1397,7 +1396,7 @@ def _check_rotation_targets(old_path: str, new_path: str) -> None:
     O_EXCL | O_NOFOLLOW and _read_no_follow.
     """
     backup = f"{old_path}_old"
-    for path in (old_path, new_path, backup):
+    for path in (old_path, new_path):
         if os.path.islink(path):
             raise PilferError(f"refusing symlink password file: {path}")
     if os.path.lexists(backup):
@@ -1513,11 +1512,10 @@ def rekey_vault_files(
         )
     # The file being rotated must hold the password the tree is on, not one
     # that ansible.cfg or vault_identity_list loaded alongside it.
-    if (
-        rotate_password_file
-        and used_secrets
-        and used_secrets != {password_file_secret(old_path).bytes}
-    ):
+    # _rotation_paths allowed exactly one -p and no --vault-id/-J, so the
+    # explicit sources are that one file, already loaded.
+    own = old_vault.explicit[0].secret if rotate_password_file else None
+    if rotate_password_file and used_secrets and (own is None or used_secrets != {own.bytes}):
         raise PilferError(
             "--rotate-password-file refused: the targets are not encrypted with the "
             "password in --old-vault-password-file."
@@ -1981,7 +1979,10 @@ def _interrupted_hint(action: str) -> str:
     if action in ("open", "close") and _session_is_open():
         return " A session is still open: run 'pilfer close' to finish."
     if action == "rekey":
-        return " If rekey had started writing, re-run the same command to resume."
+        return (
+            " If rekey had started writing, re-run the same command to resume."
+            " If <password file>_old now exists, the rotation finished."
+        )
     return ""
 
 

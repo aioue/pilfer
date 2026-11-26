@@ -27,9 +27,7 @@ from ansible.parsing.vault import (
     PromptVaultSecret,
     VaultLib,
     VaultSecret,
-    format_vaulttext_envelope,
     get_file_vault_secret,
-    is_encrypted,
     parse_vaulttext_envelope,
 )
 from ansible.utils.path import unfrackpath
@@ -261,26 +259,27 @@ def load_vault(sources=None) -> SourceVault:
     return SourceVault(secrets, _explicit_secrets(sources, secrets))
 
 
-def _require_writable_label(label: str) -> None:
-    """Refuse a label that does not survive core's header format and parse.
-
-    The label goes into every value's header. Core's own round trip catches
-    ';' (it ends the header), non-ASCII (is_encrypted rejects the blob) and
-    whitespace at the ends (the parse strips it); the printable test adds the
-    control characters inside a label, which core would write and read back
-    but a line-based reader would cut at.
-    """
-    if not label:
+def _require_writable_label(label: str | None) -> None:
+    """Refuse a label core cannot write into a header and read back unchanged."""
+    # The predicates match core's envelope round trip (a 3089-label fuzz agreed)
+    # without raising on a surrogate from a non-UTF-8 argv byte. split_vault_id
+    # gives None for a source with no label, which is fine.
+    if label is None:
         return
-    envelope = format_vaulttext_envelope(b"x", "AES256", vault_id=label)
     if not (
-        label.isprintable()
-        and is_encrypted(envelope)
-        and parse_vaulttext_envelope(envelope)[3] == label
+        label.isascii() and label.isprintable() and ";" not in label and label == label.strip()
     ):
         raise PilferError(
             f"'{label}' is not a valid vault id: labels must be ASCII, with no ';', "
             "no spaces at either end and no control characters"
+        )
+    identity = C.DEFAULT_VAULT_IDENTITY
+    if label == "default" and identity != "default":
+        # Core writes "default" as an unlabelled 1.1 header, which reads back as
+        # the configured vault_identity: a silent relabel.
+        raise PilferError(
+            f"'default' is Ansible's unlabelled id and would read back as '{identity}'; "
+            f"use --new-vault-id {identity}@..."
         )
 
 
@@ -333,16 +332,6 @@ def is_plain_password_file(path: str) -> bool:
         raise PilferError(f"vault password: {exc}") from None
     # ScriptVaultSecret and ClientScriptVaultSecret subclass FileVaultSecret.
     return type(secret) is FileVaultSecret
-
-
-def password_file_secret(path: str) -> VaultSecret:
-    """Load one password file or script, as Ansible would."""
-    try:
-        secret = get_file_vault_secret(filename=path, loader=DataLoader())
-        secret.load()
-    except AnsibleError as exc:
-        raise PilferError(f"vault password: {exc}") from None
-    return secret
 
 
 def vault_label(ciphertext: bytes) -> str | None:

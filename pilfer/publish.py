@@ -204,6 +204,10 @@ def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
     - A waiter that opened the file before the unlink wakes holding a lock on
       an inode the path no longer names. After flock returns it checks that the
       path still names its inode, and starts over if not.
+
+    Every pilfer that takes this lock must follow this protocol. pilfer 2.x has
+    no inode re-check and no unlink, so running it in the same tree as 3.x at
+    the same time can leave one of them holding a lock on a dead inode.
     """
     path = Path(path)
     lock_path = path.parent / f"{path.name}{LOCK_SUFFIX}"
