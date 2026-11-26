@@ -69,7 +69,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install ansible build twine
           pip install -r requirements-dev.txt
-          pip install -e '.[keyring]'  # the extra runs test_keyring_client
+          pip install -e '.[keyring]'
 
       - name: Ruff
         run: ruff check pilfer/ pilfer.py tests/

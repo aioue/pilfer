@@ -39,8 +39,9 @@ python -m unittest test_pilfer_unified.TestPilferCLI.test_line_endings_preserved
   null backends, so the real keychain is never touched. Needs the `keyring`
   extra (`pip install -e '.[keyring]'`).
 - `_file_keyring.py`: a keyring backend that keeps passwords in a JSON file.
-  `PYTHON_KEYRING_BACKEND` and `PILFER_TEST_KEYRING` select it, because the
-  client under test runs in its own process.
+  In-process tests pass `FileKeyring(path)`. The client under test runs in its
+  own process and selects it with `PYTHON_KEYRING_BACKEND` and
+  `PILFER_TEST_KEYRING`. Backend variants in the tests subclass it.
 - `test_vault_set.py`: `pilfer set` and `set_keys`. Results are read back
   through the `ansible-vault` CLI, not through pilfer.
 

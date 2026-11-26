@@ -229,7 +229,7 @@ keyname = myproject
 username = ops
 ```
 
-Then, from the project directory so it reads the same `[vault]` settings, store the password. It prints the key and user it stores under:
+Then, from the project directory so it reads the same `[vault]` settings, store the password:
 
 ```bash
 pilfer-vault-keyring-client --set

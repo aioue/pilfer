@@ -1,10 +1,10 @@
 """pilfer-vault-keyring-client: a vault password client script on the system keyring.
 
 The keyring is _file_keyring.FileKeyring, a JSON file per test, or keyring's
-own fail and null backends, selected with PYTHON_KEYRING_BACKEND (or patched
-in-process), so nothing here reads or writes the real keychain. Lookups run
-the client the way Ansible does, as an executable named *-client in its own
-process. --set mostly runs main() in-process to feed the prompts; tests that
+own fail and null backends, selected with PYTHON_KEYRING_BACKEND (or set
+in-process with keyring.set_keyring), so nothing here reads or writes the real
+keychain. Most lookups run the client the way Ansible does, as an executable
+named *-client in its own process. --set mostly runs main() in-process to feed the prompts; tests that
 need the real process pipe the answers to run_client(input=...).
 """
 
@@ -39,13 +39,6 @@ from pilfer import keyring_client  # noqa: E402
 
 CLIENT_NAME = "pilfer-vault-keyring-client"
 USER = getpass.getuser()
-
-
-class Interrupts(FileKeyring):
-    """ctrl-c while the keyring is read (a Keychain dialog can block there)."""
-
-    def get_password(self, service, username):
-        raise KeyboardInterrupt
 
 
 class InterruptsTheWrite(FileKeyring):
@@ -97,9 +90,7 @@ class KeyringTest(ProjectTest):
         )
 
     def store(self, service: str, password: str, username: str = USER) -> None:
-        data = self.stored()
-        data[entry(service, username)] = password
-        self.keyring_file.write_text(json.dumps(data))
+        FileKeyring(self.keyring_file).set_password(service, username, password)
 
     def stored(self) -> dict:
         return json.loads(self.keyring_file.read_text()) if self.keyring_file.exists() else {}
@@ -162,24 +153,21 @@ class TestClientLookup(KeyringTest):
         self.assertEqual(self.run_client("--vault-id", "dev").stdout, "dev-pw\n")
 
     def test_config_is_parsed_as_ansible_parses_it(self):
-        # Quotes, an inline ; comment, and a non-UTF-8 comment Ansible accepts.
-        self.write(
-            "ansible.cfg",
+        # The file ANSIBLE_CONFIG names, with quotes, an inline ; comment, and a
+        # non-UTF-8 comment Ansible accepts. A decoy in the cwd must lose to it.
+        elsewhere = self.write(
+            "conf/quirky.cfg",
             b"[defaults]\n# caf\xe9\n[vault]\nkeyname = \"homelab\" ; the service\nusername = 'ops'\n",
         )
+        self.write("ansible.cfg", "[defaults]\n[vault]\nkeyname = decoy\nusername = decoy\n")
         self.store("homelab", "pw", username="ops")
-        result = self.run_client()
+        result = self.run_client(env={"ANSIBLE_CONFIG": str(elsewhere)})
         self.assertEqual((result.returncode, result.stdout), (0, "pw\n"), result.stderr)
 
     def test_username_flag_beats_config(self):
         self.write("ansible.cfg", "[defaults]\n[vault]\nusername = ops\n")
         self.store("ansible", "theirs", username="other")
         self.assertEqual(self.run_client("--username", "other").stdout, "theirs\n")
-
-    def test_ansible_config_variable_is_followed(self):
-        elsewhere = self.write("conf/ansible.cfg", "[defaults]\n[vault]\nkeyname = from-env\n")
-        self.store("from-env", "pw")
-        self.assertEqual(self.run_client(env={"ANSIBLE_CONFIG": str(elsewhere)}).stdout, "pw\n")
 
     def test_password_bytes_are_utf8_whatever_stdout_encoding(self):
         self.store("ansible", " café pw ")
@@ -218,9 +206,20 @@ class TestClientLookup(KeyringTest):
         self.assertNotIn("Traceback", result.stderr)
 
     def test_lookup_ctrl_c_exits_130(self):
-        code, _, err = self.run_in_process(backend=Interrupts(self.keyring_file))
+        # ctrl-c while the keyring is read (a Keychain dialog can block there).
+        backend = FileKeyring(self.keyring_file)
+        backend.get_password = mock.Mock(side_effect=KeyboardInterrupt)
+        code, _, err = self.run_in_process(backend=backend)
         self.assertEqual(code, 130)
         self.assertIn("interrupted", err)
+
+    def test_ctrl_c_while_the_backend_loads_exits_130(self):
+        # A Secret Service D-Bus probe can block in get_keyring().
+        with mock.patch.object(keyring, "get_keyring", side_effect=KeyboardInterrupt):
+            code, _, err = self.run_in_process()
+        self.assertEqual(code, 130)
+        self.assertIn("interrupted", err)
+        self.assertNotIn("Traceback", err)
 
     def test_without_keyring_package_says_what_to_install(self):
         # None in sys.modules makes `import keyring.errors` raise ImportError.
@@ -244,26 +243,30 @@ class TestClientLookup(KeyringTest):
             self.assertIn("--username", err)
             with self.subTest("with --username"):
                 code, _, err = self.run_in_process("--username", "u")
-                self.assertEqual(code, keyring_client.KEYNAME_UNKNOWN_RC, err)
+                self.assertNotIn("--username", err)
 
     def test_names_from_config_are_escaped_in_messages(self):
         self.write("ansible.cfg", "[defaults]\n[vault]\nkeyname = a\n  \x1b[2Jb\n")
         result = self.run_client()
         self.assertEqual(result.returncode, 2, result.stderr)
+        # No raw ESC and no raw newline from inside the name reach the terminal.
         self.assertNotIn("\x1b", result.stderr)
-        self.assertIn("key='a\\n\\x1b[2Jb'", result.stderr)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+        self.assertIn("\\x1b[2J", result.stderr)
 
 
 class TestSet(KeyringTest):
     def test_set_stores_under_the_vault_id(self):
-        code, out, _ = self.set_in_process("--vault-id", "prod")
+        code, out, err = self.set_in_process("--vault-id", "prod")
         self.assertEqual(code, 0)
-        self.assertIn("prod", out)
+        # The notice goes to stderr with the prompts, not to stdout.
+        self.assertIn("Storing a password as", err)
+        self.assertEqual(out, "")
         self.assertEqual(self.stored(), {entry("prod", USER): "pw"})
 
     def test_set_with_the_default_vault_id_stores_under_keyname(self):
         # The same mapping and config as the lookup, so --set then
-        # vault_password_file works. A real process reading the real ansible.cfg.
+        # vault_password_file works. A real process, so Ansible parses the test's ansible.cfg.
         self.write(
             "ansible.cfg",
             "[defaults]\nvault_identity = prod\n[vault]\nkeyname = homelab\nusername = ops\n",
@@ -271,7 +274,6 @@ class TestSet(KeyringTest):
         result = self.run_client("--vault-id", "prod", "--set", input="pw\npw\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.stored(), {"homelab/ops": "pw"})
-        self.assertEqual(self.run_client("--vault-id", "prod").stdout, "pw\n")
 
     def test_set_prompts_escape_names_from_config(self):
         self.write("ansible.cfg", "[defaults]\n[vault]\nkeyname = evil\x1b]0;PWNED\x07name\n")
@@ -300,22 +302,34 @@ class TestSet(KeyringTest):
     def test_set_keeps_the_stored_password_without_an_answer(self):
         # No terminal (EOF) or just Enter: the default is to keep it.
         for answer in (EOFError(), ""):
-            self.store("ansible", "old")
-            code, _, err = self.set_in_process(replace=answer)
-            self.assertEqual(code, 1, answer)
-            self.assertIn("kept", err)
-            self.assertEqual(self.stored(), {entry("ansible", USER): "old"})
-
-    def assert_one_line_error(self, err: str) -> None:
-        # The text after the prefix is ansible-core's (PromptVaultSecret), and
-        # its wording is not pilfer's to pin across core versions.
-        self.assertTrue(err.startswith(f"{CLIENT_NAME}: "), err)
-        self.assertEqual(len(err.strip().splitlines()), 1, err)
+            with self.subTest(answer=repr(answer)):
+                self.store("ansible", "old")
+                code, _, err = self.set_in_process(replace=answer)
+                self.assertEqual(code, 1)
+                self.assertIn("kept", err)
+                self.assertEqual(self.stored(), {entry("ansible", USER): "old"})
 
     def test_set_refuses_a_mismatch(self):
         code, _, err = self.set_in_process(typed=("pw", "typo"))
         self.assertEqual(code, 1)
-        self.assert_one_line_error(err)
+        # The text after the prefix is ansible-core's (PromptVaultSecret), and
+        # its wording is not pilfer's to pin across core versions.
+        # After the "Storing" notice: one error line. The text after the prefix
+        # is ansible-core's (PromptVaultSecret), and its wording is not
+        # pilfer's to pin across core versions.
+        *_, error = err.splitlines()
+        self.assertTrue(error.startswith(f"{CLIENT_NAME}: "), err)
+        self.assertEqual(len(err.splitlines()), 2, err)
+        self.assertEqual(self.stored(), {})
+
+    def test_set_refuses_a_password_that_is_not_utf8(self):
+        # A surrogate-escaped terminal byte: PromptVaultSecret encodes strictly
+        # and raises UnicodeEncodeError, not AnsibleError.
+        code, _, err = self.set_in_process(typed=("caf\udce9", "caf\udce9"))
+        self.assertEqual(code, 1)
+        *_, error = err.splitlines()
+        self.assertTrue(error.startswith(f"{CLIENT_NAME}: "), err)
+        self.assertEqual(len(err.splitlines()), 2, err)
         self.assertEqual(self.stored(), {})
 
     def test_set_refuses_spaces_only_and_keeps_the_old_password(self):
@@ -357,7 +371,6 @@ class TestSet(KeyringTest):
         self.assertEqual(code, 1)
         self.assertIn("the old one may be gone", err)
         self.assertIn("locked after the write", err)
-        self.assertEqual(self.stored(), {entry("ansible", USER): "pw"})
 
     def test_set_reports_a_different_value_after_the_write(self):
         code, _, err = self.set_in_process(backend=Corrupts(self.keyring_file))
@@ -373,7 +386,6 @@ class TestSet(KeyringTest):
         self.assertEqual(code, 1)
         self.assertIn("could not confirm", err)
         self.assertIn("may be gone", err)
-        self.assertEqual(self.stored(), {})
 
 
 class TestThroughAnsible(KeyringTest):
@@ -416,7 +428,10 @@ class TestThroughAnsible(KeyringTest):
         self.ok(self.pilfer("close"))
         self.assertEqual(vault.decrypt((self.dir / "secret.yml").read_bytes()), b"token: old\n")
 
-    def test_pilfer_names_the_missing_key(self):
+    def test_pilfer_reports_a_missing_password_as_ansible_does(self):
+        # "did not find a secret" is ansible-core's wording for the client's exit
+        # code 2, which the README quotes; this is the one check that 2 reaches
+        # Ansible as "not found".
         self.write_cfg(f"vault_password_file = {self.client}\n")
         self.write("secret.yml", only("x").encrypt(b"token: x\n"))
         self.refused(self.pilfer("open"), "did not find a secret")

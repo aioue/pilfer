@@ -62,7 +62,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--vault-id",
-        dest="vault_id",
         help="name of the vault secret to get from keyring",
     )
     parser.add_argument("--username", help="the username whose keyring is queried")
@@ -101,7 +100,9 @@ def _store(backend, keyname: str, username: str, where: str) -> int:
             sys.stderr.write(f"{PROG}: kept the stored password\n")
             return 1
     else:
-        sys.stdout.write(f"Storing a password as {where} (config: {config}) via {backend.name!r}\n")
+        # stderr with the prompts, not stdout: piped, stdout is block-buffered
+        # and the notice would arrive after them.
+        sys.stderr.write(f"Storing a password as {where} (config: {config}) via {backend.name!r}\n")
     # Ansible's own prompt, as `ansible-vault --ask-vault-pass` asks: strips
     # whitespace, confirms, and turns ctrl-d into an error.
     secret = PromptVaultSecret(
@@ -116,9 +117,11 @@ def _store(backend, keyname: str, username: str, where: str) -> int:
         # Not in the original. PromptVaultSecret refuses an empty answer before
         # it strips, so spaces alone would store "" over the old password.
         verify_secret_is_not_empty(secret.bytes, "refusing an empty password")
-    except AnsibleError as exc:
-        # str, not repr: every message on this path is a fixed string or embeds
-        # repr(keyname), so it is already terminal-safe.
+    except (AnsibleError, UnicodeError) as exc:
+        # UnicodeError: PromptVaultSecret encodes strictly, so an answer that is
+        # not UTF-8 raises UnicodeEncodeError. str, not repr: these messages are
+        # fixed strings or embed repr(keyname); a UnicodeEncodeError names only
+        # the one bad character, escaped, not the password.
         sys.stderr.write(f"{PROG}: {exc}\n")
         return 1
     password = secret.bytes.decode()
@@ -149,8 +152,18 @@ def _store(backend, keyname: str, username: str, where: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
+        return _run(args)
+    except KeyboardInterrupt:
+        # Anywhere after argument parsing: the backend load (a Secret Service
+        # D-Bus probe can block), the lookup, or the prompts.
+        sys.stderr.write(f"{PROG}: interrupted\n")
+        return 130
+
+
+def _run(args: argparse.Namespace) -> int:
+    try:
         # Imported here: keyring is the optional extra, and --help and this hint
-        # must work without it. keyring.errors is named because main catches
+        # must work without it. keyring.errors is named because this catches
         # its KeyringError; `import keyring` binds it only as a side effect.
         import keyring.errors
     except ImportError:
@@ -190,14 +203,13 @@ def main(argv: list[str] | None = None) -> int:
         # Not in the original, which let a traceback through.
         sys.stderr.write(f"{PROG}: keyring error for {where}: {exc!r}\n")
         return 1
-    except KeyboardInterrupt:
-        sys.stderr.write(f"{PROG}: interrupted\n")
-        return 130
 
     if secret is None:
         sys.stderr.write(f"{PROG} could not find {where} via backend={backend.name!r}\n")
         return KEYNAME_UNKNOWN_RC
     if not secret:
+        # Not in the original, which printed an empty line. Ansible would then
+        # fail with a confusing vault error instead of naming the entry.
         sys.stderr.write(f"{PROG}: the stored password for {where} is empty\n")
         return 1
 
