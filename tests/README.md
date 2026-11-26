@@ -33,6 +33,15 @@ python -m unittest test_pilfer_unified.TestPilferCLI.test_line_endings_preserved
   a subprocess, because Ansible reads its config at import.
 - `_ansible_isolation.py`: imported first by every test module. Points
   `ANSIBLE_CONFIG` at an empty file so the machine's own Ansible config stays out.
+- `test_keyring_client.py`: `pilfer-vault-keyring-client`, run as Ansible runs
+  it and through `ansible-vault` and pilfer. The keyring is
+  `_file_keyring.FileKeyring`, a JSON file per test, or keyring's own fail and
+  null backends, so the real keychain is never touched. Needs the `keyring`
+  extra (`pip install -e '.[keyring]'`).
+- `_file_keyring.py`: a keyring backend that keeps passwords in a JSON file.
+  In-process tests pass `FileKeyring(path)`. The client under test runs in its
+  own process and selects it with `PYTHON_KEYRING_BACKEND` and
+  `PILFER_TEST_KEYRING`. Backend variants in the tests subclass it.
 - `test_vault_set.py`: `pilfer set` and `set_keys`. Results are read back
   through the `ansible-vault` CLI, not through pilfer.
 
@@ -40,3 +49,4 @@ python -m unittest test_pilfer_unified.TestPilferCLI.test_line_endings_preserved
 
 - Python 3.12+
 - `ansible-core` 2.21+, for `VaultLib`, and `ansible-vault` on `PATH`
+- `keyring` 25+ (`pip install -e '.[keyring]'`) for `test_keyring_client.py`

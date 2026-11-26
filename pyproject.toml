@@ -52,6 +52,11 @@ keywords = [
     "yaml",
 ]
 
+[project.optional-dependencies]
+# pilfer-vault-keyring-client: macOS Keychain or Secret Service via keyring
+# (ansible-core has no Windows controller).
+keyring = ["keyring>=25"]
+
 [project.urls]
 Homepage = "https://aioue.net/2026/08/07/pilfer-bulk-ansible-vault-edit/"
 Documentation = "https://aioue.net/2026/08/07/pilfer-bulk-ansible-vault-edit/"
@@ -61,6 +66,8 @@ Changelog = "https://github.com/aioue/pilfer/releases"
 
 [project.scripts]
 pilfer = "pilfer.cli:main"
+# Ansible passes --vault-id only to a password script whose name ends in -client.
+pilfer-vault-keyring-client = "pilfer.keyring_client:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

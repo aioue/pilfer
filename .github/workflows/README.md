@@ -138,7 +138,7 @@ Trusted publishing uses OIDC (`id-token: write`) - no long-lived PyPI API token 
 ```bash
 git clone https://github.com/aioue/pilfer.git
 cd pilfer
-pip install -e .
+pip install -e '.[keyring]'
 pilfer --help
 
 # Quick test (same as ci.yml)
