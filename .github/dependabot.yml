@@ -16,6 +16,8 @@ updates:
     labels:
       - dependencies
       - github-actions
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns:

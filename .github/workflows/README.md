@@ -17,7 +17,7 @@ Fast, essential testing on every push and pull request.
 
 Thorough validation for larger changes and pre-release checks.
 
-- Multi-Python matrix (3.10–3.13)
+- Matrix of three rows: Python 3.12 with the floors `pyproject.toml` promises (ansible-core 2.21.0, keyring 25.0.0), 3.13 with ansible-core 2.22, 3.14 with the newest core
 - Ruff lint (`requirements-dev.txt` pin)
 - Bandit (`-ll`, fails on medium+; SARIF uploaded to Security)
 - Coverage reports uploaded as artifacts
@@ -57,7 +57,7 @@ Tag pushes publish. Manual `workflow_dispatch` validates and builds only.
 - GitHub Actions updates (one grouped PR)
 - Python dependencies from `pyproject.toml` and `requirements-dev.txt` (minor/patch grouped separately from major)
 - Labels: `dependencies`, plus `github-actions` or `python`
-- Cooldown on pip updates (longer wait for major semver bumps)
+- Cooldown on updates: 7 days for GitHub Actions; for pip, 14 days for major, 7 for minor and 3 for patch bumps
 - Security updates remain immediate and are not batched with version updates
 
 ## Triggers
@@ -117,7 +117,7 @@ Trusted publishing uses OIDC (`id-token: write`) - no long-lived PyPI API token 
 - Minimal `permissions` on each workflow
 - PyPI trusted publishing instead of stored API tokens
 - Dependabot alerts, security updates, and grouped security PRs
-- CodeQL code scanning (GitHub default setup)
+- CodeQL code scanning (`codeql.yml`; GitHub's default setup stays off)
 - Bandit in CI with SARIF upload (`test.yml`); config in `pyproject.toml`
 
 ### Performance
@@ -130,7 +130,7 @@ Trusted publishing uses OIDC (`id-token: write`) - no long-lived PyPI API token 
 
 - Version consistency checks before release
 - `twine check` on built artifacts
-- Matrix testing across Python versions
+- Matrix testing across Python versions, with the supported ansible-core and keyring floors on the oldest row
 - Release artifacts preserved on GitHub
 
 ## Local Development
@@ -160,7 +160,7 @@ python -m build
 python -m twine check dist/*
 ```
 
-Use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`) so release notes stay readable. Optional: `./scripts/release-notes.sh` before tagging.
+Use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`) so release notes stay readable. For a new major version, `./scripts/release-notes.sh` appends the README's `## Upgrading to X.0` section, so write the upgrade notes there. It prints nothing extra if the section is missing. Run it before tagging.
 
 Manual publish when trusted publishing is unavailable:
 

@@ -16,20 +16,25 @@ concurrency:
 
 jobs:
   test:
-    name: Test on Python ${{ matrix.python-version }}, ansible-core ${{ matrix.ansible-core || 'latest' }}
+    name: Test on Python ${{ matrix.python-version }}, ansible-core ${{ matrix.ansible-core || 'latest' }}, keyring ${{ matrix.keyring || 'latest' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false  # Continue testing other versions if one fails
       matrix:
-        # The floor pyproject.toml promises (core 2.21 needs Python 3.12), the
-        # current core, and the newest Python with whatever core pip picks.
+        # The 3.12 row installs exactly the floors pyproject.toml promises
+        # (core 2.21 needs Python 3.12): ansible-core 2.21.0 and keyring 25.0.0.
+        # The other rows take the current core and the newest keyring, and the
+        # newest Python gets whatever core pip picks.
         include:
           - python-version: "3.12"
-            ansible-core: "==2.21.*"
+            ansible-core: "==2.21.0"
+            keyring: "==25.0.0"
           - python-version: "3.13"
             ansible-core: "==2.22.*"
+            keyring: ""
           - python-version: "3.14"
             ansible-core: ""
+            keyring: ""
     
     steps:
     - name: Checkout code
@@ -53,6 +58,8 @@ jobs:
         python -m pip install --upgrade pip
         pip install "ansible-core${{ matrix.ansible-core }}"
         pip install -e '.[keyring]'     # Install pilfer in development mode
+        # After the extra, so the pin wins over the newest keyring it pulled in.
+        pip install "keyring${{ matrix.keyring }}"
         ansible --version
         
     - name: Verify installation
@@ -149,7 +156,7 @@ jobs:
     - name: Install dependencies with coverage
       run: |
         python -m pip install --upgrade pip
-        pip install ansible-core coverage
+        pip install coverage
         pip install -e '.[keyring]'
         
     - name: Run tests with coverage

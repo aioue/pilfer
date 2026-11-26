@@ -241,6 +241,9 @@ def _ansible_vault_values(content: bytes) -> list[bytes]:
         text = content.decode("utf-8")
     except UnicodeDecodeError:
         return []
+    # Ansible may print a duplicate-key warning here ("Origin: <unknown>", the key
+    # name only). No file name is passed: with a real origin Ansible quotes the
+    # file's lines, plaintext values included, into stderr and CI logs.
     loader = AnsibleLoader(text)
     documents = []
     try:

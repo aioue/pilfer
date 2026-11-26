@@ -55,6 +55,18 @@ Add to `ansible.cfg` so you do not need `-p` on every run:
 vault_password_file = ~/.ansible-vault/.vault-file
 ```
 
+## Upgrading to 3.0
+
+- Pilfer needs Python 3.12+ and ansible-core 2.21+ (was Python 3.10+ and ansible 2.9+). It depends on ansible-core instead of ansible.
+- With `vault_id_match = True`, a `-p` password no longer opens a labelled file. `ansible-vault` refuses it too.
+- Library callers get Ansible's config as of import.
+- Non-UTF-8 password files are read as bytes, as Ansible reads them.
+- Commands that load passwords need a UTF-8 locale, as `ansible-vault` does. `LC_ALL=C` fails; use `C.UTF-8`. `--help` and `--version` work in any locale.
+- Password scripts and `-client` scripts now run ([#18](https://github.com/aioue/pilfer/issues/18)). An executable password file named by `-p`, `--vault-id` or `ansible.cfg` is run. Pilfer's own fallback files are read, never run (see [Vault passwords](https://github.com/aioue/pilfer#vault-passwords)).
+- `./ansible.cfg` in the current directory is read by Ansible, and a password script it names is run, as `ansible-vault` does. Do not run pilfer in a tree you do not trust, or set `ANSIBLE_CONFIG` or pass `-p`. 2.x only read the path.
+- A `vault_password_file` in `ansible.cfg` that does not exist is now an error. 2.x fell back to pilfer's fallback files.
+- Do not run pilfer 2.x and 3.x on the same tree at the same time. They handle lock files differently.
+
 ## Features
 
 - **Ansible's password sources** - Loads vault passwords the way `ansible-vault` does: `vault_password_file` and `vault_identity_list` from Ansible's config, `--vault-id`, password scripts and `-client` scripts
@@ -75,7 +87,7 @@ Commands: open | close | rekey | set
 
 pilfer open [--include-encrypted-vars] [-q] [VAULT OPTIONS]
 pilfer close [--confirm-delete] [VAULT OPTIONS]
-pilfer rekey [--old-vault-password-file OLD | --old-vault-id ID] (--new-vault-password-file NEW | --new-vault-id ID) [options]
+pilfer rekey [--old-vault-password-file OLD]... [--old-vault-id ID]... (--new-vault-password-file NEW | --new-vault-id ID) [options]
 pilfer set [VAULT OPTIONS] FILE KEY [VALUE]
 
 VAULT OPTIONS: [--vault-id ID]... [-p VAULT_PASSWORD_FILE]... [-J]
@@ -157,20 +169,6 @@ An inline `!vault` value is always a string to Ansible. If you edit
 `db_port: "5432"` to `db_port: 5432`, close stores the string `"5432"` and
 says so; convert it where it is used, for example `{{ db_port | int }}`.
 
-If you delete an entire opened variable line (key + value + marker), `close`
-refuses by default (ambiguous delete vs accident). Confirm with:
-
-```bash
-pilfer close --confirm-delete
-```
-
-which then prints:
-
-```text
-🔍 Detected removal of 1 encrypted vars:
-  - db_password
-```
-
 If you strip only the `# pilfer:vault:N` comment while leaving the secret,
 `close` refuses with:
 
@@ -194,12 +192,19 @@ refuses by default (ambiguous delete vs accident):
   Undo:            restore the line, then pilfer close
 ```
 
+`pilfer close --confirm-delete` then prints:
+
+```text
+🔍 Detected removal of 1 encrypted vars:
+  - db_password
+```
+
 Renaming the key and dropping the marker is also refused if the secret value is
 still present in the file (including in comments).
 
 ### Vault passwords
 
-Pilfer loads vault passwords with Ansible's own code, the same call `ansible-vault decrypt` makes. Sources load in this order: `vault_identity_list` from Ansible's config, `--vault-id`, `-p`, then `vault_password_file` from the config. The config is found as Ansible finds it: `ANSIBLE_CONFIG`, `./ansible.cfg`, `~/.ansible.cfg`, `/etc/ansible/ansible.cfg`, and the `ANSIBLE_VAULT_*` environment variables override it.
+Pilfer loads vault passwords with Ansible's own code, the same call `ansible-vault decrypt` makes. Sources load in this order: `vault_identity_list` from Ansible's config, `--vault-id`, `-p`, `vault_password_file` from the config, then the `-J` prompt. The config is found as Ansible finds it: `ANSIBLE_CONFIG`, `./ansible.cfg`, `~/.ansible.cfg`, `/etc/ansible/ansible.cfg`, and the `ANSIBLE_VAULT_*` environment variables override it.
 
 An executable password file is run and its output is the password, as in [storing passwords in third-party tools](https://docs.ansible.com/projects/ansible/latest/vault_guide/vault_managing_passwords.html#storing-passwords-in-third-party-tools-with-vault-password-client-scripts). A script named `*-client` is passed `--vault-id`. Each command runs a script once.
 
@@ -209,9 +214,9 @@ pilfer open --vault-id dev@~/.local/bin/pilfer-vault-keyring-client --vault-id p
 
 `close` and `pilfer set` encrypt each value with the password that decrypted it, under its existing vault-id label, as `ansible-vault edit` does. A tree on several vault ids opens and closes in one session, and `close` needs every password that `open` used.
 
-Ansible loads the config's `vault_password_file` even when `-p` or `--vault-id` is given, so a wrong `-p` does not fail by itself. `open` and `set` warn when a password you passed decrypts none of the files, and `close` refuses it: close never changes a file's password, and `pilfer rekey` does.
+Ansible loads the config's `vault_password_file` even when `-p` or `--vault-id` is given, so a wrong `-p` does not fail by itself. `open` and `set` warn when a password you passed decrypts none of the files. `close` refuses a password that decrypts none of the session's backups when it could be a rotation: an unlabelled `-p`, `-J` or default-id source, or a `--vault-id` whose label a backup in the session carries. A labelled `--vault-id` whose label no backup carries gets a warning. Close never changes a file's password; `pilfer rekey` does.
 
-When neither the flags nor Ansible's config name a source, pilfer tries `~/.ansible-vault/.vault-file`, `.vault_password`, `vault_password_file`, and finally `../../vault_password_file`.
+When neither the flags nor Ansible's config name a source, pilfer tries `~/.ansible-vault/.vault-file`, `.vault_password`, `vault_password_file`, and finally `../../vault_password_file`. These are read as plain password files and never run; only a source named by a flag or `ansible.cfg` can be a script.
 
 #### Passwords in the system keyring
 
@@ -235,7 +240,7 @@ Then, from the project directory so it reads the same `[vault]` settings, store 
 pilfer-vault-keyring-client --set
 ```
 
-A labelled source reads the service named by its label: `--vault-id prod@~/.local/bin/pilfer-vault-keyring-client` reads `prod`, and `--vault-id prod --set` stores it. An unlabelled source such as `vault_password_file` reads `keyname`, and so does a label equal to the default vault id (`default`, or `vault_identity`). A missing password exits 2, which Ansible reports as "did not find a secret". `--set` prints the key, user and keyring backend it writes to, and asks before it replaces a stored password.
+A labelled source reads the service named by its label: `--vault-id prod@~/.local/bin/pilfer-vault-keyring-client` reads `prod`, and `--vault-id prod --set` stores it. An unlabelled source such as `vault_password_file` reads `keyname`, and so does a label equal to the default vault id (`default`, or the value of `vault_identity` in ansible.cfg). A missing password exits 2, which Ansible reports as "did not find a secret". `--set` prints the key, user and keyring backend it writes to, and asks before it replaces a stored password.
 
 The macOS login keychain is locked in SSH sessions, so the script fails there. macOS trusts the Python build that ran `--set` and does not ask again. After a Python upgrade macOS asks once when the new build first reads the entry, and `--set` from the new build replaces it: it deletes the old entry with Apple's `security` tool, because macOS refuses the new build's own delete. A venv runs its base interpreter, so every script that build runs can read the password; where that matters, use a Python build you use for nothing else. Secret Service has no per-program access: any program in your session can read the entry.
 
@@ -250,21 +255,11 @@ pilfer open --include-encrypted-vars
 pilfer close
 ```
 
-### Re-key a project
-
-To preview a password rotation across the current directory and its subdirectories, run:
-
-```bash
-pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run
-```
-
-This includes inline `!vault` values by default. See [Rotating the vault password](#rotating-the-vault-password) for the full procedure.
-
 ## Rotating the vault password
 
 `pilfer close` is **not** password rotation - it refuses a different password than
-the one used for `open` (anti re-key). To rotate every vault target in the tree
-(including inline `!vault` spans):
+the one used for `open` (anti re-key). `pilfer rekey` rotates every vault target in
+the current directory and its subdirectories, including inline `!vault` spans:
 
 ```bash
 # Plan / decrypt-check only
@@ -283,9 +278,15 @@ pilfer rekey \
 pilfer rekey ... --rotate-password-file
 ```
 
-The old password loads like `open`: `--old-vault-password-file` and `--old-vault-id`, plus Ansible's config. The new password comes from the single `--new-vault-password-file` or `--new-vault-id` (`--new-vault-id prompt` asks for it). Values keep their vault-id label unless `--new-vault-id` names one. Rekey refuses a tree encrypted with more than one vault password; use `ansible-vault rekey` per vault id for that. It also refuses `!vault` values in a form pilfer cannot rewrite, such as list items or `|-` blocks, because they would stay on the old password.
+`--rotate-password-file` keeps the old password in `<file>_old` (mode 0600). Delete it, or move it out of the tree, once nothing needs it. It needs a plain password file on each side: not vault-encrypted, not a script. Before it rewrites anything, it also refuses:
 
-`--rotate-password-file` needs one plain password file on each side. It refuses password scripts: Ansible runs those, so the password lives somewhere else, such as a keyring. Change it there instead. With `pilfer-vault-keyring-client`, rekey to a typed password while the keyring still holds the old one, then store the same password over it:
+- a password file that is a symlink
+- an existing `<file>_old`
+- a password-file directory that is not writable
+
+The old password loads like `open`: `--old-vault-password-file` and `--old-vault-id`, plus Ansible's config. The new password comes from the single `--new-vault-password-file` or `--new-vault-id` (`--new-vault-id prompt` asks for it). Rekey refuses an old or new password file that is itself a vault in the tree. The new password file can otherwise be vault-encrypted. A new label must be ASCII, with no `;`, control characters or surrounding spaces. Rekey warns about an `--old-*` flag that decrypts nothing. Values keep their vault-id label unless `--new-vault-id` names one. Rekey refuses a tree encrypted with more than one vault password; use `ansible-vault rekey` per vault id for that. It also refuses `!vault` values in a form pilfer cannot rewrite, such as list items or `|-` blocks, because they would stay on the old password.
+
+Ansible runs a password script, so the password lives somewhere else, such as a keyring. Change it there instead. With `pilfer-vault-keyring-client`, rekey to a typed password while the keyring still holds the old one, then store the same password over it:
 
 ```bash
 pilfer rekey --new-vault-id prompt
@@ -325,6 +326,7 @@ non-zero. It does not invent fixes for ambiguous edits.
 - **`close` is progressive** - files that succeed are encrypted and dropped from the session; failures stay plaintext until you fix and retry. Not an all-or-nothing transaction.
 - **Intentional var removal** requires `pilfer close --confirm-delete`.
 - **Short secrets** can block close if the same bytes appear elsewhere in the file (docs/comments) - fail closed.
+- **Lock wait and ctrl-c:** a second pilfer run in the same tree waits for the first and prints `Waiting for another pilfer run (lock <path>)...`. Ctrl-c exits 130. If a session is still open after an interrupted `open` or `close`, pilfer says to run `pilfer close`. After an interrupted `rekey`, re-run the same command to resume. If `<password file>_old` already exists, the rotation finished.
 - **Nested git checkouts** are skipped; run pilfer from those roots if needed.
 - **Password check on close:** `close` proves the password by decrypting a `.vault` backup. The session list stores no hash of the password.
 - **File modes:** opened plaintext is `0600`. `close` puts back the mode and group the file had at `open`; `rekey` and `set` keep the file's own. The group is kept only when you are a member of it.
@@ -342,6 +344,10 @@ vaultedFileList.json
 **/*.pilfer-lock
 # Temp a killed pilfer can leave beside a file. The next open, close or rekey deletes it.
 **/.pilfer-rekey-*
+# --rotate-password-file leaves the old password here. Add `<your password file>_old`
+# if your password file is inside the project.
+.vault_password_old
+vault_password_file_old
 ```
 
 ### Pre-commit hook (suggested)

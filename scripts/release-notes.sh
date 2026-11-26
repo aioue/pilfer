@@ -16,5 +16,16 @@ echo
 echo "### Summary"
 git log ${range} --pretty=format:'- %s (%h)' --no-merges
 echo
+
+# A new major (X.0.0) carries its upgrade notes in the README's
+# "## Upgrading to X.0" section, so the README stays the single source. Print
+# nothing extra when the section is missing.
+if [[ "${version}" =~ ^([0-9]+)\.0\.0$ ]]; then
+  awk -v h="## Upgrading to ${BASH_REMATCH[1]}.0" '
+    $0 == h { on = 1; print "\n### Upgrading"; next }
+    on && /^## / { exit }
+    on { print }
+  ' README.md
+fi
 # Do not emit a Full Changelog link here: softprops/action-gh-release with
 # generate_release_notes: true appends one already (duplicate otherwise).

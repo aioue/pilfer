@@ -3,7 +3,9 @@
 Unified tests for pilfer - whole-file vaults, session safety, and inline encrypt_string.
 """
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -27,6 +29,7 @@ from ansible.parsing.vault import VaultLib, VaultSecret
 from pilfer import __version__ as pilfer_version
 from pilfer import cli as pilfer_cli
 from pilfer import inline as pilfer_inline
+from pilfer import publish as pilfer_publish
 
 
 class _VaultTagLoader(yaml.SafeLoader):
@@ -469,6 +472,191 @@ class TestSessionSafety(ProjectDirTest):
         self.assertFalse(os.path.exists(".vault"))
         self.assertFalse(os.path.exists("vaultedFileList.json"))
         self.assertFalse(os.path.exists("secret.yml.pilfer-open"))
+
+    def _interrupt_once_when(self, landed):
+        """Patch write_atomic's directory fsync to raise ctrl-c once, after landed(directory).
+
+        The interrupt must arrive after os.replace, and fsync is the only step
+        there: nothing else runs between the replace and write_atomic's return.
+        """
+        real_fsync = pilfer_publish._fsync_directory
+        fired = []
+
+        def interrupt(directory):
+            real_fsync(directory)
+            if not fired and landed(directory):
+                fired.append(True)
+                raise KeyboardInterrupt
+
+        return mock.patch.object(pilfer_publish, "_fsync_directory", side_effect=interrupt)
+
+    @staticmethod
+    def _plaintext_landed(_directory):
+        with open("secret.yml", "rb") as f:
+            return f.read() == b"secret_key: hunter2\n"
+
+    def test_interrupt_after_the_replace_keeps_the_backups(self):
+        # ctrl-c in write_atomic's directory fsync, after os.replace: the target
+        # already holds plaintext, so the backups and sidecar are all that can
+        # close it. Cleaning them up would leave unmarked plaintext.
+        with open("secret.yml", "rb") as f:
+            original = f.read()
+        with (
+            self._interrupt_once_when(self._plaintext_landed),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            pilfer_cli.open_vault_files("vault_pass")
+        self.assertTrue(os.path.isfile("secret.yml.pilfer-open"))
+        self.assertTrue(
+            any("encrypted" in files for _root, _dirs, files in os.walk(".vault")),
+            "the ciphertext backup was removed",
+        )
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        with open("secret.yml", "rb") as f:
+            self.assertEqual(f.read(), original)
+        self.assertFalse(os.path.exists("secret.yml.pilfer-open"))
+
+    def test_interrupt_in_a_backup_write_leaves_no_artifacts(self):
+        # ctrl-c in the directory fsync after the first backup's replace: the
+        # target is still ciphertext, so everything written is removed. A backup
+        # missing from the cleanup list made close fail on a half-written
+        # set ("Plaintext may remain") and open refuse an orphaned state.
+        with open("secret.yml", "rb") as f:
+            original = f.read()
+
+        def first_backup_landed(directory):
+            return os.path.exists(os.path.join(directory, "encrypted"))
+
+        with (
+            self._interrupt_once_when(first_backup_landed),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            pilfer_cli.open_vault_files("vault_pass")
+        leftovers = [
+            os.path.join(root, name) for root, _dirs, files in os.walk(".vault") for name in files
+        ]
+        self.assertEqual(leftovers, [])
+        self.assertFalse(os.path.exists("secret.yml.pilfer-open"))
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+        with open("secret.yml", "rb") as f:
+            self.assertEqual(f.read(), original)
+        reopened = self._run("open")
+        self.assertEqual(reopened.returncode, 0, reopened.stdout + reopened.stderr)
+        with open("secret.yml", "rb") as f:
+            self.assertEqual(f.read(), b"secret_key: hunter2\n")
+
+    def test_ctrl_c_after_open_started_says_how_to_recover(self):
+        stderr = io.StringIO()
+        with (
+            self._interrupt_once_when(self._plaintext_landed),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = pilfer_cli.main(["open", "-p", "vault_pass"])
+        self.assertEqual(result, 130)
+        self.assertIn("pilfer close", stderr.getvalue())
+        self.assertEqual(self._run("close").returncode, 0)
+
+    def test_ctrl_c_during_a_rekey_write_says_to_re_run(self):
+        stderr = io.StringIO()
+        with open("new_pass", "w") as f:
+            f.write("new_password\n")
+        real = pilfer_cli._rekey_whole_file
+
+        def interrupt(*args, **kwargs):
+            real(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        with (
+            mock.patch.object(pilfer_cli, "_rekey_whole_file", side_effect=interrupt),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = pilfer_cli.main(
+                [
+                    "rekey",
+                    "--old-vault-password-file",
+                    "vault_pass",
+                    "--new-vault-password-file",
+                    "new_pass",
+                    "--yes",
+                ]
+            )
+        self.assertEqual(result, 130)
+        self.assertIn("re-run", stderr.getvalue())
+
+    def test_close_after_an_interrupted_multi_file_open(self):
+        # open lists every target first. ctrl-c part way leaves entries it never
+        # reached: still ciphertext, no backup. Close has nothing to do for them.
+        with open("other.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"other: 1\n"))
+        before = {}
+        for name in ("secret.yml", "other.yml"):
+            with open(name, "rb") as f:
+                before[name] = f.read()
+        real = pilfer_cli._decrypt_whole_file
+        calls = []
+
+        def interrupt_second(path, *args, **kwargs):
+            calls.append(path)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return real(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(pilfer_cli, "_decrypt_whole_file", side_effect=interrupt_second),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            pilfer_cli.open_vault_files("vault_pass")
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+        self.assertNotIn("Plaintext may remain", closed.stderr)
+        for name, data in before.items():
+            with open(name, "rb") as f:
+                self.assertEqual(f.read(), data, name)
+        self.assertFalse(os.path.exists("vaultedFileList.json"))
+
+    def test_close_after_an_interrupted_open_restores_the_modes_of_opened_files(self):
+        # Mode and group were recorded only after the whole loop, so a file
+        # opened before the interrupt came back 0600.
+        with open("other.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"other: 1\n"))
+        for name in ("secret.yml", "other.yml"):
+            os.chmod(name, 0o640)
+        real = pilfer_cli._decrypt_whole_file
+        calls = []
+
+        def interrupt_second(path, *args, **kwargs):
+            calls.append(path)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return real(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(pilfer_cli, "_decrypt_whole_file", side_effect=interrupt_second),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            pilfer_cli.open_vault_files("vault_pass")
+        self.assertEqual(stat.S_IMODE(os.stat(calls[0]).st_mode), 0o600)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+        for name in ("secret.yml", "other.yml"):
+            self.assertEqual(stat.S_IMODE(os.stat(name).st_mode), 0o640, name)
+
+    def test_close_after_an_open_interrupted_before_any_file_needs_no_password(self):
+        with open("secret.yml", "rb") as f:
+            before = f.read()
+        with (
+            mock.patch.object(pilfer_cli, "_decrypt_whole_file", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            pilfer_cli.open_vault_files("vault_pass")
+        # Nothing was opened, so there is nothing a password could prove.
+        closed = self._run("close", password_file="does-not-exist")
+        self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+        with open("secret.yml", "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertFalse(os.path.exists("vaultedFileList.json"))
 
     def test_close_leaves_unexpected_vault_contents_and_says_so(self):
         self.assertEqual(self._run("open").returncode, 0)
@@ -2012,6 +2200,15 @@ class TestVersion(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"pilfer {pilfer_version}", result.stdout)
+
+
+class TestInterruptedHint(unittest.TestCase):
+    def test_rekey_hint_covers_a_finished_rotation(self):
+        # After ctrl-c inside the password-file swap the work is done, and a
+        # re-run is refused because <file>_old exists.
+        hint = pilfer_cli._interrupted_hint("rekey")
+        self.assertIn("re-run the same command", hint)
+        self.assertIn("_old now exists, the rotation finished", hint)
 
 
 if __name__ == "__main__":
