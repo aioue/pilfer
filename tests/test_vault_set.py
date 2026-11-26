@@ -1,9 +1,9 @@
 """pilfer set keeps plaintext off disk and out of output, and stores the exact value."""
 
-from __future__ import annotations
-
+import fcntl
 import json
 import os
+import select
 import shutil
 import stat
 import subprocess
@@ -13,11 +13,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+# Before anything imports ansible: see the module.
+import _ansible_isolation  # noqa: F401
 import yaml
 from ansible.parsing.yaml.loader import AnsibleLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import ansible.constants as C
 from ansible.constants import DEFAULT_VAULT_ID_MATCH
 from ansible.errors import AnsibleError
 from ansible.parsing.vault import VaultLib, VaultSecret
@@ -94,6 +97,22 @@ class VaultSetBase(unittest.TestCase):
 
     def _set(self, key: str, value: str, path: Path | None = None) -> str:
         return set_keys(path or self.vault, {key: value}, str(self.password))[key]
+
+    def _cli(self, *args: str, stdin: bytes = b"", env: dict | None = None):
+        """Run pilfer.py in self.directory with Ansible's config search left on.
+
+        ansible.constants reads the config at import, so a test of ansible.cfg
+        handling needs a fresh process. Without ANSIBLE_CONFIG, ./ansible.cfg wins.
+        """
+        base = {k: v for k, v in os.environ.items() if k != "ANSIBLE_CONFIG"}
+        return subprocess.run(
+            [sys.executable, str(PILFER_SCRIPT), *args],
+            capture_output=True,
+            check=False,
+            cwd=self.directory,
+            input=stdin,
+            env={**base, **(env or {})},
+        )
 
     def _view(self, path: Path | None = None) -> str:
         """Read through the ansible-vault CLI, not the code under test."""
@@ -248,22 +267,26 @@ class TestVaultSet(VaultSetBase):
 
     # Password resolution
 
-    def test_dash_p_wins_over_ansible_cfg(self) -> None:
-        # pilfer reads ansible.cfg from cwd. A decoy there must not be used when -p is given.
+    def test_dash_p_beside_an_ansible_cfg_decoy(self) -> None:
+        # Ansible loads both, -p first. The edit must be encrypted with the one
+        # that decrypts the file, not the decoy ansible.cfg names.
         decoy = self._password_file("decoy-password", "decoy")
         (self.directory / "ansible.cfg").write_text(
             f"[defaults]\nvault_password_file = {decoy}\n", encoding="utf-8"
         )
-        self._set("target", SENTINEL)
+        result = self._cli("set", "-p", str(self.password), str(self.vault), "target", SENTINEL)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(self._view(), _expected_target(SENTINEL))
         with self.assertRaises(AnsibleError):
             _vault("decoy").decrypt(self.vault.read_bytes())
 
     def test_ansible_cfg_password_without_dash_p(self) -> None:
+        # A relative path resolves against the config file's directory, as in Ansible.
         (self.directory / "ansible.cfg").write_text(
-            f"[defaults]\nvault_password_file = {self.password}\n", encoding="utf-8"
+            f"[defaults]\nvault_password_file = {self.password.name}\n", encoding="utf-8"
         )
-        set_keys(self.vault, {"target": SENTINEL})
+        result = self._cli("set", str(self.vault), "target", SENTINEL)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(self._view(), _expected_target(SENTINEL))
 
     # Failure leaves the original ciphertext
@@ -737,7 +760,7 @@ class TestVaultSetUnsafe(VaultSetBase):
         self.assertEqual(self._view(), _expected_target("from-other-process"))
 
     def test_home_password_path_beats_the_parent_fallback(self) -> None:
-        from pilfer.cli import get_vault_password_file
+        from pilfer.vault_secrets import fallback_password_file
 
         home = os.path.expanduser("~/.ansible-vault/.vault-file")
         parent = os.path.normpath(os.path.join(os.getcwd(), "../../vault_password_file"))
@@ -745,19 +768,19 @@ class TestVaultSetUnsafe(VaultSetBase):
         def exists(path: str) -> bool:
             return path in (home, parent, "../../vault_password_file")
 
-        with mock.patch("pilfer.cli.os.path.exists", side_effect=exists):
-            self.assertEqual(get_vault_password_file(), home)
+        with mock.patch("pilfer.vault_secrets.os.path.exists", side_effect=exists):
+            self.assertEqual(fallback_password_file(), home)
 
     def test_parent_password_fallback_is_last(self) -> None:
-        from pilfer.cli import get_vault_password_file
+        from pilfer.vault_secrets import fallback_password_file
 
         parent = "../../vault_password_file"
 
         def exists(path: str) -> bool:
             return path == parent
 
-        with mock.patch("pilfer.cli.os.path.exists", side_effect=exists):
-            self.assertEqual(get_vault_password_file(), parent)
+        with mock.patch("pilfer.vault_secrets.os.path.exists", side_effect=exists):
+            self.assertEqual(fallback_password_file(), parent)
 
 
 class TestReadValue(unittest.TestCase):
@@ -1004,15 +1027,13 @@ class TestReviewFollowups(VaultSetBase):
             if proc.stdout is not None:
                 proc.stdout.close()
 
-    def test_password_file_decode_error_hides_the_byte(self) -> None:
-        from pilfer.cli import _load_password
-
-        bad = self.directory / "bad-pass"
-        bad.write_bytes(b"\xff\xfe")
-        with self.assertRaises(PilferError) as caught:
-            _load_password(str(bad))
-        self.assertNotIn("xff", str(caught.exception).lower())
-        self.assertIn("not valid text", str(caught.exception))
+    def test_non_utf8_password_is_bytes_as_in_ansible(self) -> None:
+        # Ansible reads a password file as bytes; pilfer used to refuse non-UTF-8.
+        self.password.write_bytes(b"pass\xffword\n")
+        secret = VaultSecret(b"pass\xffword")
+        self.vault.write_bytes(VaultLib([("default", secret)]).encrypt(FIXTURE.encode("utf-8")))
+        self.assertEqual(self._set("target", SENTINEL), "updated")
+        self.assertEqual(self._view(), _expected_target(SENTINEL))
 
     def test_password_rotate_refuses_a_symlink_backup(self) -> None:
         from pilfer.cli import _rotate_password_file
@@ -1054,20 +1075,270 @@ class TestReviewFollowups(VaultSetBase):
         self.assertEqual(old.read_text(encoding="utf-8").strip(), "old-secret")
         self.assertFalse((self.directory / "old-pass_old").exists())
 
-    def test_strict_vault_id_match_still_decrypts_a_label(self) -> None:
-        import ansible.constants as C
-
-        from pilfer import cli
-        from pilfer.inline import vault_decrypt
+    def test_strict_vault_id_match_follows_ansible(self) -> None:
+        # vault_id_match = True: a prod file needs a prod secret. pilfer used to
+        # register a -p password under every label; now it does what Ansible does.
+        from pilfer.vault_secrets import VaultSources
 
         secret = VaultSecret(PASSWORD.encode("utf-8"))
-        blob = VaultLib([("prod", secret)]).encrypt(b"target: labeled\n", vault_id="prod")
-        with (
-            mock.patch.object(C, "DEFAULT_VAULT_ID_MATCH", True),
-            mock.patch.object(cli, "DEFAULT_VAULT_ID_MATCH", True),
-        ):
-            vault = cli._make_vault(PASSWORD)
-            self.assertEqual(vault_decrypt(vault, blob), b"target: labeled\n")
+        labelled = VaultLib([("prod", secret)]).encrypt(FIXTURE.encode("utf-8"), vault_id="prod")
+        self.vault.write_bytes(labelled)
+        strict = {**os.environ, "ANSIBLE_VAULT_ID_MATCH": "True"}
+        refused = subprocess.run(
+            ["ansible-vault", "view", str(self.vault), "--vault-password-file", str(self.password)],
+            capture_output=True,
+            env=strict,
+            check=False,
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        with mock.patch.object(C, "DEFAULT_VAULT_ID_MATCH", True):
+            with self.assertRaises(PilferError):
+                set_keys(self.vault, {"target": SENTINEL}, str(self.password))
+            self.assertEqual(self.vault.read_bytes(), labelled)
+            prod = VaultSources(vault_ids=(f"prod@{self.password}",))
+            self.assertEqual(set_keys(self.vault, {"target": SENTINEL}, prod)["target"], "updated")
+        self.assertTrue(self.vault.read_bytes().startswith(b"$ANSIBLE_VAULT;1.2;AES256;prod\n"))
+        self.assertEqual(self._view(), _expected_target(SENTINEL))
+
+
+# Child that takes the lock, prints "H", then reads stdin until EOF. A holder
+# keeps its stdin open and so keeps the lock. A waiter or rival gets its stdin
+# closed at once, so it exits as soon as it has the lock: if it is still running
+# after a pause, it is blocked in flock and not waiting on stdin.
+_HOLDER = (
+    "import sys\n"
+    "from pilfer.publish import vault_file_lock\n"
+    "with vault_file_lock(sys.argv[1]):\n"
+    "    sys.stdout.write('H')\n"
+    "    sys.stdout.flush()\n"
+    "    sys.stdin.read()\n"
+)
+# Bound on every wait for a child, so a deadlock regression fails and does not hang CI.
+_DEADLINE = 30
+
+
+class TestLockFileRemoval(VaultSetBase):
+    """vault_file_lock removes its sibling, and removing it keeps mutual exclusion."""
+
+    def _locks(self) -> list[str]:
+        return sorted(p.name for p in self.directory.rglob("*.pilfer-lock"))
+
+    def _lock_path(self) -> Path:
+        return self.directory / f"{self.vault.name}.pilfer-lock"
+
+    def _spawn(self, path: Path, *, hold: bool) -> subprocess.Popen:
+        repo = str(Path(__file__).resolve().parents[1])
+        env = os.environ.copy()
+        env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _HOLDER, str(path)],
+            cwd=self.directory,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(self._reap, proc)
+        if not hold:
+            proc.stdin.close()
+        return proc
+
+    def _holder(self, path: Path) -> subprocess.Popen:
+        """A child that holds the lock until _release."""
+        proc = self._spawn(path, hold=True)
+        self._expect_h(proc)
+        return proc
+
+    @staticmethod
+    def _reap(proc: subprocess.Popen) -> None:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+    def _expect_h(self, proc: subprocess.Popen) -> None:
+        """Read the child's "H" within the deadline."""
+        ready, _, _ = select.select([proc.stdout], [], [], _DEADLINE)
+        self.assertTrue(ready, "child never reported holding the lock")
+        self.assertEqual(os.read(proc.stdout.fileno(), 1), b"H")
+
+    def _release(self, proc: subprocess.Popen) -> None:
+        if not proc.stdin.closed:
+            proc.stdin.close()
+        self.assertEqual(proc.wait(timeout=_DEADLINE), 0, proc.stderr.read())
+
+    def _assert_blocked_in_flock(self, proc: subprocess.Popen) -> None:
+        """A child with its stdin closed that is still running is waiting on flock."""
+        with self.assertRaises(subprocess.TimeoutExpired):
+            proc.wait(timeout=0.4)
+
+    def _assert_lock_held(self) -> None:
+        """Probe from this process: the path's current lock file is held by someone."""
+        fd = os.open(self._lock_path(), os.O_RDWR)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+    def test_lock_file_is_gone_after_the_block(self) -> None:
+        import pilfer.publish
+
+        lock = self._lock_path()
+        with pilfer.publish.vault_file_lock(self.vault):
+            self.assertTrue(lock.is_file())
+        self.assertFalse(lock.exists())
+
+    def test_lock_file_is_gone_after_an_exception(self) -> None:
+        import pilfer.publish
+
+        with self.assertRaises(RuntimeError):
+            with pilfer.publish.vault_file_lock(self.vault):
+                raise RuntimeError("boom")
+        self.assertEqual(self._locks(), [])
+
+    def test_nested_locks_all_removed(self) -> None:
+        import pilfer.publish
+
+        with pilfer.publish.project_session_lock():
+            with pilfer.publish.vault_file_lock(self.vault):
+                self.assertEqual(len(self._locks()), 2)
+        self.assertEqual(self._locks(), [])
+
+    def test_set_leaves_no_lock_file(self) -> None:
+        self._set("target", SENTINEL)
+        self.assertEqual(self._locks(), [])
+
+    def test_open_then_close_leaves_no_lock_file(self) -> None:
+        opened = self._cli("open", "-p", str(self.password))
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertEqual(self._locks(), [])
+        closed = self._cli("close", "-p", str(self.password))
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertEqual(self._locks(), [])
+
+    def test_lock_left_by_a_killed_run_is_reused_and_removed(self) -> None:
+        import pilfer.publish
+
+        lock = self._lock_path()
+        lock.write_bytes(b"")
+        lock.chmod(0o644)
+        with pilfer.publish.vault_file_lock(self.vault):
+            self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(lock.exists())
+        # The CLI path too: a stale lock must not stop set or be taken for a vault.
+        lock.write_bytes(b"")
+        self._set("target", SENTINEL)
+        self.assertEqual(self._locks(), [])
+
+    def test_unlink_is_skipped_when_the_path_names_another_inode(self) -> None:
+        import pilfer.publish
+
+        lock = self._lock_path()
+        with pilfer.publish.vault_file_lock(self.vault):
+            lock.unlink()
+            lock.write_bytes(b"someone else's")
+        self.assertEqual(lock.read_bytes(), b"someone else's")
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
+    def test_failed_unlink_does_not_replace_the_result_or_the_error(self) -> None:
+        import pilfer.publish
+
+        # A stale lock opens read-write without directory write access; unlink needs it.
+        lock = self._lock_path()
+        lock.write_bytes(b"")
+        self.directory.chmod(0o555)
+        try:
+            ran = False
+            with pilfer.publish.vault_file_lock(self.vault):
+                ran = True
+            self.assertTrue(ran)
+            with self.assertRaises(PilferError) as ctx:
+                with pilfer.publish.vault_file_lock(self.vault):
+                    raise PilferError("the real error")
+            self.assertEqual(str(ctx.exception), "the real error")
+            # Nothing could remove it; the next run that can write the directory does.
+            self.assertTrue(lock.exists())
+        finally:
+            self.directory.chmod(0o755)
+        with pilfer.publish.vault_file_lock(self.vault):
+            pass
+        self.assertFalse(lock.exists())
+
+    def test_second_process_waits_for_the_holder_and_removes_the_file(self) -> None:
+        import pilfer.publish
+
+        holder = self._holder(self.vault)
+        waiter = self._spawn(self.vault, hold=False)
+        # It exits the moment it has the lock, so still running means blocked in flock.
+        self._assert_blocked_in_flock(waiter)
+        self._assert_lock_held()
+        self._release(holder)
+        # The waiter now gets the lock on a freshly created file, then exits.
+        self._release(waiter)
+        self._expect_h(waiter)
+        self.assertEqual(self._locks(), [])
+        with pilfer.publish.vault_file_lock(self.vault):
+            pass
+
+    def test_waiter_on_an_unlinked_inode_retries_and_is_the_only_holder(self) -> None:
+        import threading
+
+        import pilfer.publish
+
+        opened = threading.Event()
+        acquired = threading.Event()
+        proceed = threading.Event()
+        inodes: list[int] = []
+        real_open = pilfer.publish._open_lock_file
+
+        def spy(lock_path):
+            fd = real_open(lock_path)
+            inodes.append(os.fstat(fd).st_ino)
+            if len(inodes) == 1:
+                opened.set()
+            return fd
+
+        errors: list[BaseException] = []
+
+        def waiter() -> None:
+            try:
+                with pilfer.publish.vault_file_lock(self.vault):
+                    acquired.set()
+                    proceed.wait(_DEADLINE)
+            except BaseException as exc:  # reported on the main thread
+                errors.append(exc)
+                acquired.set()
+
+        rival = None
+        holder = self._holder(self.vault)
+        with mock.patch.object(pilfer.publish, "_open_lock_file", spy):
+            thread = threading.Thread(target=waiter, daemon=True)
+            thread.start()
+            try:
+                # The waiter has opened the holder's inode and is blocked in flock on it.
+                self.assertTrue(opened.wait(10))
+                self.assertFalse(acquired.wait(0.4))
+                # The holder unlinks, then unlocks: the waiter wakes on a dead inode.
+                self._release(holder)
+                self.assertTrue(acquired.wait(10))
+                self.assertEqual(errors, [])
+                # Two opens prove the retry. The inode numbers may match: ext4,
+                # xfs and overlayfs can reuse a freed one.
+                self.assertEqual(len(inodes), 2, "waiter must retry once")
+                # The retry holds the path's current file, and nobody else gets it.
+                self._assert_lock_held()
+                rival = self._spawn(self.vault, hold=False)
+                self._assert_blocked_in_flock(rival)
+            finally:
+                proceed.set()
+                thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self._release(rival)
+        self._expect_h(rival)
+        self.assertEqual(self._locks(), [])
 
 
 if __name__ == "__main__":

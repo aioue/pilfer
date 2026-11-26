@@ -2,7 +2,7 @@
 [![Test Suite](https://github.com/aioue/pilfer/actions/workflows/test.yml/badge.svg)](https://github.com/aioue/pilfer/actions/workflows/test.yml)
 [![CodeQL](https://github.com/aioue/pilfer/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/aioue/pilfer/actions/workflows/github-code-scanning/codeql)
 [![Dependabot enabled](https://img.shields.io/badge/dependabot-enabled-025E8C?logo=dependabot&logoColor=white)](https://github.com/aioue/pilfer/network/updates)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 # pilfer
@@ -36,7 +36,7 @@ $ pilfer close
 
 ## Quick start
 
-Requires **Python 3.10+** and **Ansible** on `PATH`.
+Requires **Python 3.12+** and **ansible-core 2.21+**. `pip install pilfer` installs ansible-core.
 
 ```bash
 pipx install pilfer
@@ -57,10 +57,10 @@ vault_password_file = ~/.ansible-vault/.vault-file
 
 ## Features
 
-- **ansible.cfg integration** - Automatically reads `vault_password_file` from your ansible.cfg
+- **Ansible's password sources** - Loads vault passwords the way `ansible-vault` does: `vault_password_file` and `vault_identity_list` from Ansible's config, `--vault-id`, password scripts and `-client` scripts
 - **Change detection** - Only re-encrypts files that were actually modified (using SHA256)
 - **Safe operation** - Preserves original encrypted content for unchanged files
-- **Ansible vault** - Calls Ansible's VaultLib. `pip install pilfer` installs Ansible; a checkout needs Ansible on `PATH`
+- **Ansible vault** - Calls Ansible's VaultLib. `pip install pilfer` installs ansible-core; a checkout needs it installed
 - **Binary data preservation** - Preserves exact line endings and formatting (critical for certificates)
 - **Inline `encrypt_string` support** - Opt-in via `pilfer open --include-encrypted-vars`; decrypts YAML `!vault` scalars in place (with `# pilfer:vault:N` markers); `close` always re-encrypts whatever the session opened
 - **Fail-closed sessions** - Refuses double-`open`, keeps session state if `close` partially fails, non-zero exit codes on errors
@@ -72,10 +72,12 @@ pilfer [--version] COMMAND ...
 
 Commands: open | close | rekey | set
 
-pilfer open [--include-encrypted-vars] [-q] [-p VAULT_PASSWORD_FILE]
-pilfer close [--confirm-delete] [-p VAULT_PASSWORD_FILE]
-pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW [options]
-pilfer set [-p VAULT_PASSWORD_FILE] FILE KEY [VALUE]
+pilfer open [--include-encrypted-vars] [-q] [VAULT OPTIONS]
+pilfer close [--confirm-delete] [VAULT OPTIONS]
+pilfer rekey [--old-vault-password-file OLD | --old-vault-id ID] (--new-vault-password-file NEW | --new-vault-id ID) [options]
+pilfer set [VAULT OPTIONS] FILE KEY [VALUE]
+
+VAULT OPTIONS: [--vault-id ID]... [-p VAULT_PASSWORD_FILE]... [-J]
 ```
 
 Run `pilfer --help` or `pilfer COMMAND --help` for full options and examples.
@@ -110,7 +112,7 @@ from pilfer.vault_set import set_keys
 set_keys(path, {key: value}, password_file)
 ```
 
-Failures and refusals raise `PilferError`, including an unreadable password file or failed encryption.
+`password_file` can be a password file or script path, a `pilfer.vault_secrets.VaultSources` (password files, vault ids, prompt), or `None` for Ansible's config. Ansible reads its config once, when it is first imported, so a script gets the `ansible.cfg` of the directory it imported pilfer from. Failures and refusals raise `PilferError`, including an unreadable password file, a failing password script or failed encryption.
 
 To check whether an update can be made before an action you cannot undo, such as minting a token, call `set_keys` with a placeholder value and `check_only=True`. This performs the edit and encryption and writes a temporary ciphertext file beside the vault, but skips the final rename. It can therefore catch problems such as a read-only directory or full disk.
 
@@ -131,6 +133,8 @@ pilfer open --include-encrypted-vars
 
 pilfer close   # no flag needed; re-encrypts everything this session opened
 ```
+
+pilfer opens `key: !vault |` blocks. Ansible also reads `!vault` list items, `|-` blocks and flow values; those stay encrypted, and `open` names the files that have them.
 
 `close` always re-encrypts session entries (whole-file and inline). The
 `--include-encrypted-vars` flag is only meaningful on `open`.
@@ -192,9 +196,21 @@ refuses by default (ambiguous delete vs accident):
 Renaming the key and dropping the marker is also refused if the secret value is
 still present in the file (including in comments).
 
-### Vault password file
+### Vault passwords
 
-Pilfer finds the vault password in this order: `-p`, then `vault_password_file` in `ansible.cfg`, then `~/.ansible-vault/.vault-file`, `.vault_password`, `vault_password_file`, and finally `../../vault_password_file`.
+Pilfer loads vault passwords with Ansible's own code, the same call `ansible-vault decrypt` makes. Sources load in this order: `vault_identity_list` from Ansible's config, `--vault-id`, `-p`, then `vault_password_file` from the config. The config is found as Ansible finds it: `ANSIBLE_CONFIG`, `./ansible.cfg`, `~/.ansible.cfg`, `/etc/ansible/ansible.cfg`, and the `ANSIBLE_VAULT_*` environment variables override it.
+
+An executable password file is run and its output is the password, as in [storing passwords in third-party tools](https://docs.ansible.com/projects/ansible/latest/vault_guide/vault_managing_passwords.html#storing-passwords-in-third-party-tools-with-vault-password-client-scripts). A script named `*-client` (for example `vault-keyring-client.py`) is passed `--vault-id`. Each command runs a script once.
+
+```bash
+pilfer open --vault-id dev@~/bin/vault-keyring-client.py --vault-id prod@prompt
+```
+
+`close` and `pilfer set` encrypt each value with the password that decrypted it, under its existing vault-id label, as `ansible-vault edit` does. A tree on several vault ids opens and closes in one session, and `close` needs every password that `open` used.
+
+Ansible loads the config's `vault_password_file` even when `-p` or `--vault-id` is given, so a wrong `-p` does not fail by itself. `open` and `set` warn when a password you passed decrypts none of the files, and `close` refuses it: close never changes a file's password, and `pilfer rekey` does.
+
+When neither the flags nor Ansible's config name a source, pilfer tries `~/.ansible-vault/.vault-file`, `.vault_password`, `vault_password_file`, and finally `../../vault_password_file`.
 
 ### Examples
 
@@ -237,6 +253,10 @@ pilfer rekey \
 # one at the old path (chmod 600):
 pilfer rekey ... --rotate-password-file
 ```
+
+The old password loads like `open`: `--old-vault-password-file` and `--old-vault-id`, plus Ansible's config. The new password comes from the single `--new-vault-password-file` or `--new-vault-id` (`--new-vault-id prompt` asks for it). Values keep their vault-id label unless `--new-vault-id` names one. Rekey refuses a tree encrypted with more than one vault password; use `ansible-vault rekey` per vault id for that. It also refuses `!vault` values in a form pilfer cannot rewrite, such as list items or `|-` blocks, because they would stay on the old password.
+
+`--rotate-password-file` needs one plain password file on each side. It refuses password scripts: Ansible runs those, so the password lives somewhere else, such as a keyring. Change it there instead.
 
 Refuse to rekey while a pilfer session is open. Nested git checkouts are skipped
 (run `pilfer rekey` from those directories separately). Prefer `--dry-run` first.
@@ -282,7 +302,7 @@ non-zero. It does not invent fixes for ambiguous edits.
 vaultedFileList.json
 .vault/
 **/*.pilfer-open
-# Empty lock left beside a vault after open, close, rekey, or set.
+# Lock file that exists while pilfer works on a vault. Left behind only if pilfer is killed.
 **/*.pilfer-lock
 # Temp a killed pilfer can leave beside a file. The next open, close or rekey deletes it.
 **/.pilfer-rekey-*
