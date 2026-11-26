@@ -118,10 +118,11 @@ def _store(backend, keyname: str, username: str, where: str) -> int:
         # it strips, so spaces alone would store "" over the old password.
         verify_secret_is_not_empty(secret.bytes, "refusing an empty password")
     except (AnsibleError, UnicodeError) as exc:
-        # UnicodeError: PromptVaultSecret encodes strictly, so an answer that is
-        # not UTF-8 raises UnicodeEncodeError. str, not repr: these messages are
-        # fixed strings or embed repr(keyname); a UnicodeEncodeError names only
-        # the one bad character, escaped, not the password.
+        # UnicodeError: an answer that is not UTF-8 fails in getpass (decode,
+        # on a terminal) or in PromptVaultSecret's strict encode (piped input).
+        # str, not repr: these messages are fixed strings or embed
+        # repr(keyname); a Unicode error names one escaped byte and its
+        # position, not the password.
         sys.stderr.write(f"{PROG}: {exc}\n")
         return 1
     password = secret.bytes.decode()

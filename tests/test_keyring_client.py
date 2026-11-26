@@ -4,8 +4,9 @@ The keyring is _file_keyring.FileKeyring, a JSON file per test, or keyring's
 own fail and null backends, selected with PYTHON_KEYRING_BACKEND (or set
 in-process with keyring.set_keyring), so nothing here reads or writes the real
 keychain. Most lookups run the client the way Ansible does, as an executable
-named *-client in its own process. --set mostly runs main() in-process to feed the prompts; tests that
-need the real process pipe the answers to run_client(input=...).
+named *-client in its own process. --set mostly runs main() in-process to feed
+the prompts; tests that need the real process pipe the answers to
+run_client(input=...).
 """
 
 import builtins
@@ -135,7 +136,11 @@ class KeyringTest(ProjectTest):
             redirect_stdout(out),
             redirect_stderr(err),
         ):
-            code = keyring_client.main(list(args))
+            try:
+                code = keyring_client.main(list(args))
+            except KeyboardInterrupt:
+                # Fail this test rather than abort the whole run.
+                self.fail(f"KeyboardInterrupt escaped main(); stderr: {err.getvalue()!r}")
         return code, out.getvalue(), err.getvalue()
 
     def set_in_process(self, *args: str, **kwargs) -> tuple[int, str, str]:
@@ -243,7 +248,8 @@ class TestClientLookup(KeyringTest):
             self.assertIn("--username", err)
             with self.subTest("with --username"):
                 code, _, err = self.run_in_process("--username", "u")
-                self.assertNotIn("--username", err)
+                # 2: past the login name to the lookup, which finds nothing.
+                self.assertEqual(code, 2, err)
 
     def test_names_from_config_are_escaped_in_messages(self):
         self.write("ansible.cfg", "[defaults]\n[vault]\nkeyname = a\n  \x1b[2Jb\n")
@@ -309,28 +315,27 @@ class TestSet(KeyringTest):
                 self.assertIn("kept", err)
                 self.assertEqual(self.stored(), {entry("ansible", USER): "old"})
 
-    def test_set_refuses_a_mismatch(self):
-        code, _, err = self.set_in_process(typed=("pw", "typo"))
-        self.assertEqual(code, 1)
-        # The text after the prefix is ansible-core's (PromptVaultSecret), and
-        # its wording is not pilfer's to pin across core versions.
-        # After the "Storing" notice: one error line. The text after the prefix
-        # is ansible-core's (PromptVaultSecret), and its wording is not
-        # pilfer's to pin across core versions.
-        *_, error = err.splitlines()
-        self.assertTrue(error.startswith(f"{CLIENT_NAME}: "), err)
-        self.assertEqual(len(err.splitlines()), 2, err)
-        self.assertEqual(self.stored(), {})
-
-    def test_set_refuses_a_password_that_is_not_utf8(self):
-        # A surrogate-escaped terminal byte: PromptVaultSecret encodes strictly
-        # and raises UnicodeEncodeError, not AnsibleError.
-        code, _, err = self.set_in_process(typed=("caf\udce9", "caf\udce9"))
-        self.assertEqual(code, 1)
-        *_, error = err.splitlines()
-        self.assertTrue(error.startswith(f"{CLIENT_NAME}: "), err)
-        self.assertEqual(len(err.splitlines()), 2, err)
-        self.assertEqual(self.stored(), {})
+    def test_set_refuses_a_mismatch_or_a_password_that_is_not_utf8(self):
+        for case, typed in (
+            ("mismatch", ("pw", "typo")),
+            # Piped input under a non-UTF-8 locale arrives surrogate-escaped,
+            # and PromptVaultSecret's strict encode raises UnicodeEncodeError.
+            ("encode", ("caf\udce9", "caf\udce9")),
+            # On a terminal, getpass itself fails to decode the byte.
+            (
+                "decode",
+                (UnicodeDecodeError("utf-8", b"caf\xe9", 3, 4, "invalid continuation byte"),),
+            ),
+        ):
+            with self.subTest(case):
+                code, _, err = self.set_in_process(typed=typed)
+                self.assertEqual(code, 1)
+                # After the "Storing" notice: one error line. The text after the
+                # prefix is ansible-core's or Python's, not pilfer's to pin.
+                *_, error = err.splitlines()
+                self.assertTrue(error.startswith(f"{CLIENT_NAME}: "), err)
+                self.assertEqual(len(err.splitlines()), 2, err)
+                self.assertEqual(self.stored(), {})
 
     def test_set_refuses_spaces_only_and_keeps_the_old_password(self):
         self.store("ansible", "old")
