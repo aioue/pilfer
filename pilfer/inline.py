@@ -6,10 +6,8 @@ import base64
 import bisect
 import collections
 import hashlib
-import io
 import itertools
 import json
-import os
 import re
 from dataclasses import dataclass, field
 
@@ -230,22 +228,11 @@ def find_inline_vault_spans(content: bytes) -> list[InlineSpan]:
     return spans
 
 
-class _NamedText(io.StringIO):
-    """Text stream with a name. AnsibleLoader reads a stream's .name as the origin of
-    its warnings (a duplicate key), which otherwise say "Origin: <unknown>"."""
-
-    def __init__(self, text: str, name: str | None) -> None:
-        super().__init__(text)
-        self.name = name
-
-
-def _ansible_vault_values(content: bytes, name: str | None = None) -> list[bytes]:
+def _ansible_vault_values(content: bytes) -> list[bytes]:
     """Ciphertext of every !vault value Ansible's YAML loader reads, normalized like spans.
 
     Empty when Ansible cannot load the file as YAML: it would not read those
     values either. Errors are dropped, not shown: YAML errors quote the line.
-    name: the file's path (made absolute: Ansible rejects a relative origin), so Ansible's own warnings about it (a duplicate key)
-    say which file they mean. Ansible prints those; they are not pilfer's.
     """
     from ansible.parsing.vault import VaultHelper
     from ansible.parsing.yaml.loader import AnsibleLoader
@@ -254,7 +241,10 @@ def _ansible_vault_values(content: bytes, name: str | None = None) -> list[bytes
         text = content.decode("utf-8")
     except UnicodeDecodeError:
         return []
-    loader = AnsibleLoader(_NamedText(text, os.path.abspath(name)) if name else text)
+    # Ansible may print a duplicate-key warning here ("Origin: <unknown>", the key
+    # name only). No file name is passed: with a real origin Ansible quotes the
+    # file's lines, plaintext values included, into stderr and CI logs.
+    loader = AnsibleLoader(text)
     documents = []
     try:
         while loader.check_data():
@@ -279,17 +269,16 @@ def _ansible_vault_values(content: bytes, name: str | None = None) -> list[bytes
     return found
 
 
-def vault_values_pilfer_skips(content: bytes, name: str | None = None) -> int:
+def vault_values_pilfer_skips(content: bytes) -> int:
     """How many !vault values Ansible reads in content that find_inline_vault_spans does not.
 
     pilfer opens only `key: !vault |` blocks; a list item, a `|-` block or a
     flow scalar stays encrypted. Open reports them. Rekey refuses, because
-    rotating the password would leave them on the old one. name is passed on to
-    _ansible_vault_values.
+    rotating the password would leave them on the old one.
     """
     if VAULT_HEADER_PREFIX not in content or is_whole_file_vault(content):
         return 0
-    remaining = collections.Counter(_ansible_vault_values(content, name))
+    remaining = collections.Counter(_ansible_vault_values(content))
     remaining.subtract(span.ciphertext for span in find_inline_vault_spans(content))
     return sum(count for count in remaining.values() if count > 0)
 

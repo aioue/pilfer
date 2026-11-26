@@ -78,8 +78,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _is_macos_backend(backend) -> bool:
     # keyring.backends.macOS imports on any platform; it guards its own
     # Security framework import.
-    from keyring.backends import macOS
+    from keyring.backends import chainer, macOS
 
+    # Any other installed keyring plugin (keyrings.alt, say) makes get_keyring()
+    # return a ChainerBackend, which writes through the first backend that does
+    # not raise NotImplementedError: the highest-priority one. Look at that one,
+    # or the macOS delete below is skipped and --set cannot replace the entry.
+    if isinstance(backend, chainer.ChainerBackend) and backend.backends:
+        backend = backend.backends[0]
     return isinstance(backend, macOS.Keyring)
 
 

@@ -438,22 +438,5 @@ class TestInlineRandomized(unittest.TestCase):
         self.assertEqual(problems, [], "\n".join(problems))
 
 
-class TestDuplicateKeyWarning(unittest.TestCase):
-    def test_ansible_warning_names_the_file(self):
-        from pilfer.inline import vault_values_pilfer_skips
-
-        # The header must be present or the cross-check returns before loading.
-        content = b"a: 1\na: 2\nb: !vault |\n  $ANSIBLE_VAULT;1.1;AES256\n  00\n"
-        for name, expected in (
-            ("group_vars/all.yml", os.path.abspath("group_vars/all.yml")),
-            (None, "<unknown>"),
-        ):
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                vault_values_pilfer_skips(content, name)
-            self.assertIn("duplicate mapping key", err.getvalue())
-            self.assertIn(f"Origin: {expected}", err.getvalue())
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -1023,9 +1023,10 @@ class TestReviewFollowups(VaultSetBase):
         outside = self.directory / "outside"
         outside.write_text("keep", encoding="utf-8")
         (self.directory / "old-pass_old").symlink_to(outside)
-        with self.assertRaises(PilferError) as caught:
+        # rekey refuses this before rewriting anything (_check_rotation_targets);
+        # here the write itself must not follow the link: O_EXCL | O_NOFOLLOW.
+        with self.assertRaises(FileExistsError):
             _rotate_password_file(str(old), str(new))
-        self.assertIn("symlink", str(caught.exception))
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
         self.assertEqual(old.read_text(encoding="utf-8").strip(), "old-secret")
 

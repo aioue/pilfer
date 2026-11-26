@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   test:
-    name: Test on Python ${{ matrix.python-version }}, ansible-core ${{ matrix.ansible-core || 'latest' }}
+    name: Test on Python ${{ matrix.python-version }}, ansible-core ${{ matrix.ansible-core || 'latest' }}, keyring ${{ matrix.keyring || 'latest' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false  # Continue testing other versions if one fails

@@ -464,6 +464,30 @@ class TestMacOSReplace(KeyringTest):
         self.assertEqual(self.stored(), {entry("ansible", USER): "pw"})
 
 
+class TestIsMacOSBackend(unittest.TestCase):
+    """The gate looks through keyring's ChainerBackend to the backend that set_password writes to."""
+
+    def chain(self, *backends):
+        from keyring.backends import chainer
+
+        # `backends` is a classproperty that discovers installed plugins; pin it.
+        return type("Chain", (chainer.ChainerBackend,), {"backends": list(backends)})()
+
+    def test_chainer_is_judged_by_its_first_backend(self):
+        from keyring.backends import macOS
+
+        # Subclass stub: instantiating it makes no Security framework call.
+        class MacStub(macOS.Keyring):
+            pass
+
+        other = FileKeyring(Path("unused.json"))
+        self.assertTrue(keyring_client._is_macos_backend(MacStub()))
+        self.assertTrue(keyring_client._is_macos_backend(self.chain(MacStub(), other)))
+        self.assertFalse(keyring_client._is_macos_backend(self.chain(other, MacStub())))
+        self.assertFalse(keyring_client._is_macos_backend(self.chain()))
+        self.assertFalse(keyring_client._is_macos_backend(other))
+
+
 class TestThroughAnsible(KeyringTest):
     def ansible_vault(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(

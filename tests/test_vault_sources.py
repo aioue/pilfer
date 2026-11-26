@@ -289,6 +289,27 @@ class TestRekeySources(ProjectTest):
         self.assertEqual(len(self.runs(script)), 1)
         only("scripted-new").decrypt((self.dir / "plain.yml").read_bytes())
 
+    def test_new_vault_id_without_a_label_passes_the_client_no_vault_id(self):
+        # ansible-vault hands a -client script --vault-id only for a label; a
+        # password file given by flag is the default label, so it gets one.
+        client = self.script("log-client", "scripted-new")
+        self.ok(self.rekey("--new-vault-id", "./log-client"))
+        self.assertEqual(self.runs(client), [""])
+        only("scripted-new").decrypt((self.dir / "plain.yml").read_bytes())
+
+    def test_new_vault_password_file_client_gets_the_default_vault_id(self):
+        client = self.script("log-client", "scripted-new")
+        self.ok(self.rekey("--new-vault-password-file", str(client)))
+        self.assertEqual(self.runs(client), ["--vault-id default"])
+
+    def test_new_vault_id_label_with_a_semicolon_or_control_character_is_refused(self):
+        before = (self.dir / "plain.yml").read_bytes()
+        for label in ("a;b", "a\x01b", "a\nb"):
+            with self.subTest(label=label):
+                result = self.rekey("--new-vault-id", f"{label}@new-pass")
+                self.refused(result, "not a valid vault id")
+                self.assertEqual((self.dir / "plain.yml").read_bytes(), before)
+
     def test_new_equal_to_the_ansible_cfg_password_is_refused(self):
         # ansible.cfg's password loads on the old side too; equal to new, rekey
         # would take every old file for one already on the new password.
@@ -397,13 +418,19 @@ class TestUnusedExplicitPassword(ProjectTest):
         result = self.pilfer("close", "-p", "other-pass")
         # The unused-flag refusal, not the one for a password that decrypts no backup.
         self.refused(result, "decrypts none of the session's backups")
-        self.assertIn("pilfer rekey", result.stderr)
         self.assertEqual((self.dir / "secret.yml").read_text(), "token: new\n")
         self.assertTrue((self.dir / "vaultedFileList.json").exists())
         # The password open used, given explicitly or not, closes.
         self.ok(self.pilfer("close", "-p", "cfg-pass"))
         data = (self.dir / "secret.yml").read_bytes()
         self.assertEqual(only("cfg-password").decrypt(data), b"token: new\n")
+
+    def test_close_refuses_a_password_file_that_failed_to_load(self):
+        self.ok(self.pilfer("open"))
+        self.edit("secret.yml", "old", "new")
+        result = self.pilfer("close", "-p", "no-such-file")
+        self.refused(result, "could not be loaded")
+        self.assertTrue((self.dir / "vaultedFileList.json").exists())
 
     def test_close_refuses_a_vault_id_that_opened_nothing(self):
         self.ok(self.pilfer("open"))
@@ -421,7 +448,6 @@ class TestUnusedExplicitPassword(ProjectTest):
                 result = self.ok(self.pilfer("open", "-p", flag))
                 # The path as Ansible unfracks it: /var is /private/var on macOS.
                 self.assertIn(f"/{flag} decrypted none", result.stderr)
-                self.assertIn("decrypted none of the opened files", result.stderr)
                 self.ok(self.pilfer("close"))
 
     def test_set_warns_for_a_wrong_dash_p(self):
@@ -543,7 +569,6 @@ class TestCloseUnusedFlags(ProjectTest):
             "close", "--vault-id", "dev@../wrong-pass", env=identities, cwd=self.sub
         )
         self.refused(result, "--vault-id dev@../wrong-pass")
-        self.assertIn("drop the flag", result.stderr)
         self.assertTrue((self.sub / "vaultedFileList.json").exists())
         self.assertEqual((self.sub / "dev.yml").read_text(), "where: dev-edited\n")
 
@@ -553,7 +578,6 @@ class TestCloseUnusedFlags(ProjectTest):
         self.ok(self.pilfer("open", env=identities))
         result = self.pilfer("close", "-p", "wrong-pass", env=identities)
         self.refused(result, "-p ")
-        self.assertIn("decrypts none of the session's backups", result.stderr)
 
 
 class TestInteractiveSources(ProjectTest):
@@ -606,8 +630,25 @@ class TestInteractiveSources(ProjectTest):
             "--yes",
             answers="one\ntwo\n",
         )
-        self.assertNotEqual(result.returncode, 0)
+        self.refused(result, "Passwords do not match")
         self.assertEqual((self.dir / "secret.yml").read_bytes(), before)
+
+    def test_two_prompts_for_one_id_are_judged_one_each(self):
+        # Both flags would map to the first prompt's secret, and the second
+        # password, which decrypts nothing, would go unreported.
+        self.write("secret.yml", only("pw1", "a").encrypt(b"token: x\n", vault_id="a"))
+        result = self.ok(
+            self.pilfer(
+                "open",
+                "--vault-id",
+                "a@prompt",
+                "--vault-id",
+                "a@prompt",
+                answers="pw1\npw2\n",
+            )
+        )
+        self.assertEqual(result.stderr.count("decrypted none"), 1, result.stderr)
+        self.ok(self.pilfer("close", "--vault-id", "a@prompt", answers="pw1\n"))
 
 
 class TestRekeyPreconditions(ProjectTest):
@@ -654,9 +695,76 @@ class TestRekeyPreconditions(ProjectTest):
         result = self.rotate()
         self.refused(result, "symlink")
         self.assertEqual(result.returncode, 1)
-        for name, data in self.before.items():
-            self.assertEqual((self.dir / name).read_bytes(), data)
-        self.assertEqual((self.dir / "real-pass").read_text().strip(), "old-password")
+        self.assert_untouched()
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes to a 0500 directory")
+    def test_an_unwritable_password_directory_refuses_before_any_file_is_written(self):
+        keys = self.dir / "keys"
+        keys.mkdir()
+        (self.dir / "old-pass").rename(keys / "old-pass")
+        os.chmod(keys, 0o500)
+        self.addCleanup(os.chmod, keys, 0o700)
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                result = self.pilfer(
+                    "rekey",
+                    "--old-vault-password-file",
+                    "keys/old-pass",
+                    "--new-vault-password-file",
+                    "new-pass",
+                    "--rotate-password-file",
+                    "--yes",
+                    *extra,
+                )
+                self.refused(result, "not writable")
+                self.assertEqual(result.returncode, 1)
+                for name, data in self.before.items():
+                    self.assertEqual((self.dir / name).read_bytes(), data)
+                self.assertEqual((keys / "old-pass").read_text().strip(), "old-password")
+
+    def test_a_vault_encrypted_new_password_file_cannot_be_rotated_in(self):
+        # Rotation copies the file as it is: Ansible could not use the blob.
+        elsewhere = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, elsewhere)
+        encrypted = elsewhere / "new-pass.vault"
+        encrypted.write_bytes(only("old-password").encrypt(b"brand-new\n"))
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                result = self.pilfer(
+                    "rekey",
+                    "--old-vault-password-file",
+                    "old-pass",
+                    "--new-vault-password-file",
+                    str(encrypted),
+                    "--rotate-password-file",
+                    "--yes",
+                    *extra,
+                )
+                self.refused(result, "vault-encrypted")
+                self.assertEqual(result.returncode, 1)
+                self.assert_untouched()
+                self.assertFalse((self.dir / "old-pass_old").exists())
+
+    def test_a_new_password_file_inside_the_tree_is_refused(self):
+        # It would be re-keyed under itself: the new password would then exist
+        # only encrypted with the new password.
+        encrypted = self.write("new-pass.vault", only("old-password").encrypt(b"brand-new\n"))
+        before = encrypted.read_bytes()
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                result = self.pilfer(
+                    "rekey",
+                    "--old-vault-password-file",
+                    "old-pass",
+                    "--new-vault-password-file",
+                    "new-pass.vault",
+                    "--yes",
+                    *extra,
+                )
+                self.refused(result, "move it out first")
+                self.assertEqual(result.returncode, 1)
+                self.assert_untouched()
+                self.assertEqual(encrypted.read_bytes(), before)
 
 
 class TestRekeyOldAndNewSources(ProjectTest):
@@ -748,8 +856,9 @@ class TestInterruptAndLocale(ProjectTest):
         result = self.pilfer("open", "-p", "pass", env={"LC_ALL": "C", "LANG": "C"})
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertNotIn("Traceback", result.stderr)
-        self.assertIn("UTF-8 locale", result.stderr)
-        self.assertIn("LC_ALL=C.UTF-8", result.stderr)
+        self.assertIn("UTF-8", result.stderr)
+        self.assertNotIn("ERROR: ERROR", result.stderr)
+        self.assertNotIn("Error: ERROR", result.stderr)
 
 
 if __name__ == "__main__":

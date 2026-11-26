@@ -105,13 +105,8 @@ def _cli():
     try:
         from ansible.cli import CLI
     except SystemExit as exc:
-        message = str(exc)
-        if "locale" in message:
-            message += (
-                "\npilfer loads vault passwords through ansible-core, which needs a UTF-8 "
-                "locale, as ansible-vault does (try LC_ALL=C.UTF-8)."
-            )
-        raise PilferError(message) from None
+        # Ansible's text starts "ERROR: "; main prints its own "Error: ".
+        raise PilferError(str(exc).removeprefix("ERROR: ")) from None
     return CLI
 
 
@@ -136,9 +131,10 @@ def _read_plain_password_file(path: str) -> VaultSecret:
 def load_secrets(sources=None) -> Secrets:
     """Every secret Ansible would load for these flags, as [(vault_id, secret)].
 
-    vault_identity_list comes first, then --vault-id, then the password files,
-    and ansible.cfg's vault_password_file last: setup_vault_secrets appends it.
-    A source that fails is a warning while another loads, as in ansible-vault.
+    The order is build_vault_ids': vault_identity_list, then --vault-id, then
+    the -p files, then ansible.cfg's vault_password_file (setup_vault_secrets
+    appends it), and -J's prompt last. A password file that fails is a warning
+    while another loads, as in ansible-vault; a failing prompt is an error.
     Each source is read or run once per call, so a command calls this once.
     With no source at all, the first existing FALLBACK_PASSWORD_FILES entry is
     read as a plain password file and never run.
@@ -186,7 +182,7 @@ class SourceVault(VaultLib):
     --vault-id, so a wrong -p no longer fails on its own: the config password
     decrypts the files. explicit pairs each flag with the secret it loaded.
     unused_explicit() names the flags whose password decrypted nothing, so
-    close can refuse and open and set can warn. VaultLib.decrypt goes through
+    close can refuse, and open, set and rekey can warn. VaultLib.decrypt goes through
     decrypt_and_get_vault_id, so every decrypt is seen without decrypting
     anything twice.
     """
@@ -216,28 +212,31 @@ def _explicit_secrets(sources: VaultSources, secrets: Secrets) -> list[ExplicitS
 
     A secret is matched on its vault id and its file, not the file alone: one
     -client script named by --vault-id dev@X and --vault-id prod@X loads as
-    two secrets, and each flag must be judged by its own.
+    two secrets, and each flag must be judged by its own. Each secret goes to
+    one flag, taken in the order core loads them (--vault-id, then -p, then
+    -J), so two flags that name the same file and id get two secrets.
     """
+    taken: set[int] = set()
+
+    def claim(vault_id: str, matches) -> VaultSecret | None:
+        secret = next(
+            (s for sid, s in secrets if sid == vault_id and id(s) not in taken and matches(s)),
+            None,
+        )
+        if secret is not None:
+            taken.add(id(secret))
+        return secret
 
     def by_file(vault_id: str, path: str) -> VaultSecret | None:
         # get_file_vault_secret stores the path unfracked without following links.
         target = unfrackpath(path, follow=False)
-        return next(
-            (s for sid, s in secrets if sid == vault_id and getattr(s, "filename", None) == target),
-            None,
-        )
+        return claim(vault_id, lambda s: getattr(s, "filename", None) == target)
 
     def by_prompt(vault_id: str) -> VaultSecret | None:
-        return next(
-            (s for sid, s in secrets if sid == vault_id and isinstance(s, PromptVaultSecret)),
-            None,
-        )
+        return claim(vault_id, lambda s: isinstance(s, PromptVaultSecret))
 
     default = C.DEFAULT_VAULT_IDENTITY
-    found = [
-        ExplicitSource(f"-p {path}", default, by_file(default, path))
-        for path in sources.password_files
-    ]
+    found = []
     for slug in sources.vault_ids:
         label, source = _cli().split_vault_id(slug)
         vault_id = label or default
@@ -245,6 +244,10 @@ def _explicit_secrets(sources: VaultSources, secrets: Secrets) -> list[ExplicitS
             found.append(ExplicitSource(f"--vault-id {slug}", vault_id, by_prompt(vault_id)))
         else:
             found.append(ExplicitSource(f"--vault-id {slug}", vault_id, by_file(vault_id, source)))
+    found.extend(
+        ExplicitSource(f"-p {path}", default, by_file(default, path))
+        for path in sources.password_files
+    )
     if sources.ask:
         found.append(ExplicitSource("-J", default, by_prompt(default)))
     return found
@@ -256,18 +259,6 @@ def load_vault(sources=None) -> SourceVault:
     return SourceVault(secrets, _explicit_secrets(sources, secrets))
 
 
-def _loader_holding(secrets: Secrets) -> DataLoader:
-    """A DataLoader that can read a password file encrypted with one of secrets.
-
-    ansible-vault rekey reads its new password file this way: the file may
-    itself be a vault, encrypted with the old password.
-    """
-    loader = DataLoader()
-    if secrets:
-        loader.set_vault_secrets(secrets)
-    return loader
-
-
 def load_new_secret(sources, old_secrets: Secrets = ()) -> tuple[str, VaultSecret]:
     """The one secret rekey encrypts with, from exactly one --new-* source.
 
@@ -275,7 +266,8 @@ def load_new_secret(sources, old_secrets: Secrets = ()) -> tuple[str, VaultSecre
     which is the old password, and when the named source fails it warns and
     returns the rest, so a mistyped path would leave the old password chosen
     as the new one. These are the calls it makes for a single source.
-    old_secrets decrypt a new password file that is itself a vault.
+    old_secrets decrypt a new password file that is itself a vault, as
+    ansible-vault rekey reads it.
     """
     sources = VaultSources.of(sources)
     default = C.DEFAULT_VAULT_IDENTITY
@@ -284,8 +276,14 @@ def load_new_secret(sources, old_secrets: Secrets = ()) -> tuple[str, VaultSecre
         slugs.append(f"{default}@prompt")
     if len(slugs) != 1:
         raise PilferError("rekey needs exactly one new vault password source")
-    vault_id, source = _cli().split_vault_id(slugs[0])
-    vault_id = vault_id or default
+    label, source = _cli().split_vault_id(slugs[0])
+    # The label goes into every value's header, where ';' ends it and a control
+    # character is cut off on read. Core's VaultCLI refuses ';' for --vault-id.
+    if label and (";" in label or any(not c.isprintable() for c in label)):
+        raise PilferError(
+            f"'{label}' is not a valid vault id: ';' and control characters are not allowed"
+        )
+    vault_id = label or default
     try:
         if source in ("prompt", "prompt_ask_vault_pass"):
             secret = PromptVaultSecret(
@@ -296,13 +294,26 @@ def load_new_secret(sources, old_secrets: Secrets = ()) -> tuple[str, VaultSecre
                 vault_id=vault_id,
             )
         else:
-            secret = get_file_vault_secret(
-                filename=source, vault_id=vault_id, loader=_loader_holding(old_secrets)
-            )
+            loader = DataLoader()
+            loader.set_vault_secrets(list(old_secrets))
+            # The raw label, as ansible-vault passes it: a -client script gets
+            # --vault-id only when there is one.
+            secret = get_file_vault_secret(filename=source, vault_id=label, loader=loader)
         secret.load()
     except AnsibleError as exc:
         raise PilferError(f"new vault password: {exc}") from None
     return vault_id, secret
+
+
+def password_file_paths(sources) -> list[str]:
+    """The files a set of flags names: -p files and the file part of each --vault-id."""
+    sources = VaultSources.of(sources)
+    paths = list(sources.password_files)
+    for slug in sources.vault_ids:
+        _label, source = _cli().split_vault_id(slug)
+        if source not in ("prompt", "prompt_ask_vault_pass"):
+            paths.append(source)
+    return paths
 
 
 def is_plain_password_file(path: str) -> bool:
@@ -315,10 +326,10 @@ def is_plain_password_file(path: str) -> bool:
     return type(secret) is FileVaultSecret
 
 
-def password_file_secret(path: str, secrets: Secrets = ()) -> VaultSecret:
-    """Load one password file or script, as Ansible would. secrets decrypt a vault-encrypted file."""
+def password_file_secret(path: str) -> VaultSecret:
+    """Load one password file or script, as Ansible would."""
     try:
-        secret = get_file_vault_secret(filename=path, loader=_loader_holding(secrets))
+        secret = get_file_vault_secret(filename=path, loader=DataLoader())
         secret.load()
     except AnsibleError as exc:
         raise PilferError(f"vault password: {exc}") from None
