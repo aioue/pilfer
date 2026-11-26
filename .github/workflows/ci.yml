@@ -30,9 +30,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ansible-core
-          # The keyring extra: test_keyring_client fails under CI without it.
-          pip install 'keyring>=25'
+          # The keyring extra is a test dependency (test_keyring_client imports
+          # keyring); installing it from pyproject keeps one version floor.
+          # This also pulls ansible-core.
+          pip install -e '.[keyring]'
           pip install -r requirements-dev.txt
 
       - name: Ruff

@@ -55,7 +55,9 @@ keywords = [
 [project.optional-dependencies]
 # pilfer-vault-keyring-client: a vault password client script on the system
 # keyring (macOS Keychain, Secret Service; ansible-core has no Windows controller).
-# 25.x is the current major; the script calls only get_password and set_password.
+# The script uses keyring.get_keyring(), the backend's get_password and
+# set_password, and keyring.errors.KeyringError, all present well before 25;
+# 25.x is simply the current major.
 keyring = ["keyring>=25"]
 
 [project.urls]

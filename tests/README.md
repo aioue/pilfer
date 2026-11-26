@@ -36,8 +36,11 @@ python -m unittest test_pilfer_unified.TestPilferCLI.test_line_endings_preserved
 - `test_keyring_client.py`: `pilfer-vault-keyring-client`, run as Ansible runs
   it and through `ansible-vault` and pilfer. The keyring is
   `_file_keyring.FileKeyring`, a JSON file per test, or keyring's own fail and
-  null backends, so the real keychain is never touched. Skipped without the
-  `keyring` extra, except under `CI`, where a missing extra fails the run.
+  null backends, so the real keychain is never touched. Needs the `keyring`
+  extra (`pip install -e '.[keyring]'`).
+- `_file_keyring.py`: a keyring backend that keeps passwords in a JSON file.
+  `PYTHON_KEYRING_BACKEND` and `PILFER_TEST_KEYRING` select it, because the
+  client under test runs in its own process.
 - `test_vault_set.py`: `pilfer set` and `set_keys`. Results are read back
   through the `ansible-vault` CLI, not through pilfer.
 

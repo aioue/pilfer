@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 
 from keyring.backend import KeyringBackend
-from keyring.errors import PasswordDeleteError
 
 
 class FileKeyring(KeyringBackend):
@@ -31,10 +30,4 @@ class FileKeyring(KeyringBackend):
     def set_password(self, service, username, password):
         data = self._load()
         data[f"{service}/{username}"] = password
-        self._path.write_text(json.dumps(data))
-
-    def delete_password(self, service, username):
-        data = self._load()
-        if data.pop(f"{service}/{username}", None) is None:
-            raise PasswordDeleteError(service)
         self._path.write_text(json.dumps(data))
