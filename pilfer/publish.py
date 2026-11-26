@@ -156,16 +156,8 @@ def _fsync_directory(directory: str) -> None:
         os.close(fd)
 
 
-@contextmanager
-def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
-    """Block other pilfer publishes of this path until the with-block ends.
-
-    flock is on a sibling, held from the first read through os.replace.
-    Two threads in one process do not exclude each other: flock is per
-    process. pilfer runs one publish at a time in each process.
-    """
-    path = Path(path)
-    lock_path = path.parent / f"{path.name}{LOCK_SUFFIX}"
+def _open_lock_file(lock_path: Path) -> int:
+    """Open (creating) the lock file as a private regular file, refusing symlinks."""
     # O_NOFOLLOW: a planted sibling symlink must not be chmod'd or created through.
     flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
@@ -181,13 +173,74 @@ def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
             # A FIFO or device opened here is not ours to chmod.
             raise OSError(errno.EINVAL, f"pilfer lock is not a regular file: {lock_path}")
         os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
+    except BaseException:
         os.close(fd)
+        raise
+    return fd
+
+
+def _names_inode(lock_path: Path, fd: int) -> bool:
+    """True if lock_path still names the file that fd has open."""
+    try:
+        on_disk = os.stat(lock_path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    held = os.fstat(fd)
+    return (on_disk.st_dev, on_disk.st_ino) == (held.st_dev, held.st_ino)
+
+
+@contextmanager
+def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
+    """Block other pilfer publishes of this path until the with-block ends.
+
+    flock is on a sibling, held from the first read through os.replace. On
+    local filesystems flock belongs to the open file description, so two
+    threads that each open the lock file exclude each other as well as two
+    processes. The sibling is removed on the way out; only a killed pilfer
+    leaves one, and the next run reuses it and removes it. Every pilfer that
+    takes this lock must use this protocol: an older pilfer without the
+    re-check below could end up holding a lock on a dead inode.
+
+    Removing a flock file needs two steps, or two holders can coexist:
+    - The holder unlinks while it still holds the lock. If it unlocked first,
+      a third process could create a fresh file and lock it while a waiter
+      wakes on the old, unlinked inode and locks that too.
+    - A waiter that opened the file before the unlink wakes holding a lock on
+      an inode the path no longer names. After flock returns it checks that the
+      path still names its inode, and starts over if not.
+    """
+    path = Path(path)
+    lock_path = path.parent / f"{path.name}{LOCK_SUFFIX}"
+    while True:
+        fd = _open_lock_file(lock_path)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if _names_inode(lock_path, fd):
+                break
+        except BaseException:
+            os.close(fd)
+            raise
+        # The previous holder unlinked this inode after we opened it.
+        os.close(fd)
+    try:
+        yield
+    finally:
+        try:
+            # Unlink before unlock, and only if the path is still our inode.
+            # Best effort: a stale lock in a directory we cannot write opens
+            # fine but cannot be unlinked, and that must not replace the
+            # block's result or its PilferError. The file stays reusable, and
+            # the next run that can write the directory removes it.
+            try:
+                if _names_inode(lock_path, fd):
+                    os.unlink(lock_path)
+            except OSError:
+                pass
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 def locked_by_path(func: Callable) -> Callable:

@@ -541,7 +541,8 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
             file_path = os.path.join(dirpath, name)
             if os.path.islink(file_path):
                 continue
-            # Empty sibling used by vault_file_lock. Not a vault target.
+            # Sibling used by vault_file_lock (it can exist while another pilfer
+            # runs, or after a killed one). Not a vault target.
             if name.endswith(LOCK_SUFFIX):
                 continue
             # Sidecars / markers must be collected even if renamed behind the

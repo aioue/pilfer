@@ -302,7 +302,7 @@ non-zero. It does not invent fixes for ambiguous edits.
 vaultedFileList.json
 .vault/
 **/*.pilfer-open
-# Empty lock left beside a vault after open, close, rekey, or set.
+# Lock file that exists while pilfer works on a vault. Left behind only if pilfer is killed.
 **/*.pilfer-lock
 # Temp a killed pilfer can leave beside a file. The next open, close or rekey deletes it.
 **/.pilfer-rekey-*
