@@ -30,9 +30,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # The keyring extra is a test dependency (test_keyring_client imports
-          # keyring); installing it from pyproject keeps one version floor.
-          # This also pulls ansible-core.
+          # The keyring extra is a test dependency; pyproject holds the version floor.
           pip install -e '.[keyring]'
           pip install -r requirements-dev.txt
 

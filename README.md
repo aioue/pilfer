@@ -292,7 +292,7 @@ pilfer rekey --new-vault-id prompt
 pilfer-vault-keyring-client --set    # answer y to replace the old password
 ```
 
-For a labelled source, name the label on both: `--new-vault-id prod@prompt`, then `--vault-id prod --set`. Until `--set` succeeds, the files are on the new password and the keyring holds the old one; run `--set` again if it was interrupted or kept the old password.
+For a labelled source, name the label on both: `--new-vault-id prod@prompt`, then `--vault-id prod --set`. The files are already on the new password after the rekey, so run `--set` again until it succeeds.
 
 Refuse to rekey while a pilfer session is open. Nested git checkouts are skipped
 (run `pilfer rekey` from those directories separately). Prefer `--dry-run` first.

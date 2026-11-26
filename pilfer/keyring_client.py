@@ -13,11 +13,9 @@ Ported from vault-keyring-client.py in ansible-community/contrib-scripts
     (c) 2014, Matt Martz <matt@sivel.net>
     (c) 2016, Justin Mayer <https://justinmayer.com/>
 
-Same interface: the keyring service is the vault id, else ``keyname`` in
-ansible.cfg's ``[vault]`` section, else ``ansible``; the account is
-``--username``, else ``[vault] username``, else the login name; ``--set`` stores
-a password; exit code 2 means none is stored. Where this differs from the
-original, the comment at that line says why.
+Same interface as the original: service is the vault id, else ``[vault] keyname``,
+else ``ansible``; ``--set`` stores a password; exit code 2 means none is stored.
+Where this differs from the original, the comment at that line says why.
 """
 
 import argparse
@@ -61,8 +59,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "The id Ansible gives an unlabelled password file, the configured default vault id "
             "('default' unless vault_identity is set), also uses keyname."
         ),
-        # So `--s` cannot mean `--set`.
-        allow_abbrev=False,
     )
     parser.add_argument(
         "--vault-id",
@@ -88,7 +84,7 @@ def _store(backend, keyname: str, username: str, where: str) -> int:
 
     # Names and paths come from ansible.cfg and its directory: repr keeps
     # control characters out of the terminal.
-    config = repr(C.CONFIG_FILE)
+    config = repr(C.CONFIG_FILE) if C.CONFIG_FILE else "none found"
     # Not in the original. Replacing the entry loses the password files may
     # still be encrypted with: `pilfer rekey` first, then --set.
     replacing = backend.get_password(keyname, username) is not None
@@ -121,12 +117,15 @@ def _store(backend, keyname: str, username: str, where: str) -> int:
         # it strips, so spaces alone would store "" over the old password.
         verify_secret_is_not_empty(secret.bytes, "refusing an empty password")
     except AnsibleError as exc:
-        sys.stderr.write(f"{PROG}: {exc!r}\n")
+        # str, not repr: every message on this path is a fixed string or embeds
+        # repr(keyname), so it is already terminal-safe.
+        sys.stderr.write(f"{PROG}: {exc}\n")
         return 1
     password = secret.bytes.decode()
     # Not in the original: confirm the write. A backend can drop it (keyring's
     # null backend does), and macOS replaces by delete then add, so a failure
-    # from here on may already have removed the old password.
+    # from here on may already have removed the old password. set_password can
+    # also block on a keychain unlock or access dialog, so ctrl-c lands here too.
     try:
         backend.set_password(keyname, username, password)
         stored = backend.get_password(keyname, username)
@@ -135,10 +134,14 @@ def _store(backend, keyname: str, username: str, where: str) -> int:
         problem = "nothing is stored" if stored is None else "a different value is stored"
     except keyring.errors.KeyringError as exc:
         problem = repr(exc)
+    except KeyboardInterrupt:
+        # rc 1, not 130: the write may have started (a Keychain dialog can hold
+        # it), and "interrupted" alone would suggest nothing changed.
+        problem = "interrupted"
     lost = "; the old one may be gone" if replacing else ""
     sys.stderr.write(
         f"{PROG}: could not confirm the new password for {where} ({problem}){lost}. "
-        "Check with a lookup (no --set) and run --set again\n"
+        "Run --set again\n"
     )
     return 1
 
@@ -147,8 +150,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
         # Imported here: keyring is the optional extra, and --help and this hint
-        # must work without it.
-        import keyring
+        # must work without it. keyring.errors is named because main catches
+        # its KeyringError; `import keyring` binds it only as a side effect.
+        import keyring.errors
     except ImportError:
         sys.stderr.write(
             f"{PROG} needs the keyring package: pip install 'pilfer[keyring]' (or: pipx inject pilfer keyring)\n"

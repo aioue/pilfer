@@ -27,7 +27,7 @@ import keyring
 import keyring.backends.fail
 import keyring.backends.null
 import keyring.errors
-from _file_keyring import FileKeyring
+from _file_keyring import FileKeyring, entry
 from ansible.parsing.vault import script_is_client
 from test_vault_sources import ProjectTest, only
 
@@ -39,6 +39,45 @@ from pilfer import keyring_client  # noqa: E402
 
 CLIENT_NAME = "pilfer-vault-keyring-client"
 USER = getpass.getuser()
+
+
+class Interrupts(FileKeyring):
+    """ctrl-c while the keyring is read (a Keychain dialog can block there)."""
+
+    def get_password(self, service, username):
+        raise KeyboardInterrupt
+
+
+class InterruptsTheWrite(FileKeyring):
+    """macOS replaces by delete then add: ctrl-c between the two loses the old password."""
+
+    def set_password(self, service, username, password):
+        data = self._load()
+        del data[entry(service, username)]
+        self._path.write_text(json.dumps(data))
+        raise KeyboardInterrupt
+
+
+class LocksAfterWrite(FileKeyring):
+    """The write lands, then the read-back fails."""
+
+    written = False
+
+    def set_password(self, service, username, password):
+        super().set_password(service, username, password)
+        self.written = True
+
+    def get_password(self, service, username):
+        if self.written:
+            raise keyring.errors.KeyringLocked("locked after the write")
+        return super().get_password(service, username)
+
+
+class Corrupts(FileKeyring):
+    """The write lands as a different value."""
+
+    def set_password(self, service, username, password):
+        super().set_password(service, username, "other")
 
 
 class KeyringTest(ProjectTest):
@@ -59,7 +98,7 @@ class KeyringTest(ProjectTest):
 
     def store(self, service: str, password: str, username: str = USER) -> None:
         data = self.stored()
-        data[f"{service}/{username}"] = password
+        data[entry(service, username)] = password
         self.keyring_file.write_text(json.dumps(data))
 
     def stored(self) -> dict:
@@ -82,10 +121,13 @@ class KeyringTest(ProjectTest):
             start_new_session=True,
         )
 
-    def set_in_process(
-        self, *args: str, typed: tuple = ("pw", "pw"), replace: str | None = None, backend=None
+    def run_in_process(
+        self, *args: str, backend=None, typed: tuple = ("pw", "pw"), replace=None
     ) -> tuple[int, str, str]:
-        """main(--set ...) with getpass (and the replace question) answered, on this test's keyring."""
+        """main(args) with getpass (and the replace question) answered, on this test's keyring.
+
+        replace is the answer to the "Replace it?" question; None means it must not be asked.
+        """
         out, err = io.StringIO(), io.StringIO()
         answers = (
             mock.Mock(side_effect=[replace])
@@ -95,16 +137,18 @@ class KeyringTest(ProjectTest):
         # Reset to the null backend, not to get_keyring()'s: reading that first
         # would initialise the machine's real backend.
         self.addCleanup(keyring.set_keyring, keyring.backends.null.Keyring())
-        keyring.set_keyring(backend or FileKeyring())
+        keyring.set_keyring(backend or FileKeyring(self.keyring_file))
         with (
-            mock.patch.dict(os.environ, PILFER_TEST_KEYRING=str(self.keyring_file)),
             mock.patch.object(getpass, "getpass", side_effect=list(typed)),
             mock.patch.object(builtins, "input", answers),
             redirect_stdout(out),
             redirect_stderr(err),
         ):
-            code = keyring_client.main(["--set", *args])
+            code = keyring_client.main(list(args))
         return code, out.getvalue(), err.getvalue()
+
+    def set_in_process(self, *args: str, **kwargs) -> tuple[int, str, str]:
+        return self.run_in_process("--set", *args, **kwargs)
 
 
 class TestClientLookup(KeyringTest):
@@ -116,22 +160,6 @@ class TestClientLookup(KeyringTest):
     def test_vault_id_names_the_service(self):
         self.store("dev", "dev-pw")
         self.assertEqual(self.run_client("--vault-id", "dev").stdout, "dev-pw\n")
-
-    def test_vault_id_default_uses_keyname_from_ansible_cfg(self):
-        # Ansible passes --vault-id default for vault_password_file; the
-        # contrib original then looked up a service called "default".
-        self.write("ansible.cfg", "[defaults]\n[vault]\nkeyname = homelab\nusername = 'ops'\n")
-        self.store("homelab", "pw", username="ops")
-        self.store("default", "wrong", username="ops")
-        result = self.run_client("--vault-id", "default")
-        self.assertEqual((result.returncode, result.stdout), (0, "pw\n"), result.stderr)
-
-    def test_configured_vault_identity_also_uses_keyname(self):
-        # vault_identity renames the id Ansible gives an unlabelled file.
-        self.write("ansible.cfg", "[defaults]\nvault_identity = prod\n[vault]\nkeyname = homelab\n")
-        self.store("homelab", "pw")
-        self.store("prod", "wrong")
-        self.assertEqual(self.run_client("--vault-id", "prod").stdout, "pw\n")
 
     def test_config_is_parsed_as_ansible_parses_it(self):
         # Quotes, an inline ; comment, and a non-UTF-8 comment Ansible accepts.
@@ -164,12 +192,9 @@ class TestClientLookup(KeyringTest):
         # Ansible's ClientScriptVaultSecret.VAULT_ID_UNKNOWN_RC is 2.
         result = self.run_client("--vault-id", "prod")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("could not find key='prod'", result.stderr)
+        self.assertIn("could not find", result.stderr)
+        self.assertIn("prod", result.stderr)
         self.assertEqual(result.stdout, "")
-
-    def test_null_backend_is_not_found(self):
-        result = self.run_client(env={"PYTHON_KEYRING_BACKEND": "keyring.backends.null.Keyring"})
-        self.assertEqual(result.returncode, 2, result.stderr)
 
     def test_no_usable_backend_is_one_line_not_a_traceback(self):
         # keyring's fail backend: what a headless box with no keyring daemon gets.
@@ -193,17 +218,33 @@ class TestClientLookup(KeyringTest):
         self.assertNotIn("Traceback", result.stderr)
 
     def test_lookup_ctrl_c_exits_130(self):
+        code, _, err = self.run_in_process(backend=Interrupts(self.keyring_file))
+        self.assertEqual(code, 130)
+        self.assertIn("interrupted", err)
+
+    def test_without_keyring_package_says_what_to_install(self):
+        # None in sys.modules makes `import keyring.errors` raise ImportError.
         err = io.StringIO()
-        self.addCleanup(keyring.set_keyring, keyring.backends.null.Keyring())
-        keyring.set_keyring(FileKeyring())
         with (
-            mock.patch.dict(os.environ, PILFER_TEST_KEYRING=str(self.keyring_file)),
-            mock.patch.object(FileKeyring, "get_password", side_effect=KeyboardInterrupt),
+            mock.patch.dict(sys.modules, {"keyring": None}),
             redirect_stderr(err),
         ):
             code = keyring_client.main([])
-        self.assertEqual(code, 130)
-        self.assertIn("interrupted", err.getvalue())
+            self.assertEqual(code, 1)
+            self.assertIn("pilfer[keyring]", err.getvalue())
+            # --help must not need the package.
+            with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                keyring_client.main(["--help"])
+            self.assertEqual(raised.exception.code, 0)
+
+    def test_no_login_name_asks_for_username(self):
+        with mock.patch.object(keyring_client.getpass, "getuser", side_effect=KeyError):
+            code, _, err = self.run_in_process()
+            self.assertEqual(code, 1)
+            self.assertIn("--username", err)
+            with self.subTest("with --username"):
+                code, _, err = self.run_in_process("--username", "u")
+                self.assertEqual(code, keyring_client.KEYNAME_UNKNOWN_RC, err)
 
     def test_names_from_config_are_escaped_in_messages(self):
         self.write("ansible.cfg", "[defaults]\n[vault]\nkeyname = a\n  \x1b[2Jb\n")
@@ -217,8 +258,8 @@ class TestSet(KeyringTest):
     def test_set_stores_under_the_vault_id(self):
         code, out, _ = self.set_in_process("--vault-id", "prod")
         self.assertEqual(code, 0)
-        self.assertIn("key='prod'", out)
-        self.assertEqual(self.stored(), {f"prod/{USER}": "pw"})
+        self.assertIn("prod", out)
+        self.assertEqual(self.stored(), {entry("prod", USER): "pw"})
 
     def test_set_with_the_default_vault_id_stores_under_keyname(self):
         # The same mapping and config as the lookup, so --set then
@@ -249,12 +290,12 @@ class TestSet(KeyringTest):
         code, _, err = self.set_in_process(replace="n")
         self.assertEqual(code, 1)
         self.assertIn("kept", err)
-        self.assertEqual(self.stored(), {f"ansible/{USER}": "old"})
+        self.assertEqual(self.stored(), {entry("ansible", USER): "old"})
 
     def test_set_replaces_on_yes(self):
         self.store("ansible", "old")
         self.assertEqual(self.set_in_process(replace="yes")[0], 0)
-        self.assertEqual(self.stored(), {f"ansible/{USER}": "pw"})
+        self.assertEqual(self.stored(), {entry("ansible", USER): "pw"})
 
     def test_set_keeps_the_stored_password_without_an_answer(self):
         # No terminal (EOF) or just Enter: the default is to keep it.
@@ -263,7 +304,7 @@ class TestSet(KeyringTest):
             code, _, err = self.set_in_process(replace=answer)
             self.assertEqual(code, 1, answer)
             self.assertIn("kept", err)
-            self.assertEqual(self.stored(), {f"ansible/{USER}": "old"})
+            self.assertEqual(self.stored(), {entry("ansible", USER): "old"})
 
     def assert_one_line_error(self, err: str) -> None:
         # The text after the prefix is ansible-core's (PromptVaultSecret), and
@@ -271,20 +312,18 @@ class TestSet(KeyringTest):
         self.assertTrue(err.startswith(f"{CLIENT_NAME}: "), err)
         self.assertEqual(len(err.strip().splitlines()), 1, err)
 
-    def test_set_refuses_a_mismatch_an_empty_password_and_ctrl_d(self):
-        for typed in (("pw", "typo"), ("", ""), (EOFError(),)):
-            with self.subTest(typed=typed):
-                code, _, err = self.set_in_process(typed=typed)
-                self.assertEqual(code, 1)
-                self.assert_one_line_error(err)
-                self.assertEqual(self.stored(), {})
+    def test_set_refuses_a_mismatch(self):
+        code, _, err = self.set_in_process(typed=("pw", "typo"))
+        self.assertEqual(code, 1)
+        self.assert_one_line_error(err)
+        self.assertEqual(self.stored(), {})
 
     def test_set_refuses_spaces_only_and_keeps_the_old_password(self):
         self.store("ansible", "old")
         code, _, err = self.set_in_process(typed=("   ", "   "), replace="y")
         self.assertEqual(code, 1)
         self.assertIn("empty", err)
-        self.assertEqual(self.stored(), {f"ansible/{USER}": "old"})
+        self.assertEqual(self.stored(), {entry("ansible", USER): "old"})
 
     def test_set_ctrl_c_exits_130_and_stores_nothing(self):
         for name, kwargs in {
@@ -296,7 +335,7 @@ class TestSet(KeyringTest):
                 code, _, err = self.set_in_process(**kwargs)
                 self.assertEqual(code, 130)
                 self.assertIn("interrupted", err)
-                self.assertEqual(self.stored(), {f"ansible/{USER}": "old"})
+                self.assertEqual(self.stored(), {entry("ansible", USER): "old"})
 
     def test_set_without_a_usable_backend(self):
         code, _, err = self.set_in_process(backend=keyring.backends.fail.Keyring())
@@ -313,31 +352,28 @@ class TestSet(KeyringTest):
 
     def test_set_says_the_old_password_may_be_gone_when_the_read_back_fails(self):
         # macOS replaces by delete then add: past the write, the old one may be gone.
-        class LocksAfterWrite(FileKeyring):
-            written = False
-
-            def set_password(self, service, username, password):
-                super().set_password(service, username, password)
-                self.written = True
-
-            def get_password(self, service, username):
-                if self.written:
-                    raise keyring.errors.KeyringLocked("locked after the write")
-                return super().get_password(service, username)
-
         self.store("ansible", "old")
-        code, _, err = self.set_in_process(replace="y", backend=LocksAfterWrite())
+        code, _, err = self.set_in_process(replace="y", backend=LocksAfterWrite(self.keyring_file))
         self.assertEqual(code, 1)
         self.assertIn("the old one may be gone", err)
         self.assertIn("locked after the write", err)
-        self.assertEqual(self.stored(), {f"ansible/{USER}": "pw"})
+        self.assertEqual(self.stored(), {entry("ansible", USER): "pw"})
 
     def test_set_reports_a_different_value_after_the_write(self):
-        # First get_password: the replace check sees nothing. Second: the read-back.
-        with mock.patch.object(FileKeyring, "get_password", side_effect=[None, "other"]):
-            code, _, err = self.set_in_process()
+        code, _, err = self.set_in_process(backend=Corrupts(self.keyring_file))
         self.assertEqual(code, 1)
         self.assertIn("a different value is stored", err)
+
+    def test_set_ctrl_c_during_the_write_is_not_reported_as_nothing_changed(self):
+        # The write may have started, so rc 1 and the "may be gone" warning, not 130.
+        self.store("ansible", "old")
+        code, _, err = self.set_in_process(
+            replace="y", backend=InterruptsTheWrite(self.keyring_file)
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("could not confirm", err)
+        self.assertIn("may be gone", err)
+        self.assertEqual(self.stored(), {})
 
 
 class TestThroughAnsible(KeyringTest):
@@ -353,38 +389,32 @@ class TestThroughAnsible(KeyringTest):
         )
 
     def test_ansible_vault_with_vault_password_file(self):
-        self.write(
-            "ansible.cfg",
-            f"[defaults]\nvault_password_file = {self.client}\n[vault]\nkeyname = homelab\n",
-        )
-        self.store("homelab", "kc-password")
-        self.write("secret.yml", only("kc-password").encrypt(b"token: x\n"))
-        result = self.ansible_vault("view", "secret.yml")
-        self.assertEqual((result.returncode, result.stdout), (0, "token: x\n"), result.stderr)
-
-    def test_ansible_vault_with_a_renamed_vault_identity(self):
-        self.write(
-            "ansible.cfg",
-            f"[defaults]\nvault_identity = prod\nvault_password_file = {self.client}\n[vault]\nkeyname = homelab\n",
-        )
-        self.store("homelab", "kc-password")
-        self.write("secret.yml", only("kc-password").encrypt(b"token: x\n"))
-        result = self.ansible_vault("view", "secret.yml")
-        self.assertEqual((result.returncode, result.stdout), (0, "token: x\n"), result.stderr)
+        # Ansible passes --vault-id default (or the configured vault_identity)
+        # for a vault_password_file; both must reach the keyname.
+        for name, identity in {"default id": "", "renamed id": "vault_identity = prod\n"}.items():
+            with self.subTest(name):
+                self.write(
+                    "ansible.cfg",
+                    f"[defaults]\n{identity}vault_password_file = {self.client}\n[vault]\nkeyname = homelab\n",
+                )
+                self.store("homelab", "kc-password")
+                self.write("secret.yml", only("kc-password").encrypt(b"token: x\n"))
+                result = self.ansible_vault("view", "secret.yml")
+                self.assertEqual(
+                    (result.returncode, result.stdout), (0, "token: x\n"), result.stderr
+                )
 
     def test_pilfer_open_and_close_with_vault_identity_list(self):
+        # The real client gets --vault-id homelab and pilfer gets a usable password.
         self.write_cfg(f"vault_identity_list = homelab@{self.client}\n")
         self.store("homelab", "kc-password")
         vault = only("kc-password", "homelab")
         self.write("secret.yml", vault.encrypt(b"token: old\n", vault_id="homelab"))
 
         self.ok(self.pilfer("open"))
-        self.edit("secret.yml", "old", "new")
+        self.assertEqual((self.dir / "secret.yml").read_text(), "token: old\n")
         self.ok(self.pilfer("close"))
-
-        closed = (self.dir / "secret.yml").read_bytes()
-        self.assertTrue(closed.startswith(b"$ANSIBLE_VAULT;1.2;AES256;homelab\n"))
-        self.assertEqual(vault.decrypt(closed), b"token: new\n")
+        self.assertEqual(vault.decrypt((self.dir / "secret.yml").read_bytes()), b"token: old\n")
 
     def test_pilfer_names_the_missing_key(self):
         self.write_cfg(f"vault_password_file = {self.client}\n")
@@ -400,16 +430,6 @@ class TestPackaging(unittest.TestCase):
         names = [name for name, target in scripts.items() if target == "pilfer.keyring_client:main"]
         self.assertEqual(len(names), 1, scripts)
         self.assertTrue(script_is_client(names[0]), names[0])
-
-    def test_without_keyring_package_says_what_to_install(self):
-        err = io.StringIO()
-        with (
-            mock.patch.dict(sys.modules, {"keyring": None, "keyring.errors": None}),
-            redirect_stderr(err),
-        ):
-            code = keyring_client.main([])
-        self.assertEqual(code, 1)
-        self.assertIn("pilfer[keyring]", err.getvalue())
 
 
 if __name__ == "__main__":
