@@ -62,7 +62,8 @@ def _install(shell: str, script: str) -> int:
 
 def run_completion(args, parser) -> int:
     shell = _resolve_shell(args.shell)
-    script = shtab.complete(parser, shell=shell)
+    # shell= names the completion dialect (bash or zsh); nothing runs a shell.
+    script = shtab.complete(parser, shell=shell)  # nosec B604
     if args.install:
         return _install(shell, script)
     print(script)

@@ -303,7 +303,7 @@ def _ansible_keeps_string(value: str) -> bool:
 
 def _load(text: str):
     # _SetLoader is a SafeLoader subclass; it adds only the !unsafe constructor.
-    return yaml.load(text, Loader=_SetLoader)
+    return yaml.load(text, Loader=_SetLoader)  # nosec B506 - a SafeLoader subclass
 
 
 _MISSING = object()
