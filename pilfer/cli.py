@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import sys
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,7 +21,7 @@ import ansible.constants as C
 from ansible.parsing.vault import VaultLib, VaultSecret, is_encrypted
 from ansible.utils.path import unfrackpath
 
-from pilfer import __version__
+from pilfer import __version__, completion
 from pilfer.errors import PilferError
 from pilfer.inline import (
     INLINE_FORMAT,
@@ -1661,86 +1662,204 @@ def _read_no_follow(path: str, what: str) -> bytes:
         return handle.read()
 
 
-_HELP_FORMATTER = argparse.RawDescriptionHelpFormatter
+# Help layout, after gh and ripgrep: summary, Usage, Examples, then option
+# groups. argparse prints Usage first, so _Parser.format_help reorders.
+# Legacy spellings that still work but only clutter --help.
+_HIDDEN_ALIASES = frozenset(
+    {"--vault-pass-file", "--ask-vault-pass", "--no-include-encrypted-vars"}
+)
 
-_HELP_EPILOG = """
-Vault passwords load as ansible-vault loads them: vault_identity_list, then
---vault-id, then -p files, then vault_password_file from Ansible's config
-(ANSIBLE_CONFIG, ./ansible.cfg, ~/.ansible.cfg, ANSIBLE_VAULT_* variables),
-then the -J prompt.
-An executable password file named by a flag or config is run and its output
-used; a *-client script is passed --vault-id. With no source at all, pilfer
-tries ~/.ansible-vault/.vault-file, .vault_password, vault_password_file, and
-finally ../../vault_password_file, reading each as a plain password file:
-those are never run, even when executable.
 
-Never commit while a session is open. Add vaultedFileList.json, .vault/,
-*.pilfer-open sidecars and *.pilfer-lock files (left only when pilfer is
-killed) to your project's .gitignore. Check the exit code of close.
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def __init__(self, prog, **kwargs):
+        # Wide enough that "-p, --vault-password-file FILE" keeps its help on one line.
+        kwargs.setdefault("max_help_position", 32)
+        super().__init__(prog, **kwargs)
 
-Run 'pilfer COMMAND --help' for command-specific options and examples.
-"""
+    def add_usage(self, usage, actions, groups, prefix=None):
+        # add_subparsers passes prefix="" to build each subcommand's prog.
+        super().add_usage(usage, actions, groups, "Usage: " if prefix is None else prefix)
 
-_OPEN_EPILOG = """
+    def _split_lines(self, text, width):
+        # break_on_hyphens off: a flag such as --no-include-encrypted-vars must not split.
+        text = self._whitespace_matcher.sub(" ", text).strip()
+        return textwrap.wrap(text, width, break_on_hyphens=False)
+
+    def _format_action(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            # List the commands without argparse's "COMMAND" header line.
+            parts = [super()._format_action(sub) for sub in action._get_subactions()]
+            return "".join(parts)
+        return super()._format_action(action)
+
+    def _format_action_invocation(self, action):
+        """'-p, --long METAVAR' rather than argparse's '-p METAVAR, --long METAVAR'."""
+        if not action.option_strings:
+            return super()._format_action_invocation(action)
+        names = ", ".join(s for s in action.option_strings if s not in _HIDDEN_ALIASES)
+        if action.nargs == 0:
+            return names
+        return (
+            f"{names} {self._format_args(action, self._get_default_metavar_for_optional(action))}"
+        )
+
+
+class _Parser(argparse.ArgumentParser):
+    """Help reads: summary, Usage, Examples (epilog), option groups, then notes."""
+
+    def __init__(self, *args, notes: str = "", **kwargs):
+        kwargs.setdefault("formatter_class", _HelpFormatter)
+        kwargs["add_help"] = False
+        super().__init__(*args, **kwargs)
+        self._notes = notes
+        self._optionals.title = "Options"
+        self._positionals.title = "Arguments"
+        self.add_argument("-h", "--help", action="help", help="Show this help")
+
+    def format_help(self):
+        formatter = self._get_formatter()
+        formatter.add_text(self.description)
+        formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
+        formatter.add_text(self.epilog)
+        for group in self._action_groups:
+            formatter.start_section(group.title)
+            formatter.add_text(group.description)
+            formatter.add_arguments(group._group_actions)
+            formatter.end_section()
+        formatter.add_text(self._notes)
+        return formatter.format_help()
+
+
+_TOP_EXAMPLES = """
 Examples:
-  pilfer open
-  pilfer open --include-encrypted-vars
-  pilfer open --include-encrypted-vars --quiet
-  pilfer open -p ~/.ansible-vault/.vault-file
-
-Whole-file vault YAML is opened by default. With --include-encrypted-vars, inline
-!vault / encrypt_string scalars become quoted plaintext plus a # pilfer:vault:N
-marker (leave the marker until close).
+  pilfer open                           decrypt the vault files in this tree
+  pilfer close                          re-encrypt them when you are done
+  pilfer find-keys '*token*'            which vault files hold a key like this
+  pilfer set secrets.yml db_password    change one key without opening anything
 """
 
-_CLOSE_EPILOG = """
+_TOP_NOTES = """
+Run 'pilfer COMMAND --help' for a command's options.
+Vault passwords load the way ansible-vault loads them; the README has the order.
+Never commit while a session is open, and check close's exit status.
+"""
+
+_OPEN_EXAMPLES = """
+Examples:
+  pilfer open                               whole-file vaults only
+  pilfer open --include-encrypted-vars      inline !vault values too
+  pilfer open -p ~/.ansible-vault/.vault-file
+"""
+
+_OPEN_NOTES = """
+With --include-encrypted-vars, each inline !vault value becomes quoted plaintext
+followed by a '# pilfer:vault:N' marker. Leave the marker in place: close uses
+it to re-encrypt the value.
+"""
+
+_CLOSE_EXAMPLES = """
 Examples:
   pilfer close
-  pilfer close --confirm-delete
+  pilfer close --confirm-delete             accept deleted inline values
   pilfer close -p ~/.ansible-vault/.vault-file
-
-Re-encrypts every entry recorded in the open session (whole-file and inline).
-No --include-encrypted-vars flag is needed on close. Each edited value is
-encrypted with the vault id and password that decrypt its backup, as
-ansible-vault edit does, so close needs the same sources as open.
 """
 
-_SET_EPILOG = """
+_CLOSE_NOTES = """
+Close re-encrypts whatever open decrypted, inline values included, so it needs
+no --include-encrypted-vars. Each edited value is encrypted with the vault id
+and password that decrypted it, as ansible-vault edit does, so close needs the
+same password sources as open.
+"""
+
+_SET_EXAMPLES = """
 Examples:
-  pilfer set inventory/group_vars/all/secrets.yml db_password
-      (prompts for the value without echoing it)
+  pilfer set secrets.yml db_password        prompts for the value, hidden
+  pilfer set secrets.yml aws.prod.secret_key
+  pilfer set secrets.yml 'users[0].password'
   printf '%s' "$TOKEN" | pilfer set secrets.yml api_token
   pilfer set secrets.yml api_token -- '-starts-with-a-dash'
-
-Sets one top-level key in a closed whole-file vault without writing plaintext to
-disk. A new key is appended; an existing scalar is replaced in place, keeping an
-inline comment. The value is stored as a JSON-quoted string, so yes/no/0123 stay
-strings. A value containing {{, {% or {# is stored as !unsafe so Ansible does
-not template it. An existing !unsafe tag is kept only when Ansible would still
-load the new text as that string; otherwise the tag is dropped. A value that
-needs !unsafe and would not stay a string is refused. Refuses plaintext and
-files open in a pilfer session.
-
-Leave VALUE out to read it from stdin: a hidden prompt on a terminal, otherwise
-the whole input with one trailing newline dropped. A VALUE argument is visible
-in ps and saved in shell history.
 """
 
-_REKEY_EPILOG = """
+_SET_NOTES = """
+KEY is a name or a Jinja-style path: aws.prod.secret_key, users[0].password,
+aws['key.with.dots']. Missing mappings along a path are created. A new key is
+appended; an existing scalar is replaced in place, keeping its inline comment.
+
+The value is stored as a quoted string, so yes, no and 0123 stay strings. A
+value containing {{, {% or {# is stored as !unsafe so Ansible does not template
+it. An existing !unsafe tag is kept only when Ansible would still load the new
+text as that string, and a value that needs !unsafe but would not stay a string
+is refused. Plaintext files and files open in a pilfer session are refused.
+
+Leave VALUE out to read it from stdin: a hidden prompt on a terminal, otherwise
+the whole input minus one trailing newline. A VALUE argument shows in ps and in
+shell history.
+"""
+
+_FIND_EXAMPLES = """
 Examples:
-  pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run
-  pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --yes
+  pilfer find-keys db_password          exact name
+  pilfer find-keys '*token*'            glob (quote it)
+  pilfer find-keys -E '^ha_(url|token)$'
+  pilfer find-keys --path 'aws.*.secret_key'
+  pilfer find-keys --json '*token*'     one JSON object per line, for scripts
+"""
+
+_FIND_NOTES = """
+A pattern matches the whole key name. Several patterns match if any one does,
+and no pattern lists every key. Files that are open in a session are read from
+their plaintext and tagged (open).
+
+Exit status: 0 a key matched, 1 none matched, 2 an error.
+"""
+
+_UPDATE_EXAMPLES = """
+Examples:
+  pilfer update db_password                 prompts for the value, hidden
+  pilfer update aws.prod.secret_key
+  pilfer update db_password --file inventory/group_vars/prod/secrets.yml
+  printf '%s' "$TOKEN" | pilfer update api_token
+"""
+
+_UPDATE_NOTES = """
+Update finds the file that holds KEY. If several files do, it lists them and
+asks for --file. It never creates a key: use 'pilfer set FILE KEY' for that.
+Value rules and the leading-dash rule are the same as for 'pilfer set'.
+Files open in a pilfer session are refused.
+"""
+
+_REKEY_EXAMPLES = """
+Examples:
+  pilfer rekey --dry-run \\
+      --old-vault-password-file OLD --new-vault-password-file NEW
+  pilfer rekey --yes \\
+      --old-vault-password-file OLD --new-vault-password-file NEW
   pilfer rekey --new-vault-id prompt
-  pilfer rekey ... --quiet
+"""
 
-The old password loads like open: --old-vault-password-file and --old-vault-id
-plus Ansible's config. The new password is the one --new-* source. Values keep
-their vault-id label unless --new-vault-id names one. A tree on several vault
-passwords is refused.
+_REKEY_NOTES = """
+The old password loads as it does for open: --old-vault-password-file,
+--old-vault-id and Ansible's config. Values keep their vault-id label unless
+--new-vault-id names one. A tree on several vault passwords is refused.
 
-Inline !vault spans are included by default; pass --no-include-encrypted-vars for
-whole-file vault YAML only. Rekey refuses a tree with !vault values in a form
-pilfer cannot rewrite, which would stay on the old password.
+Inline !vault values are included by default. Rekey refuses a tree with !vault
+values in a form pilfer cannot rewrite, because they would stay on the old
+password.
+"""
+
+_COMPLETION_EXAMPLES = """
+Examples:
+  pilfer completion --install               install for the shell in $SHELL
+  pilfer completion zsh --install
+  pilfer completion bash > pilfer.bash      print the script instead
+"""
+
+_COMPLETION_NOTES = """
+bash:  ~/.local/share/bash-completion/completions/pilfer
+zsh:   a writable directory under your home on zsh's fpath, else
+       ~/.zfunc/_pilfer (add 'fpath=(~/.zfunc $fpath)' above compinit)
+It completes commands, options and file paths, never key names, and never
+edits your shell's startup files.
 """
 
 
@@ -1768,34 +1887,39 @@ _UNFRACK_PATH = functools.partial(unfrackpath, follow=False)
 
 def _add_vault_options(parser, help_text: str) -> None:
     """The vault flags of ansible-vault (add_vault_options), plus -p for pilfer's old flag."""
-    parser.add_argument(
+    group = parser.add_argument_group(
+        "Vault password",
+        "Sources load in ansible-vault's order; see 'Vault passwords' in the README.",
+    )
+    group.add_argument(
         "--vault-id",
         action="append",
         default=[],
         dest="vault_ids",
-        metavar="VAULT_ID",
-        help="vault identity to use, as for ansible-vault: [label@]FILE or [label@]prompt",
+        metavar="ID",
+        help="Vault identity, as for ansible-vault: [label@]FILE or [label@]prompt",
     )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
+    # -p and -J cannot be combined; -p itself repeats.
+    exclusive = group.add_mutually_exclusive_group()
+    exclusive.add_argument(
         "-p",
         "--vault-password-file",
         "--vault-pass-file",
         action="append",
         default=[],
         dest="vault_password_files",
-        metavar="VAULT_PASSWORD_FILE",
+        metavar="FILE",
         type=_UNFRACK_PATH,
         help=help_text,
     )
-    group.add_argument(
+    exclusive.add_argument(
         "-J",
         "--ask-vault-password",
         "--ask-vault-pass",
         action="store_true",
         default=C.DEFAULT_ASK_VAULT_PASS,
         dest="ask_vault_pass",
-        help="ask for the vault password",
+        help="Ask for the vault password (not with -p)",
     )
 
 
@@ -1812,25 +1936,22 @@ def _add_quiet_option(parser) -> None:
         "-q",
         "--quiet",
         action="store_true",
-        help="Suppress nested git repo skip messages during discovery",
+        help="Hide messages about skipped nested git repos",
     )
 
 
 _DEFAULT_PASSWORD_HELP = (
-    "vault password file or script; repeatable (default: Ansible's config, then common paths)"
+    "Password file or script; repeatable (default: Ansible's config, then common paths)"
 )
 
 
 def _build_argument_parser():
-    """Build the pilfer CLI parser (subcommands: open, close, rekey, set)."""
-    parser = argparse.ArgumentParser(
+    """Build the pilfer CLI parser (commands: open, close, find-keys, set, update, rekey, completion)."""
+    parser = _Parser(
         prog="pilfer",
-        formatter_class=_HELP_FORMATTER,
-        description=(
-            "Bulk decrypt Ansible vault files in a project tree for editing, then "
-            "re-encrypt when done."
-        ),
-        epilog=_HELP_EPILOG,
+        description="Decrypt Ansible vault files in a project, edit them, then re-encrypt.",
+        epilog=_TOP_EXAMPLES,
+        notes=_TOP_NOTES,
     )
 
     def _parser_error(message: str) -> None:
@@ -1845,210 +1966,240 @@ def _build_argument_parser():
         argparse.ArgumentParser.error(parser, message)
 
     parser.error = _parser_error  # type: ignore[method-assign]
-    parser.add_argument("--version", action="version", version=f"pilfer {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"pilfer {__version__}", help="Show the version"
+    )
 
     subparsers = parser.add_subparsers(
-        dest="action",
-        metavar="COMMAND",
-        required=True,
-        title="commands",
-        description="valid commands",
+        dest="action", metavar="COMMAND", required=True, title="Commands"
     )
+    # After add_subparsers: it builds each subcommand's prog from the parent's usage.
+    parser.usage = "%(prog)s [--version] COMMAND [OPTIONS]"
 
-    open_parser = subparsers.add_parser(
+    def command(name, summary, description, usage, examples, notes):
+        return subparsers.add_parser(
+            name,
+            help=summary,
+            description=description,
+            usage=f"%(prog)s {usage}",
+            epilog=examples,
+            notes=notes,
+        )
+
+    open_parser = command(
         "open",
-        formatter_class=_HELP_FORMATTER,
-        help="decrypt vault targets for editing",
-        description="Decrypt whole-file vault YAML (and optionally inline !vault scalars).",
-        epilog=_OPEN_EPILOG,
+        "Decrypt vault files for editing",
+        "Decrypt the vault files in this tree for editing. Run 'pilfer close' when done.",
+        "[OPTIONS]",
+        _OPEN_EXAMPLES,
+        _OPEN_NOTES,
     )
-    _add_vault_options(open_parser, _DEFAULT_PASSWORD_HELP)
     open_parser.add_argument(
         "--include-encrypted-vars",
         action="store_true",
-        help="Also decrypt inline !vault / encrypt_string scalars",
+        help="Decrypt inline !vault (encrypt_string) values too",
     )
     _add_quiet_option(open_parser)
+    _add_vault_options(open_parser, _DEFAULT_PASSWORD_HELP)
 
-    close_parser = subparsers.add_parser(
+    close_parser = command(
         "close",
-        formatter_class=_HELP_FORMATTER,
-        help="re-encrypt everything this session opened",
-        description="Re-encrypt session entries (whole-file and inline).",
-        epilog=_CLOSE_EPILOG,
-    )
-    _add_vault_options(
-        close_parser, "vault password file or script; repeatable (the sources open used)"
+        "Re-encrypt what open decrypted",
+        "Re-encrypt every file the open session decrypted.",
+        "[OPTIONS]",
+        _CLOSE_EXAMPLES,
+        _CLOSE_NOTES,
     )
     close_parser.add_argument(
         "--confirm-delete",
         action="store_true",
         dest="confirm_delete",
-        help=(
-            "Confirm intentional deletion of opened inline vars (marker and secret line removed)"
-        ),
+        help="Accept deleted inline values (marker and secret line removed)",
     )
+    _add_vault_options(close_parser, "Password file or script; repeatable (what open used)")
 
-    rekey_parser = subparsers.add_parser(
-        "rekey",
-        formatter_class=_HELP_FORMATTER,
-        help="rotate vault password across the tree",
-        description="Re-key whole-file and inline vault targets without an open session.",
-        epilog=_REKEY_EPILOG,
-    )
-    rekey_parser.add_argument(
-        "--old-vault-password-file",
-        action="append",
-        default=[],
-        dest="old_vault_password_files",
-        metavar="OLD_VAULT_PASSWORD_FILE",
-        type=_UNFRACK_PATH,
-        help="current vault password file or script; repeatable (default: Ansible's config)",
-    )
-    rekey_parser.add_argument(
-        "--old-vault-id",
-        action="append",
-        default=[],
-        dest="old_vault_ids",
-        metavar="OLD_VAULT_ID",
-        help="current vault identity, [label@]FILE or [label@]prompt; repeatable",
-    )
-    new_group = rekey_parser.add_mutually_exclusive_group(required=True)
-    new_group.add_argument(
-        "--new-vault-password-file",
-        type=_UNFRACK_PATH,
-        help="new vault password file or script",
-    )
-    new_group.add_argument(
-        "--new-vault-id",
-        help="new vault identity, [label@]FILE or [label@]prompt; a label relabels every value",
-    )
-    rekey_parser.add_argument(
-        "--include-encrypted-vars",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Include inline !vault spans (default: on; --no-include-encrypted-vars "
-        "rekeys whole-file vault YAML only)",
-    )
-    rekey_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Decrypt-check and print plan without writing",
-    )
-    rekey_parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="Skip interactive REKEY confirmation",
-    )
-    rekey_parser.add_argument(
-        "--rotate-password-file",
-        action="store_true",
-        help=(
-            "After 100%% success, move old password file to *_old and write the "
-            "new password at the old path"
-        ),
-    )
-    _add_quiet_option(rekey_parser)
-
-    set_parser = subparsers.add_parser(
-        "set",
-        formatter_class=_HELP_FORMATTER,
-        help="set one key in a whole-file vault without opening it",
-        description="Add or replace one top-level string in a closed whole-file vault.",
-        epilog=_SET_EPILOG,
-    )
-    set_parser.add_argument("file", help="Whole-file vault YAML")
-    set_parser.add_argument(
-        "key",
-        help="Key to add or replace: a name, or a path such as aws.prod.key or users[0].password "
-        "(missing mappings along it are created)",
-    )
-    set_parser.add_argument(
-        "value",
-        nargs="?",
-        help="New string value. Omit it to read stdin or get a hidden prompt "
-        "(use -- before a value with a leading dash)",
-    )
-    _add_vault_options(set_parser, _DEFAULT_PASSWORD_HELP)
-
-    find_parser = subparsers.add_parser(
+    find_parser = command(
         "find-keys",
-        formatter_class=_HELP_FORMATTER,
-        help="list the keys in vault files whose names match, never their values",
-        description=(
-            "List key names in the project's vault files. Prints file and key path, "
-            "never a value, a length or a hash. Whole-file vaults are decrypted in "
-            "memory, so this shows key names that those vaults otherwise hide. "
-            "Exit status: 0 a key matched, 1 none matched, 2 an error."
-        ),
+        "Show which vault files hold a key",
+        "Show which vault files hold a key. Prints paths and key names, never values.\n"
+        "Whole-file vaults are read in memory, so this reveals key names they hide.",
+        "[OPTIONS] [PATTERN ...]",
+        _FIND_EXAMPLES,
+        _FIND_NOTES,
     )
     find_parser.add_argument(
         "patterns",
         nargs="*",
         metavar="PATTERN",
-        help="match the whole key name, with * and ? wildcards; several patterns match "
-        "if any one does; no pattern lists every key",
+        help="Key name to match; * and ? are wildcards (default: every key)",
     )
     find_parser.add_argument(
         "-E",
         "--regex",
         action="store_true",
-        help="treat each pattern as a regular expression that matches anywhere in the name",
+        help="Treat patterns as regular expressions that match anywhere in the name",
     )
     find_parser.add_argument(
-        "-i", "--ignore-case", action="store_true", help="ignore case when matching"
+        "-i", "--ignore-case", action="store_true", help="Ignore case when matching"
     )
     find_parser.add_argument(
         "--path",
         action="store_true",
-        help="match the full key path (such as aws.prod.key) instead of the last name",
+        help="Match the full key path (aws.prod.key) instead of the last name",
     )
     find_parser.add_argument(
         "--include-encrypted-vars",
         action="store_true",
-        help="also list keys whose value is an inline !vault string",
+        help="Also list keys whose value is an inline !vault string",
     )
-    find_parser.add_argument(
+    output = find_parser.add_argument_group("Output")
+    output.add_argument(
         "-l",
         "--files-with-matches",
         action="store_true",
-        help="print only the names of files that have a match",
+        help="Print only the names of files with a match",
     )
-    find_parser.add_argument(
+    output.add_argument(
         "--json",
         action="store_true",
-        help="print one JSON object per line: file, key, path, kind, open, vault_id",
+        help="One JSON object per line: file, key, path, kind, open, vault_id",
     )
     _add_vault_options(find_parser, _DEFAULT_PASSWORD_HELP)
 
-    update_parser = subparsers.add_parser(
+    set_parser = command(
+        "set",
+        "Set one key in a vault file without opening it",
+        "Add or replace one key in a closed whole-file vault. No plaintext reaches disk.",
+        "[OPTIONS] FILE KEY [VALUE]",
+        _SET_EXAMPLES,
+        _SET_NOTES,
+    )
+    completion.mark_file(
+        set_parser.add_argument("file", metavar="FILE", help="Whole-file vault YAML")
+    )
+    set_parser.add_argument(
+        "key", metavar="KEY", help="Name or path of the key, such as db_password or aws.prod.key"
+    )
+    set_parser.add_argument(
+        "value",
+        metavar="VALUE",
+        nargs="?",
+        help="New string value (default: read stdin or prompt; use -- before a leading dash)",
+    )
+    _add_vault_options(set_parser, _DEFAULT_PASSWORD_HELP)
+
+    update_parser = command(
         "update",
-        formatter_class=_HELP_FORMATTER,
-        help="replace the value of an existing key, found by name, in whichever vault holds it",
-        description=(
-            "Replace the value of a key that already exists, without opening a session. "
-            "Finds the file itself; if the key is in more than one file it lists them and "
-            "asks for --file. To create a key, use 'pilfer set FILE KEY'."
-        ),
+        "Replace an existing key's value, wherever it lives",
+        "Replace the value of an existing key in whichever vault file holds it.",
+        "[OPTIONS] KEY [VALUE]",
+        _UPDATE_EXAMPLES,
+        _UPDATE_NOTES,
     )
     update_parser.add_argument(
-        "key", help="Key name or path, such as db_password or aws.prod.secret_key"
+        "key", metavar="KEY", help="Name or path of the key, such as aws.prod.secret_key"
     )
     update_parser.add_argument(
         "value",
+        metavar="VALUE",
         nargs="?",
-        help="New string value. Omit it to read stdin or get a hidden prompt "
-        "(use -- before a value with a leading dash)",
+        help="New string value (default: read stdin or prompt; use -- before a leading dash)",
     )
-    update_parser.add_argument(
-        "--file", metavar="FILE", help="only look in this vault file, to pick between several"
+    completion.mark_file(
+        update_parser.add_argument(
+            "--file", metavar="FILE", help="Only look in this vault file, to pick between several"
+        )
     )
     update_parser.add_argument(
         "--include-encrypted-vars",
         action="store_true",
-        help="also replace inline !vault values, keeping each one's vault id",
+        help="Also replace inline !vault values, keeping each one's vault id",
     )
     _add_vault_options(update_parser, _DEFAULT_PASSWORD_HELP)
+
+    rekey_parser = command(
+        "rekey",
+        "Change the vault password across the tree",
+        "Change the vault password of every file and inline value in the tree.",
+        "[OPTIONS]",
+        _REKEY_EXAMPLES,
+        _REKEY_NOTES,
+    )
+    old = rekey_parser.add_argument_group("Current password")
+    completion.mark_file(
+        old.add_argument(
+            "--old-vault-password-file",
+            action="append",
+            default=[],
+            dest="old_vault_password_files",
+            metavar="FILE",
+            type=_UNFRACK_PATH,
+            help="Password file or script; repeatable (default: Ansible's config)",
+        )
+    )
+    old.add_argument(
+        "--old-vault-id",
+        action="append",
+        default=[],
+        dest="old_vault_ids",
+        metavar="ID",
+        help="Vault identity, [label@]FILE or [label@]prompt; repeatable",
+    )
+    new = rekey_parser.add_argument_group("New password (one required)")
+    new_group = new.add_mutually_exclusive_group(required=True)
+    completion.mark_file(
+        new_group.add_argument(
+            "--new-vault-password-file",
+            metavar="FILE",
+            type=_UNFRACK_PATH,
+            help="Password file or script",
+        )
+    )
+    new_group.add_argument(
+        "--new-vault-id",
+        metavar="ID",
+        help="Vault identity, [label@]FILE or [label@]prompt; a label relabels every value",
+    )
+    rekey_parser.add_argument(
+        "--include-encrypted-vars",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Rekey inline !vault values too (on by default; --no-include-encrypted-vars turns it off)",
+    )
+    rekey_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check that everything decrypts and print the plan, writing nothing",
+    )
+    rekey_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the REKEY confirmation prompt",
+    )
+    rekey_parser.add_argument(
+        "--rotate-password-file",
+        action="store_true",
+        help=(
+            "After full success, move the old password file to *_old and write the "
+            "new password at the old path"
+        ),
+    )
+    _add_quiet_option(rekey_parser)
+
+    completion_parser = command(
+        "completion",
+        "Print or install shell completion (bash, zsh)",
+        "Print a shell completion script, or install it with --install.",
+        "[OPTIONS] [SHELL]",
+        _COMPLETION_EXAMPLES,
+        _COMPLETION_NOTES,
+    )
+    completion_parser.add_argument(
+        "shell", metavar="SHELL", nargs="?", help="bash or zsh (default: the shell in $SHELL)"
+    )
+    completion_parser.add_argument(
+        "--install", action="store_true", help="Write the script where the shell finds it"
+    )
 
     return parser
 
@@ -2078,6 +2229,8 @@ def main(argv=None):
     try:
         if args.action == "set":
             return _run_set(args)
+        if args.action == "completion":
+            return completion.run_completion(args, parser)
         if args.action in ("find-keys", "update"):
             # Imported here: find_keys imports helpers from this module.
             from pilfer import find_keys

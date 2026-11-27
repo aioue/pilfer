@@ -9,7 +9,7 @@ Pilfer - Decrypt all ansible vault files in a project recursively for search/edi
 Thin entry script that delegates to the packaged implementation (pilfer.cli).
 
 Usage (from a clone of this repository):
-    python pilfer.py [open|close|rekey|set] [-p VAULT_PASSWORD_FILE]
+    python pilfer.py COMMAND [OPTIONS]
 
 For installation (recommended):
     pipx install pilfer
@@ -19,7 +19,7 @@ import sys
 
 # Keep a literal assignment so release CI can triangulate versions across
 # pyproject.toml, pilfer/__init__.py, and this file.
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 from pilfer.cli import main
 

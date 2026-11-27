@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pilfer"
-version = "3.0.0"
+version = "3.1.0"
 authors = [
     {name = "Tom Paine", email = "github@aioue.net"},
 ]
@@ -35,6 +35,8 @@ dependencies = [
     # 2.21 is the floor CI tests: CLI.setup_vault_secrets(initialize_context=)
     # and VaultHelper are recent. No upper bound; CI also tests the latest core.
     "ansible-core>=2.21",
+    # Generates the bash and zsh completion scripts for `pilfer completion`.
+    "shtab>=1.7",
 ]
 keywords = [
     "ansible",

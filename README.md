@@ -55,6 +55,14 @@ Add to `ansible.cfg` so you do not need `-p` on every run:
 vault_password_file = ~/.ansible-vault/.vault-file
 ```
 
+## What's new in 3.1
+
+- `pilfer find-keys` shows which vault files hold a key. It prints names, never values.
+- `pilfer update KEY` replaces an existing key's value in whichever vault holds it.
+- `pilfer set` and `update` take nested key paths such as `aws.prod.secret_key`.
+- `pilfer completion` installs bash and zsh completion.
+- `--help` is rewritten, with examples first.
+
 ## Upgrading to 3.0
 
 - Pilfer needs Python 3.12+ and ansible-core 2.21+ (was Python 3.10+ and ansible 2.9+). It depends on ansible-core instead of ansible.
@@ -83,25 +91,56 @@ vault_password_file = ~/.ansible-vault/.vault-file
 ```
 pilfer [--version] COMMAND ...
 
-Commands: open | close | rekey | set
+Commands: open | close | find-keys | set | update | rekey | completion
 
 pilfer open [--include-encrypted-vars] [-q] [VAULT OPTIONS]
 pilfer close [--confirm-delete] [VAULT OPTIONS]
+pilfer find-keys [-E] [-i] [--path] [--include-encrypted-vars] [-l | --json] [PATTERN ...] [VAULT OPTIONS]
+pilfer update [--file FILE] [--include-encrypted-vars] [VAULT OPTIONS] KEY [VALUE]
 pilfer rekey [--old-vault-password-file OLD]... [--old-vault-id ID]... (--new-vault-password-file NEW | --new-vault-id ID) [options]
 pilfer set [VAULT OPTIONS] FILE KEY [VALUE]
+pilfer completion [--install] [bash | zsh]
 
 VAULT OPTIONS: [--vault-id ID]... [-p VAULT_PASSWORD_FILE]... [-J]
 ```
 
 Run `pilfer --help` or `pilfer COMMAND --help` for full options and examples.
 
+### Find which file holds a key
+
+`pilfer find-keys` lists the keys in your vault files and prints the file and key name for each match. It never prints a value, a length or a hash.
+
+```bash
+pilfer find-keys db_password          # exact name
+pilfer find-keys '*token*'            # glob; quote it so the shell leaves it alone
+pilfer find-keys -E '^ha_(url|token)$'
+pilfer find-keys --path 'aws.*.secret_key'
+pilfer find-keys --json '*token*'     # one JSON object per line
+```
+
+A pattern matches the whole key name, and `*` and `?` are wildcards. With several patterns, a key matches if any one does. With none, every key is listed. `-E` treats patterns as regular expressions that match anywhere in the name, `-i` ignores case, and `--path` matches the full path (`aws.prod.secret_key`) instead of the last name. `-l` prints only file names. Each `--json` line has `file`, `key`, `path` (a list; list indexes are integers), `kind`, `open` and `vault_id`. The exit status is 0 when a key matched, 1 when none did and 2 on an error.
+
+A whole-file vault hides its key names from `grep`. `find-keys` decrypts each file in memory, so it shows those names to anyone who has the password. Pilfer prints no values and has no value search, which would let you guess a secret. Files open in a session are read from their plaintext and tagged `(open)`. Keys whose value is an inline `!vault` string are skipped unless you pass `--include-encrypted-vars`; they are tagged `(inline)`.
+
+### Update a value you cannot place
+
+`pilfer update KEY [VALUE]` replaces an existing key in whichever vault file holds it:
+
+```bash
+pilfer update db_password
+```
+
+Values are read as for `pilfer set`. Update never creates a key; it points you to `pilfer set FILE KEY`. If several files hold the key, it lists them and asks for `--file FILE`. A key that exists only as an inline `!vault` value needs `--include-encrypted-vars`, and the new value keeps its vault-id label. Update refuses files open in a session.
+
 ### Set a single value
 
-Use `pilfer set` to add or replace a top-level key in a whole-file vault without opening a session:
+Use `pilfer set` to add or replace a key in a whole-file vault without opening a session:
 
 ```bash
 pilfer set secrets.yml db_password
 ```
+
+KEY can be a nested path in Jinja syntax: `aws.prod.secret_key`, `users[0].password` or `aws['key.with.dots']`. Pilfer creates missing mappings along the path. It refuses a path whose parent is not a mapping, or whose list index is out of range. `find-keys` and `update` print and accept the same syntax.
 
 Pilfer prompts for the value without echoing it. You can also pipe a value in:
 
@@ -245,6 +284,19 @@ A labelled source reads the service named by its label: `--vault-id prod@~/.loca
 The macOS login keychain is locked in SSH sessions, so the script fails there. macOS trusts the Python build that ran `--set` and does not ask again. After a Python upgrade macOS asks once when the new build first reads the entry, and `--set` from the new build replaces it: it deletes the old entry with Apple's `security` tool, because macOS refuses the new build's own delete. A venv runs its base interpreter, so every script that build runs can read the password; where that matters, use a Python build you use for nothing else. Secret Service has no per-program access: any program in your session can read the entry.
 
 The script ports [`vault-keyring-client.py`](https://github.com/ansible-community/contrib-scripts/blob/main/vault/vault-keyring-client.py) from ansible-community, which no longer imports on ansible-core 2.21. It also reads `keyname` for an unlabelled source, where the original looked up a service called `default`: store a password the original saved there again with `--set`.
+
+### Shell completion
+
+```bash
+pilfer completion --install
+```
+
+This writes a completion script for the shell in `$SHELL`; name `bash` or `zsh` to choose. Open a new shell to use it. Pilfer never edits your shell's startup files.
+
+- bash: `${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/pilfer`
+- zsh: the first writable directory under your home on zsh's `fpath`, otherwise `~/.zfunc/_pilfer`. In that case, add `fpath=(~/.zfunc $fpath)` above `compinit` in `~/.zshrc`.
+
+Without `--install` the script prints to stdout. It completes commands, options and file paths, never key names.
 
 ### Examples
 
