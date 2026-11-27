@@ -24,7 +24,7 @@ pilfer find-keys --json '*token*'
 - `-E` takes regular expressions, `-i` ignores case, `--path` matches the full path such as `aws.prod.secret_key`.
 - With no pattern it lists every key.
 - `-l` prints only file names.
-- `--json` prints one object per line: `file`, `key`, `path`, `kind`, `open`, `vault_id`.
+- `--json` prints one object per line: `file`, `key`, `path`, `kind`, `open`, `vault_id` (`default` for a file with no vault label).
 - Keys that are inline `!vault` strings are skipped unless you pass `--include-encrypted-vars`.
 - Exit status: 0 a key matched, 1 none matched, 2 an error.
 
