@@ -441,13 +441,13 @@ class TestInlineRandomized(unittest.TestCase):
 
 class TestDuplicateKeyWarning(unittest.TestCase):
     def test_warning_does_not_quote_the_file(self):
-        """Ansible's duplicate-key warning must not carry the file's lines.
+        """A scan with a duplicate key prints no warning, so none can quote the file.
 
-        The scan gives Ansible's loader no file name on purpose: with a real
-        origin Ansible reads the file and quotes the offending lines, and the
-        duplicate key here holds plaintext. The file must exist on disk (an
-        origin that cannot be read is never quoted) and the scan runs in a
-        child process, so output written through any channel is caught.
+        The scan only composes the YAML (it never builds Ansible's objects), so
+        Ansible's duplicate-key warning, which quotes the offending lines when
+        it can read the file, is never produced. The duplicate key here holds
+        plaintext. The scan runs in a child process, so output written through
+        any channel is caught.
         """
         secret = "PLAINTEXT-must-not-leak-9f3a"
         cipher = VAULT.encrypt(b"inline secret").decode()
@@ -469,7 +469,8 @@ class TestDuplicateKeyWarning(unittest.TestCase):
                 env={**os.environ, "PYTHONPATH": os.pathsep.join([here, os.path.dirname(here)])},
                 check=True,
             )
-        self.assertIn(b"duplicate mapping key", result.stderr)
+        # Nothing warns about the duplicate, so nothing quotes it.
+        self.assertNotIn(b"duplicate", result.stderr.lower())
         self.assertNotIn(secret.encode(), result.stderr)
         self.assertNotIn(secret.encode(), result.stdout)
 

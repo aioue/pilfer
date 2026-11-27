@@ -11,7 +11,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from test_find_keys import INLINE_SECRET, SECRETS, FindKeysBase
 
-from pilfer import vault_secrets
+from pilfer import cli, vault_secrets
+from pilfer.vault_set import DRY_RUN_UNCHECKED
 
 
 class TestStatus(FindKeysBase):
@@ -19,11 +20,34 @@ class TestStatus(FindKeysBase):
         return self._main("status", *args)
 
     def test_no_session(self) -> None:
-        self.assertEqual(self._status(), (0, "No session open.\n", ""))
+        code, out, err = self._status()
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, "No session open.\n")
         code, out, _ = self._status("--json")
         self.assertEqual(
-            (code, json.loads(out)), (0, {"open": False, "incomplete": False, "files": []})
+            (code, json.loads(out)),
+            (0, {"open": False, "incomplete": False, "orphaned": False, "files": []}),
         )
+
+    def test_backups_without_a_session_list_are_reported_as_orphaned(self) -> None:
+        self.assertEqual(self._main("open", "-p", str(self.password))[0], 0)
+        os.unlink(cli.temp_vault_file_list_path)
+        code, out, err = self._status()
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("No session list, but .vault/ holds backups", out)
+        self.assertIn("pilfer open", out)
+        self.assertNotIn("No session open.", out)
+        code, out, _ = self._status("--json")
+        report = json.loads(out)
+        self.assertEqual((code, report["open"], report["orphaned"]), (0, False, True))
+
+    def test_help_explains_orphaned_and_option_order(self) -> None:
+        for command, text in (("status", "Orphaned means"), ("find-keys", "between patterns")):
+            with self.subTest(command=command):
+                out = io.StringIO()
+                with mock.patch("sys.stdout", out), self.assertRaises(SystemExit):
+                    cli.main([command, "--help"])
+                self.assertIn(text, " ".join(out.getvalue().split()))
 
     def test_lists_files_that_hold_plaintext_without_values(self) -> None:
         self._inline()
@@ -32,8 +56,9 @@ class TestStatus(FindKeysBase):
         )
         code, out, err = self._status()
         self.assertEqual(code, 0, err)
-        self.assertIn(
-            "Session open: 2 files hold plaintext. Run 'pilfer close' to re-encrypt them.", out
+        self.assertEqual(
+            out.splitlines()[0],
+            "Session open: 2 files hold plaintext. Run 'pilfer close' to re-encrypt them.",
         )
         self.assertIn("secrets.yml  (whole-file)", out)
         self.assertIn("inline.yml  (inline)", out)
@@ -49,6 +74,41 @@ class TestStatus(FindKeysBase):
         self.assertEqual(self._main("close", "-p", str(self.password))[0], 0)
         self.assertEqual(self._status()[1], "No session open.\n")
 
+    def test_planted_entries_do_not_hang_status(self) -> None:
+        pipe = self.directory / "pipe.yml"
+        os.mkfifo(pipe)
+        self._session(
+            {"kind": "file", "path": str(pipe)},
+            {"kind": "file", "path": str(self.directory / "we\x1bird.yml")},
+        )
+        self._guard()
+        code, out, err = self._status()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("\x1b", out)
+        self.assertIn("\\x1b", out)
+
+    def test_session_entry_reads_are_capped(self) -> None:
+        from pilfer import cli
+
+        # A regular file larger than the cap: only the leading bytes come back.
+        big = self.directory / "big.yml"
+        big.write_bytes(b"x" * (cli._SESSION_INLINE_READ_CAP + 10))
+        inline = cli._read_session_entry({"kind": "inline", "path": str(big)})
+        self.assertEqual(len(inline), cli._SESSION_INLINE_READ_CAP)
+        whole = cli._read_session_entry({"kind": "file", "path": str(big)})
+        self.assertEqual(len(whole), cli._HEADER_READ_BYTES)
+
+    def test_long_leading_whitespace_before_the_header_is_still_ciphertext(self) -> None:
+        # More than the old 256-byte read: the entry was misreported as plaintext.
+        padded = self.directory / "padded.yml"
+        padded.write_bytes(b" " * 1000 + self.vault.read_bytes())
+        self._session({"kind": "file", "path": str(padded)})
+        code, out, err = self._status("--json")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            json.loads(out), {"open": True, "incomplete": True, "orphaned": False, "files": []}
+        )
+
     def test_interrupted_open_is_incomplete(self) -> None:
         # open lists its targets before decrypting any; killed there, all still ciphertext.
         (self.directory / "vaultedFileList.json").write_text(
@@ -56,7 +116,8 @@ class TestStatus(FindKeysBase):
         )
         code, out, _ = self._status("--json")
         self.assertEqual(
-            (code, json.loads(out)), (0, {"open": True, "incomplete": True, "files": []})
+            (code, json.loads(out)),
+            (0, {"open": True, "incomplete": True, "orphaned": False, "files": []}),
         )
         self.assertIn("incomplete", self._status()[1])
 
@@ -64,19 +125,13 @@ class TestStatus(FindKeysBase):
         (self.directory / "vaultedFileList.json").write_text("not json")
         code, out, err = self._status()
         self.assertEqual((code, out), (2, ""))
-        self.assertIn("Error:", err)
+        self.assertTrue(err.startswith("pilfer:"), err)
 
 
 class TestDryRun(FindKeysBase):
     def _snapshot(self):
         stat = self.vault.stat()
         return self.vault.read_bytes(), stat.st_mtime_ns
-
-    def _no_value_read(self):
-        stdin = mock.Mock()
-        stdin.buffer.read.side_effect = AssertionError("stdin was read")
-        stdin.isatty.side_effect = AssertionError("stdin was probed")
-        return mock.patch.object(sys, "stdin", stdin)
 
     def test_set_says_what_it_would_do_and_writes_nothing(self) -> None:
         snapshot = self._snapshot()
@@ -90,6 +145,26 @@ class TestDryRun(FindKeysBase):
                         "set", "--dry-run", "-p", str(self.password), "secrets.yml", key
                     )
                     self.assertEqual((code, out.splitlines()[0], err), (0, expected, ""))
+        self.assertEqual(self._snapshot(), snapshot)
+
+    def test_set_dry_run_checks_a_value_given_on_the_command_line(self) -> None:
+        snapshot = self._snapshot()
+        base = ("set", "--dry-run", "-p", str(self.password), "secrets.yml")
+        code, out, err = self._main(*base, "brand.new", "")
+        self.assertEqual(code, 1)
+        self.assertIn("empty value", err)
+        code, out, err = self._main(*base, "brand.new", "fine")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines()[0], "would add brand.new in secrets.yml")
+        self.assertNotIn("not checked", out)
+        self.assertIn("visible in ps", err)
+        code, out, _ = self._main(*base, "tail", "done")
+        self.assertEqual((code, out.splitlines()[0]), (0, "unchanged tail in secrets.yml"))
+        # No VALUE: stdin is not read, and the output says the value went unchecked.
+        with self._no_value_read():
+            code, out, err = self._main(*base, "brand.new")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines()[-1], DRY_RUN_UNCHECKED)
         self.assertEqual(self._snapshot(), snapshot)
 
     def test_set_refuses_what_a_real_run_refuses(self) -> None:

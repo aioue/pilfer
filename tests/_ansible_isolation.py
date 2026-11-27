@@ -9,6 +9,7 @@ imports this before anything imports ansible. Subprocesses inherit it.
 
 import atexit
 import os
+import shutil
 import tempfile
 
 for _name in list(os.environ):
@@ -20,3 +21,9 @@ with os.fdopen(_handle, "w") as _cfg:
     _cfg.write("[defaults]\n")
 atexit.register(os.remove, EMPTY_ANSIBLE_CFG)
 os.environ["ANSIBLE_CONFIG"] = EMPTY_ANSIBLE_CFG
+
+# Importing pilfer must not need a writable HOME (ansible creates its local tmp
+# there on import). Tests of the read-only-HOME fallback remove this variable.
+ANSIBLE_LOCAL_TEMP = tempfile.mkdtemp(prefix="pilfer-test-tmp-")
+atexit.register(shutil.rmtree, ANSIBLE_LOCAL_TEMP, ignore_errors=True)
+os.environ["ANSIBLE_LOCAL_TEMP"] = ANSIBLE_LOCAL_TEMP

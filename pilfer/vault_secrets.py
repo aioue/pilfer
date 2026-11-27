@@ -168,6 +168,18 @@ def _prompt_flag(sources: VaultSources, vault_ids) -> str | None:
     return None
 
 
+def require_terminal_if_prompting(sources=None) -> None:
+    """Refuse a password prompt with no terminal, before any password script runs.
+
+    Callers that load the password lazily (find-keys, update) call this up
+    front: otherwise every file tries the prompt and prints the same error.
+    """
+    sources = VaultSources.of(sources)
+    flag = _prompt_flag(sources, [*C.DEFAULT_VAULT_IDENTITY_LIST, *sources.vault_ids])
+    if flag:
+        require_terminal_for_prompt(flag, "-p FILE or --vault-id LABEL@FILE")
+
+
 def load_secrets(sources=None) -> Secrets:
     """Every secret Ansible would load for these flags, as [(vault_id, secret)].
 
@@ -186,10 +198,8 @@ def load_secrets(sources=None) -> Secrets:
         if fallback is None:
             raise PilferError(NO_SOURCE_MESSAGE)
         return [(C.DEFAULT_VAULT_IDENTITY, _read_plain_password_file(fallback))]
-    flag = _prompt_flag(sources, vault_ids)
-    if flag:
-        # Before any password script runs: fail with nothing half done.
-        require_terminal_for_prompt(flag, "-p FILE or --vault-id LABEL@FILE")
+    # Before any password script runs: fail with nothing half done.
+    require_terminal_if_prompting(sources)
     try:
         return _cli().setup_vault_secrets(
             DataLoader(),

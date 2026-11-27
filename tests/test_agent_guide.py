@@ -11,6 +11,9 @@ from importlib import resources
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# Before anything imports ansible: see _ansible_isolation.
+import _ansible_isolation  # noqa: F401
+
 from pilfer.cli import _build_argument_parser, main
 
 GUIDE = resources.files("pilfer").joinpath("agent_guide", "SKILL.md").read_text(encoding="utf-8")
@@ -62,17 +65,26 @@ class AgentGuideTests(unittest.TestCase):
 
     def test_every_flag_mentioned_exists(self):
         top, commands = _parsers()
-        known = {
-            option
-            for parser in (top, *commands.values())
-            for action in parser._actions
-            for option in action.option_strings
-        }
-        mentioned = set(re.findall(r"(?<![\w-])--?[A-Za-z][\w-]*", _code(_body())))
-        flags = {m for m in mentioned if m.startswith("--") or len(m) == 2}
-        self.assertTrue(flags)
-        for flag in flags:
-            self.assertIn(flag, known, f"SKILL.md mentions {flag}")
+
+        def options(parser):
+            return {o for action in parser._actions for o in action.option_strings}
+
+        everything = options(top).union(*(options(p) for p in commands.values()))
+        flag_re = re.compile(r"(?<![\w-])--?[A-Za-z][\w-]*")
+        checked = 0
+        for line in _code(_body()).splitlines():
+            flags = {m for m in flag_re.findall(line) if m.startswith("--") or len(m) == 2}
+            # A line that starts `pilfer <cmd>` is checked against that command only.
+            start = re.match(r"\s*pilfer ([a-z][a-z-]*)", line)
+            known = (
+                options(commands[start[1]]) | options(top)
+                if start and start[1] in commands
+                else everything
+            )
+            for flag in flags:
+                checked += 1
+                self.assertIn(flag, known, f"SKILL.md mentions {flag} in: {line.strip()}")
+        self.assertTrue(checked)
 
     def test_guide_is_listed_for_completion(self):
         import shtab

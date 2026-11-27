@@ -21,16 +21,27 @@ import shlex
 import sys
 from dataclasses import dataclass
 
+from ansible.parsing.vault import AnsibleVaultFormatError
+
 from pilfer.cli import (
+    MAX_READ_BYTES,
     PilferError,
+    _check_session_path,
     _classify_file_bytes,
+    _describe_skipped_vault_values,
     _encrypted_backup_path,
     _inline_meta_path,
+    _is_regular_file,
     _load_session,
     _open_sidecar_path,
+    _read_no_follow,
+    _refuse_planted_session_links,
     _session_is_open,
     _sources,
+    _too_large_message,
     _warn_unused_sources,
+    safe_multiline,
+    safe_text,
     scan_project,
 )
 from pilfer.inline import (
@@ -41,9 +52,24 @@ from pilfer.inline import (
     read_marked_values,
 )
 from pilfer.key_paths import parse_key_path, render_key_path, walk_keys
-from pilfer.vault_secrets import load_vault, vault_label
+from pilfer.vault_secrets import (
+    load_vault,
+    require_terminal_if_prompting,
+    vault_label,
+)
+from pilfer.vault_set import CHECK_PLACEHOLDER, DRY_RUN_UNCHECKED, _clip, _shown_path
 
-PLACEHOLDER = "pilfer-update-check-placeholder"
+# Per-file failure lines printed before the rest are summarised.
+MAX_FAILURE_LINES = 5
+
+
+def _listing(names) -> str:
+    """Sorted, escaped names, one per line, capped so a mass failure stays short."""
+    names = sorted(safe_text(name) for name in names)
+    lines = [f"  {name}" for name in names[:MAX_FAILURE_LINES]]
+    if len(names) > MAX_FAILURE_LINES:
+        lines.append(f"  ... and {len(names) - MAX_FAILURE_LINES} more")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -57,20 +83,35 @@ class KeyHit:
     vault_id: str | None
 
 
+class VaultLoadError(PilferError):
+    """The vault password could not be loaded. Fatal for the whole run, not one file."""
+
+
 class _LazyVault:
-    """Load the vault password once, and only if some file needs it."""
+    """Load the vault password once, and only if some file needs it.
+
+    A failure is cached and raised as VaultLoadError: a missing source or a -p
+    script that exits non-zero would otherwise be retried (the script run again)
+    and reported once per vault file.
+    """
 
     def __init__(self, sources):
         self._sources = sources
         self._vault = None
+        self._error = None
 
     def get(self):
+        if self._error is not None:
+            raise self._error
         if self._vault is None:
-            self._vault = load_vault(self._sources)
-        return self._vault
-
-    @property
-    def loaded(self):
+            try:
+                self._vault = load_vault(self._sources)
+            except PilferError as exc:
+                text = str(exc)
+                if not text.startswith("vault password"):
+                    text = f"vault password: {text}"
+                self._error = VaultLoadError(text)
+                raise self._error from None
         return self._vault
 
 
@@ -82,32 +123,46 @@ def _label_or_none(ciphertext: bytes) -> str | None:
 
 
 def _read(path: str) -> bytes:
-    with open(path, "rb") as handle:
-        return handle.read()
+    # No-follow: a repo can plant a symlink where pilfer expects a vault file,
+    # a backup or a sidecar, and find-keys must not read through it.
+    data = _read_no_follow(path, "file", MAX_READ_BYTES + 1)
+    if len(data) > MAX_READ_BYTES:
+        raise PilferError(_too_large_message())
+    return data
+
+
+def _found_keys(documents) -> list:
+    return [found for document in documents for found in walk_keys(document)]
 
 
 def _closed_hits(path: str, kind: str, vault: _LazyVault) -> list[KeyHit]:
     data = _read(path)
     if kind == "file":
         normalized = normalize_whole_file_vault(data)
+        label = _label_or_none(normalized)
         try:
             plaintext = vault.get().decrypt(normalized)
         except PilferError:
             raise
+        except AnsibleVaultFormatError:
+            # A header that parses but a body that does not (non-hex, truncated).
+            raise PilferError("vault format error (the file is damaged)") from None
         except Exception:
-            raise PilferError(f"could not decrypt {path} with this vault password") from None
-        _, documents = _compose(plaintext)
-        label = _label_or_none(normalized)
-        return [
-            KeyHit(path, found.path, "file", False, label)
-            for document in documents
-            for found in walk_keys(document)
-        ]
-    _, documents = _compose(data)
+            # The caller prefixes the file name.
+            if label:
+                raise PilferError(
+                    "could not decrypt with the loaded vault passwords "
+                    f"(file uses vault id '{safe_text(label)}')"
+                ) from None
+            raise PilferError("could not decrypt with this vault password") from None
+        # The parse cap is for plaintext inline files (attacker-controlled text),
+        # not for a vault the password holder encrypted.
+        _, documents = _compose(plaintext, limit=False, ansible_fallback=True)
+        return [KeyHit(path, found.path, "file", False, label) for found in _found_keys(documents)]
+    _, documents = _compose(data, ansible_fallback=True)
     return [
         KeyHit(path, found.path, "inline", False, _label_or_none(found.value_node.value.encode()))
-        for document in documents
-        for found in walk_keys(document)
+        for found in _found_keys(documents)
         if found.value_node.tag == "!vault"
     ]
 
@@ -120,23 +175,20 @@ def _open_hits(path: str, kind: str, include_inline: bool) -> list[KeyHit] | Non
     if is_whole_file_vault(data):
         return None  # recorded but not yet decrypted: the scan reports it as closed
     if kind == "file":
-        _, documents = _compose(data)
+        # Decrypted whole-file plaintext is not capped (as in _closed_hits).
+        _, documents = _compose(data, limit=False, ansible_fallback=True)
         try:
             label = vault_label(_read(_encrypted_backup_path(path)))
         except Exception:
             label = None
-        return [
-            KeyHit(path, found.path, "file", True, label)
-            for document in documents
-            for found in walk_keys(document)
-        ]
+        return [KeyHit(path, found.path, "file", True, label) for found in _found_keys(documents)]
     if not include_inline:
         return []
     labels = {}
     try:
-        with open(_inline_meta_path(path)) as handle:
-            labels = {span["id"]: span.get("vault_id") for span in json.load(handle)["spans"]}
-    except (OSError, ValueError, KeyError, TypeError):
+        meta = json.loads(_read(_inline_meta_path(path)))
+        labels = {span["id"]: span.get("vault_id") for span in meta["spans"]}
+    except (PilferError, ValueError, KeyError, TypeError):
         pass
     by_key = {marked.key_index: marked.span_id for marked in read_marked_values(data)}
     _, documents = _compose(data)
@@ -144,45 +196,58 @@ def _open_hits(path: str, kind: str, include_inline: bool) -> list[KeyHit] | Non
         KeyHit(
             path, found.path, "inline", True, labels.get(by_key[found.key_node.start_mark.index])
         )
-        for document in documents
-        for found in walk_keys(document)
+        for found in _found_keys(documents)
         if found.key_node.start_mark.index in by_key
     ]
 
 
 def collect_keys(
     vault: _LazyVault, include_inline: bool, only_file: str | None = None
-) -> tuple[list[KeyHit], int]:
-    """Every key in the project's vault files. Returns (hits, number of files that failed).
+) -> tuple[list[KeyHit], list[str]]:
+    """Every key in the project's vault files. Returns (hits, paths of files that failed).
 
     A file that cannot be read is reported on stderr and skipped, so one bad file
     does not hide the rest. Messages name the file, never its content.
     """
     hits: list[KeyHit] = []
-    failures = 0
+    failures: list[str] = []
     wanted = os.path.abspath(only_file) if only_file else None
     seen: set[str] = set()
+    # A wrong password that loads but does not decrypt fails every vault file:
+    # print the first few and summarise, so the real error is not buried.
+    reported = 0
+    suppressed = 0
+
+    def report(line: str) -> None:
+        nonlocal reported, suppressed
+        if reported < MAX_FAILURE_LINES:
+            reported += 1
+            print(line, file=sys.stderr)
+        else:
+            suppressed += 1
 
     def attempt(path, produce, *call_args):
-        nonlocal failures
         try:
             return produce(*call_args)
+        except VaultLoadError:
+            raise
         except (PilferError, OpenedFileError) as exc:
-            print(f"pilfer: {path}: {exc}", file=sys.stderr)
+            report(f"pilfer: {safe_text(path)}: {safe_multiline(str(exc))}")
         except OSError as exc:
-            print(f"pilfer: {path}: {exc.strerror}", file=sys.stderr)
+            report(f"pilfer: {safe_text(path)}: {exc.strerror}")
         except Exception as exc:
             # Never str(exc): a YAML or crypto error can quote the plaintext.
-            print(f"pilfer: {path}: failed ({type(exc).__name__})", file=sys.stderr)
-        failures += 1
+            report(f"pilfer: {safe_text(path)}: failed ({type(exc).__name__})")
+        failures.append(path)
         return None
 
     if _session_is_open():
+        _refuse_planted_session_links()
         for entry in _load_session():
             path = os.path.abspath(entry["path"])
             if wanted and path != wanted:
                 continue
-            found = attempt(path, _open_hits, path, entry.get("kind", "file"), include_inline)
+            found = attempt(path, _open_entry, path, entry, include_inline)
             if found is not None:
                 seen.add(path)
                 hits.extend(found)
@@ -197,7 +262,26 @@ def collect_keys(
             if kind:
                 targets.append({"kind": kind, "path": wanted})
     else:
-        targets = scan_project(include_encrypted_vars=include_inline, announce_skips=False).targets
+        scan = scan_project(include_encrypted_vars=include_inline, announce_skips=False)
+        targets = sorted(scan.targets, key=lambda target: target["path"])
+        for path, reason in sorted(scan.unreadable):
+            report(f"pilfer: {safe_text(path)}: {reason}")
+            failures.append(path)
+        # Cannot be a vault by extension: worth knowing, not a failed search.
+        # Capped like the failures, so a tree of unreadable logs stays short.
+        for count, (path, reason) in enumerate(sorted(scan.unreadable_other)):
+            if count < MAX_FAILURE_LINES:
+                print(f"pilfer: warning: {safe_text(path)}: {reason}", file=sys.stderr)
+        extra = len(scan.unreadable_other) - MAX_FAILURE_LINES
+        if extra > 0:
+            print(f"pilfer: ... and {extra} more warning(s)", file=sys.stderr)
+        if scan.skipped_vault_values:
+            # Their names are not searched: say so, or a file whose only !vault
+            # values are in unsupported forms looks like it holds no keys.
+            print(
+                f"pilfer: warning: {_describe_skipped_vault_values(scan)}; their keys are not searched",
+                file=sys.stderr,
+            )
     for target in targets:
         path = os.path.abspath(target["path"])
         if path in seen:
@@ -205,7 +289,14 @@ def collect_keys(
         found = attempt(path, _closed_hits, path, target["kind"], vault)
         if found:
             hits.extend(found)
+    if suppressed:
+        print(f"pilfer: {suppressed} more file(s) could not be read", file=sys.stderr)
     return hits, failures
+
+
+def _open_entry(path: str, entry: dict, include_inline: bool):
+    _check_session_path(path)
+    return _open_hits(path, entry.get("kind", "file"), include_inline)
 
 
 def _shown(path: str) -> str:
@@ -214,22 +305,29 @@ def _shown(path: str) -> str:
 
 def _matcher(args):
     """A function from (name, rendered path) to bool, from the patterns and flags."""
-    patterns = args.patterns
-    if not patterns:
+    if not args.patterns:
         return lambda name, rendered: True
     flags = re.IGNORECASE if args.ignore_case else 0
-    if args.regex:
-        try:
-            compiled = [re.compile(pattern, flags) for pattern in patterns]
-        except re.error as exc:
-            raise PilferError(f"invalid regular expression: {exc}") from None
-        test = lambda text: any(rx.search(text) for rx in compiled)  # noqa: E731
-    else:
-        folded = [pattern.lower() for pattern in patterns] if args.ignore_case else patterns
-        test = lambda text: any(  # noqa: E731
-            fnmatch.fnmatchcase(text.lower() if args.ignore_case else text, pattern)
-            for pattern in folded
-        )
+    # Only * and ? are wildcards: a [ in a key path such as users[0] is literal.
+    # fnmatch.translate anchors the whole name, as -E's search does not.
+    sources = (
+        args.patterns
+        if args.regex
+        else [fnmatch.translate(pattern.replace("[", "[[]")) for pattern in args.patterns]
+    )
+    try:
+        compiled = [re.compile(pattern, flags) for pattern in sources]
+    except re.error as exc:
+        raise PilferError(f"invalid regular expression: {exc}") from None
+
+    # -E matches anywhere in the name; a glob must cover all of it.
+    find = (
+        (lambda rx, text: rx.search(text)) if args.regex else (lambda rx, text: rx.fullmatch(text))
+    )
+
+    def test(text: str) -> bool:
+        return any(find(rx, text) for rx in compiled)
+
     return lambda name, rendered: test(rendered if args.path else name)
 
 
@@ -237,10 +335,11 @@ def run_find_keys(args) -> int:
     """Exit 0 when a key matched, 1 when none did, 2 on an error."""
     try:
         matches = _matcher(args)
+        require_terminal_if_prompting(_sources(args))
         vault = _LazyVault(_sources(args))
         hits, failures = collect_keys(vault, args.include_encrypted_vars)
     except PilferError as exc:
-        print(f"pilfer: {exc}", file=sys.stderr)
+        print(f"pilfer: {safe_multiline(str(exc))}", file=sys.stderr)
         return 2
     except Exception as exc:
         # Never str(exc): the rule for this command is that no error carries content.
@@ -252,7 +351,7 @@ def run_find_keys(args) -> int:
     if args.files_with_matches:
         files = list(dict.fromkeys(_shown(hit.file) for hit in hits))
         for name in files:
-            print(json.dumps({"file": name}) if args.json else name)
+            print(safe_text(name))
     else:
         for hit in hits:
             rendered = render_key_path(hit.path)
@@ -267,12 +366,14 @@ def run_find_keys(args) -> int:
                     # encrypts under the id "default" (or none), so report that id.
                     "vault_id": hit.vault_id or "default",
                 }
-                print(json.dumps(record, ensure_ascii=False))
+                # Default ensure_ascii on purpose: bidi, zero-width and lone-surrogate
+                # names arrive as \u escapes, not raw characters.
+                print(json.dumps(record))
             else:
                 tags = ("  (inline)" if hit.kind == "inline" else "") + (
                     "  (open)" if hit.open else ""
                 )
-                print(f"{_shown(hit.file)}: {rendered}{tags}")
+                print(f"{safe_text(_shown(hit.file))}: {safe_text(rendered)}{tags}")
     if failures:
         return 2
     if not hits:
@@ -283,12 +384,17 @@ def run_find_keys(args) -> int:
 
 def run_update(args) -> int:
     """Replace the value of an existing key, found by name. Refuses missing or ambiguous keys."""
-    from pilfer.vault_set import read_value, set_keys, update_inline_value
+    from pilfer.vault_set import read_value, set_keys, update_inline_value, warn_value_on_argv
 
+    warn_value_on_argv(args)
+    require_terminal_if_prompting(_sources(args))
     keypath = parse_key_path(args.key)
-    shown = render_key_path(keypath)
+    shown = _shown_path(keypath)
+    if args.file and not _is_regular_file(args.file):
+        problem = "is not a regular file" if os.path.lexists(args.file) else "does not exist"
+        raise PilferError(f"--file {args.file} {problem}")
     vault = _LazyVault(_sources(args))
-    hits, failures = collect_keys(vault, True, only_file=args.file)
+    hits, failed = collect_keys(vault, True, only_file=args.file)
     matching = [hit for hit in hits if hit.path == keypath]
     for hit in matching:
         if hit.open:
@@ -297,19 +403,64 @@ def run_update(args) -> int:
                 "run 'pilfer close' first"
             )
     targets = [hit for hit in matching if hit.kind == "file" or args.include_encrypted_vars]
+    if not targets and args.file and failed:
+        # The failure was reported above; "not found" would be untrue.
+        raise PilferError(f"{args.file} could not be read (see above); nothing was changed")
     if not targets:
         if matching:
             raise PilferError(
-                f"{shown} exists only as an inline !vault value in {_shown(matching[0].file)}; "
+                f"{shown} exists only as an inline !vault value in "
+                f"{_shown(matching[0].file)}; "
                 "pass --include-encrypted-vars to update it"
             )
-        hint = f"; to create it run: pilfer set FILE {shlex.quote(args.key)}"
-        suffix = f" ({failures} file(s) could not be read)" if failures else ""
-        raise PilferError(f"{shown} not found in any vault file{suffix}{hint}")
+        if failed:
+            note = f"; it may be in one of {len(failed)} file(s) that could not be read"
+            if not args.file:
+                note += "; pass --file FILE to update one you know holds it"
+        elif any(isinstance(segment, int) for segment in keypath):
+            note = ""  # set cannot create a list item, so there is nothing to suggest
+        else:
+            # A runnable command when the key fits on a line; a clipped key would
+            # not be one, so a long key gets the placeholder.
+            key_arg = shlex.quote(args.key) if _clip(args.key) == args.key else "KEY"
+            note = f"; to create it run: pilfer set FILE {key_arg}"
+            # A file that holds a proper prefix of the path is where set would
+            # create it. Ask set whether it would, so the hint is not a dead end.
+            holder = next(
+                (
+                    hit
+                    for hit in hits
+                    if hit.kind == "file" and hit.path == keypath[: len(hit.path)] and not hit.open
+                ),
+                None,
+            )
+            if holder is not None:
+                try:
+                    set_keys(
+                        _shown(holder.file),
+                        {args.key: CHECK_PLACEHOLDER},
+                        vault.get(),
+                        check_only=True,
+                        create=True,
+                    )
+                except PilferError as exc:
+                    note = f"; set cannot create it in {_shown(holder.file)}: {safe_multiline(str(exc))}"
+        raise PilferError(f"{shown} not found in any vault file{note}")
+    # One entry per file: a key twice in one file is set_keys' duplicate refusal,
+    # not "in 2 files".
+    targets = list({hit.file: hit for hit in targets}.values())
     if len(targets) > 1:
-        listing = "\n".join(f"  {name}" for name in sorted(_shown(hit.file) for hit in targets))
+        listing = _listing(_shown(hit.file) for hit in targets)
         raise PilferError(
             f"{shown} is in {len(targets)} files; pass --file FILE to choose one:\n{listing}"
+        )
+    if failed and not args.file:
+        # The key may be in a file we could not read too; updating only the
+        # readable copy would leave a stale one behind.
+        listing = _listing(_shown(name) for name in failed)
+        raise PilferError(
+            f"{shown} may also be in {len(failed)} file(s) that could not be read; "
+            f"fix them or pass --file FILE to choose one:\n{listing}"
         )
     target = targets[0]
     secrets = vault.get()
@@ -317,21 +468,29 @@ def run_update(args) -> int:
     def write(value: str, check_only: bool) -> str:
         if target.kind == "file":
             return set_keys(
-                target.file, {args.key: value}, secrets, check_only=check_only, create=False
+                _shown(target.file),
+                {args.key: value},
+                secrets,
+                check_only=check_only,
+                create=False,
             )[args.key]
-        return update_inline_value(target.file, args.key, value, secrets, check_only=check_only)
+        return update_inline_value(
+            _shown(target.file), args.key, value, secrets, check_only=check_only
+        )
 
-    if args.dry_run:
-        write(PLACEHOLDER, True)
-        print(f"would update {shown} in {_shown(target.file)}")
-        _warn_unused_sources(secrets, _shown(target.file))
-        return 0
     value = args.value
-    if value is None:
-        # Refuse before asking for the secret, not after someone has pasted it.
-        write(PLACEHOLDER, True)
-        value = read_value(args.key)
-    action = write(value, False)
-    print(f"{action} {shown} in {_shown(target.file)}")
-    _warn_unused_sources(secrets, _shown(target.file))
+    if args.dry_run:
+        outcome = write(CHECK_PLACEHOLDER if value is None else value, True)
+        # With no value there is nothing to compare, so it would update.
+        action = "unchanged" if outcome == "unchanged" and value is not None else "would update"
+    else:
+        if value is None:
+            # Refuse before asking for the secret, not after someone has pasted it.
+            write(CHECK_PLACEHOLDER, True)
+            value = read_value(args.key)
+        action = write(value, False)
+    print(f"{action} {safe_text(shown)} in {safe_text(_shown(target.file))}")
+    if args.dry_run and value is None:
+        print(DRY_RUN_UNCHECKED)
+    _warn_unused_sources(secrets, safe_text(_shown(target.file)))
     return 0

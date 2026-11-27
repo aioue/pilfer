@@ -9,6 +9,9 @@ import os
 import sys
 import unittest
 
+# Before anything imports ansible (discovery does): see the module.
+import _ansible_isolation  # noqa: F401
+
 
 def main() -> int:
     tests_dir = os.path.dirname(os.path.abspath(__file__))

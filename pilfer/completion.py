@@ -9,7 +9,10 @@ import os
 import subprocess
 from pathlib import Path
 
+import shtab
+
 from pilfer.errors import PilferError
+from pilfer.publish import write_atomic
 
 SHELLS = ("bash", "zsh")
 _ZSH_FPATH_NOTE = "Add this line above 'compinit' in ~/.zshrc:\n  fpath=(~/.zfunc $fpath)"
@@ -17,10 +20,6 @@ _ZSH_FPATH_NOTE = "Add this line above 'compinit' in ~/.zshrc:\n  fpath=(~/.zfun
 
 def mark_file(action) -> None:
     """Have the completion script offer file paths for this argument."""
-    try:
-        import shtab
-    except ImportError:  # a checkout without the dependency still runs
-        return
     action.complete = shtab.FILE
 
 
@@ -70,8 +69,17 @@ def _install(shell: str, script: str) -> int:
         found = _zsh_fpath_dir(home)
         target = (found or home / ".zfunc") / "_pilfer"
         note = "" if found else _ZSH_FPATH_NOTE
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(script, encoding="utf-8")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        # A dangling symlink (or a file) where the directory should be, such as
+        # a ~/.zfunc link whose target is gone.
+        raise PilferError(
+            f"cannot create {target.parent}: something that is not a directory is there"
+        ) from None
+    # write_atomic replaces the path itself, not what a symlink at it points to, and
+    # refuses a symlink target; 0o644 so the shell can read it.
+    write_atomic(target, script.encode("utf-8"), mode=0o644, action="completion install")
     print(f"Wrote {target}")
     if note:
         print(note)
@@ -80,8 +88,6 @@ def _install(shell: str, script: str) -> int:
 
 
 def run_completion(args, parser) -> int:
-    import shtab
-
     shell = _resolve_shell(args.shell)
     script = shtab.complete(parser, shell=shell)
     if args.install:

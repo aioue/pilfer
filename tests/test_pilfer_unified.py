@@ -74,15 +74,18 @@ class ProjectDirTest(unittest.TestCase):
             f.write("test_password")
         self.vault = make_vault()
 
-    def run_pilfer(self, *args):
+    def run_pilfer(self, *args, timeout=None):
         """Run pilfer.py in a subprocess. stdin is closed: rekey without --yes
-        would otherwise wait at its REKEY prompt for as long as the test runs."""
+        would otherwise wait at its REKEY prompt for as long as the test runs.
+        A timeout kills a child that blocks (for example on a planted FIFO) and
+        fails the test instead of hanging the suite."""
         return subprocess.run(
             [sys.executable, PILFER_SCRIPT, *args],
             capture_output=True,
             text=True,
             check=False,
             stdin=subprocess.DEVNULL,
+            timeout=timeout,
         )
 
 
@@ -220,6 +223,145 @@ class TestSessionSafety(ProjectDirTest):
         self.assertTrue(os.path.isfile("vaultedFileList.json"))
         with open("secret.yml", "rb") as f:
             self.assertEqual(f.read(), b"secret_key: hunter2\n")
+
+    def _planted_backup_close(self, name, plant, reason):
+        """Open, replace .vault/.../NAME with whatever plant() makes, then close."""
+        self.assertEqual(self._run("open").returncode, 0)
+        backup = next(os.path.join(r, name) for r, _, files in os.walk(".vault") if name in files)
+        os.remove(backup)
+        plant(backup)
+        # A modified file makes close read both backups.
+        with open("secret.yml", "w") as f:
+            f.write("secret_key: changed\n")
+        closed = self.run_pilfer("close", "-p", "vault_pass", timeout=30)
+        self.assertEqual(closed.returncode, 1, closed.stdout + closed.stderr)
+        self.assertIn(reason, closed.stdout + closed.stderr)
+        self.assertTrue(os.path.isfile("vaultedFileList.json"))
+        with open("secret.yml", "rb") as f:
+            self.assertEqual(f.read(), b"secret_key: changed\n")
+
+    def test_close_refuses_a_symlinked_hash_backup(self):
+        # An absolute, existing target: a relative or dangling link could fail
+        # for the wrong reason (isfile False) and pass this test anyway.
+        target = os.path.abspath("elsewhere")
+        with open(target, "w") as f:
+            f.write("0" * 64)
+        self._planted_backup_close("hash", lambda path: os.symlink(target, path), "could not read")
+
+    def test_close_refuses_a_symlinked_encrypted_backup(self):
+        target = os.path.abspath("elsewhere")
+        with open(target, "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
+        self._planted_backup_close(
+            "encrypted", lambda path: os.symlink(target, path), "could not read"
+        )
+
+    def test_close_refuses_a_fifo_hash_backup_without_blocking(self):
+        self._planted_backup_close("hash", os.mkfifo, "not a regular file")
+
+    def test_close_refuses_a_fifo_encrypted_backup_without_blocking(self):
+        # Also says how to recover.
+        self._planted_backup_close("encrypted", os.mkfifo, "is not a regular file; remove it")
+
+    def test_a_planted_session_mode_cannot_make_the_vault_world_writable(self):
+        os.chmod("secret.yml", 0o644)
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("vaultedFileList.json") as f:
+            session = json.load(f)
+        for entry in session["entries"]:
+            entry["mode"] = 0o4777
+        with open("vaultedFileList.json", "w") as f:
+            json.dump(session, f)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        # Setuid, setgid, sticky and other-write are gone; owner and group exec stay.
+        self.assertEqual(stat.S_IMODE(os.stat("secret.yml").st_mode), 0o775)
+
+    def test_a_0o755_vault_round_trips(self):
+        os.chmod("secret.yml", 0o755)
+        self.assertEqual(self._run("open").returncode, 0)
+        self.assertEqual(self._run("close").returncode, 0)
+        self.assertEqual(stat.S_IMODE(os.stat("secret.yml").st_mode), 0o755)
+
+    def _planted_gid_is_malformed(self, bad):
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("vaultedFileList.json") as f:
+            session = json.load(f)
+        session["entries"][0]["gid"] = bad
+        with open("vaultedFileList.json", "w") as f:
+            json.dump(session, f)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 1)
+        self.assertIn("malformed entry", closed.stderr)
+
+    def test_a_session_gid_that_is_a_string_is_malformed(self):
+        self._planted_gid_is_malformed("x")
+
+    def test_a_negative_session_gid_is_malformed(self):
+        self._planted_gid_is_malformed(-1)
+
+    def test_a_session_gid_of_2_to_the_32_is_malformed(self):
+        # fchown raises OverflowError for it.
+        self._planted_gid_is_malformed(2**32)
+
+    def test_a_session_mode_that_is_not_an_int_is_a_malformed_entry(self):
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("vaultedFileList.json") as f:
+            session = json.load(f)
+        session["entries"][0]["mode"] = "0777"
+        with open("vaultedFileList.json", "w") as f:
+            json.dump(session, f)
+        closed = self._run("close")
+        self.assertEqual(closed.returncode, 1)
+        self.assertIn("malformed entry", closed.stderr)
+
+    def test_find_keys_rejects_an_abbreviated_option(self):
+        result = self.run_pilfer("find-keys", "--file", "x", "-p", "vault_pass")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("unrecognized arguments", result.stderr)
+
+    def test_a_closed_pipe_exits_141_without_a_traceback(self):
+        # The reader is gone before pilfer writes anything, so the first write
+        # fails whatever the pipe buffer size (a reader that closes after one
+        # byte raced the writer on Python 3.14).
+        for i in range(3):
+            with open(f"v{i}.yml", "wb") as f:
+                f.write(self.vault.encrypt(b"k%d: v\n" % i))
+        self._assert_closed_pipe_exits_141("find-keys", "--json", "-p", "vault_pass")
+
+    def test_help_with_a_closed_pipe_exits_141_without_a_traceback(self):
+        # argparse prints --help and exits from inside parse_args.
+        self._assert_closed_pipe_exits_141("--help")
+
+    def _assert_closed_pipe_exits_141(self, *args):
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        try:
+            proc = subprocess.run(
+                [sys.executable, PILFER_SCRIPT, *args],
+                stdout=write_end,
+                stderr=subprocess.PIPE,
+                timeout=60,
+            )
+        finally:
+            os.close(write_end)
+        err = proc.stderr.decode()
+        self.assertEqual(proc.returncode, 141, err)
+        self.assertNotIn("Traceback", err)
+
+    def test_a_closed_stdout_is_not_a_traceback(self):
+        # Launched with fd 1 closed, sys.stdout is None.
+        proc = subprocess.run(
+            [sys.executable, PILFER_SCRIPT, "status"],
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            preexec_fn=lambda: os.close(1),
+            timeout=60,
+            check=False,
+        )
+        err = proc.stderr.decode()
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("Traceback", err)
 
     def test_retry_close_after_partial_failure(self):
         """After a failed close, restoring the missing hash sidecar allows a clean close."""
@@ -790,6 +932,14 @@ class TestSessionSafety(ProjectDirTest):
         self.assertNotEqual(opened.returncode, 0)
         self.assertIn("Orphaned open state", opened.stderr)
 
+    def test_empty_vault_dir_is_not_orphaned_state(self):
+        """A bare .vault/ (say, left by a failed mkdir or a clean-up) holds no secrets."""
+        os.mkdir(".vault")
+        self.assertEqual(os.listdir(".vault"), [])
+        opened = self._run("open")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertNotIn("Orphaned open state", opened.stderr)
+
     def test_orphan_whole_file_sidecar_without_session_refuse_open(self):
         """Whole-file opens leave no markers; *.pilfer-open must block re-open."""
         self.assertEqual(self._run("open").returncode, 0)
@@ -860,7 +1010,7 @@ class TestInlineVault(ProjectDirTest):
         chunks = ["---\n", "plain_key: visible\n"]
         for name, value in pairs:
             chunks.append(encrypt_string_yaml(self.vault, name, value))
-        with open("group_vars.yml", "w") as f:
+        with open("group_vars.yml", "w", encoding="utf-8") as f:
             f.write("".join(chunks))
         with open("group_vars.yml", "rb") as f:
             return f.read()
@@ -1550,6 +1700,20 @@ class TestInlineVault(ProjectDirTest):
         self.assertIn(b"api_token", after)
         self.assertIn(b"!vault", after)
 
+    def test_removed_variable_names_are_escaped(self):
+        """A removed key holding U+202E must not reach the terminal raw."""
+        name = "db\u202epassword"
+        self._write_vars_file((name, b"super-secret"), ("api_token", b"keep-me"))
+        self.assertEqual(self._run("open").returncode, 0)
+        with open("group_vars.yml", encoding="utf-8") as f:
+            lines = f.readlines()
+        with open("group_vars.yml", "w", encoding="utf-8") as f:
+            f.writelines(ln for ln in lines if name not in ln)
+        closed = self._run("close", confirm_delete=True)
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertNotIn("\u202e", closed.stdout + closed.stderr)
+        self.assertIn("- db\\u202epassword", closed.stdout)
+
     def test_multiline_blank_lines_survive_unrelated_edit(self):
         """Interior blank lines in multiline secrets must not truncate on close."""
         secret = b"line1\n\nline3"
@@ -1625,9 +1789,14 @@ class TestDiscoveryOptimizations(ProjectDirTest):
             f.write(self.vault.encrypt(b"should-not-open\n"))
         with open("real.yml", "wb") as f:
             f.write(self.vault.encrypt(b"ok: 1\n"))
-        found = pilfer_cli.scan_project(include_encrypted_vars=True).targets
-        paths = [os.path.basename(e["path"]) for e in found]
+        scan = pilfer_cli.scan_project(include_encrypted_vars=True)
+        paths = [os.path.basename(e["path"]) for e in scan.targets]
         self.assertEqual(paths, ["real.yml"])
+        # Not a target, but a vault pilfer will not rekey: a warning, and rekey refuses.
+        self.assertEqual(
+            [(os.path.basename(p), "binary file name" in r) for p, r in scan.unreadable_other],
+            [("noise.db", True)],
+        )
 
     def test_compound_archive_suffix_is_denylisted(self):
         """backup.tar.zst must not be a vault target. splitext only sees .zst."""
@@ -1849,6 +2018,17 @@ class TestScanOnce(ProjectDirTest):
             needle = f"Skipping nested git repo: {os.path.abspath(name)}"
             self.assertEqual(result.stdout.count(needle), 1, result.stdout)
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads mode-000 files")
+    def test_open_with_only_an_unreadable_vault_exits_nonzero(self):
+        with open("secret.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
+        os.chmod("secret.yml", 0)
+        self.addCleanup(os.chmod, "secret.yml", 0o600)
+        result = self.run_pilfer("open", "-p", "vault_pass")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("No readable vault files found (1 could not be read", result.stderr)
+        self.assertIn("Could not read", result.stderr)
+
     def test_quiet_suppresses_nested_skip_messages(self):
         for name in ("nested_a", "nested_b"):
             os.makedirs(name)
@@ -1893,6 +2073,71 @@ class TestAllowRemovalsAndRekey(ProjectDirTest):
         with open("secret.yml", "rb") as f:
             body = f.read()
         self.assertEqual(new_vault.decrypt(body), b"secret_key: hunter2\n")
+
+    def test_rekey_refuses_a_vault_with_a_binary_file_name(self):
+        with open("real.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"ok: 1\n"))
+        with open("certs.tar.gz", "wb") as f:
+            f.write(self.vault.encrypt(b"certs\n"))
+        result = self.run_pilfer(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--yes",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("certs.tar.gz (a vault with a binary file name", result.stderr)
+        with open("real.yml", "rb") as f:
+            self.assertEqual(self.vault.decrypt(f.read()), b"ok: 1\n")
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads mode-000 files")
+    def test_rekey_refuses_an_unreadable_file_that_could_be_a_vault(self):
+        # A whole-file vault can be named key.pem or secret.txt; rekey must not
+        # leave it on the old password.
+        with open("secret.yml", "wb") as f:
+            f.write(self.vault.encrypt(b"secret_key: hunter2\n"))
+        with open("key.pem", "wb") as f:
+            f.write(self.vault.encrypt(b"pem\n"))
+        os.chmod("key.pem", 0)
+        self.addCleanup(os.chmod, "key.pem", 0o600)
+        result = self.run_pilfer(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--yes",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("key.pem", result.stderr)
+        self.assertIn("key.pem (Permission denied)", result.stderr)
+        with open("secret.yml", "rb") as f:
+            self.assertEqual(self.vault.decrypt(f.read()), b"secret_key: hunter2\n")
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads mode-000 files")
+    def test_rekey_refusal_lists_five_paths_and_counts_the_rest(self):
+        for i in range(7):
+            name = f"k{i}.pem"
+            with open(name, "wb") as f:
+                f.write(b"x")
+            os.chmod(name, 0)
+            self.addCleanup(os.chmod, name, 0o600)
+        result = self.run_pilfer(
+            "rekey",
+            "--old-vault-password-file",
+            "vault_pass",
+            "--new-vault-password-file",
+            "vault_pass_new",
+            "--yes",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(result.stderr, r"  k0\.pem \(.+\)\n")
+        self.assertRegex(result.stderr, r"  k4\.pem \(.+\)\n")
+        self.assertNotIn("k5.pem", result.stderr)
+        self.assertIn("Fix the permissions or size", result.stderr)
+        self.assertIn("and 2 more (", result.stderr)
 
     def test_rekey_keeps_the_mode(self):
         with open("secret.yml", "wb") as f:
@@ -2175,6 +2420,126 @@ class TestAllowRemovalsAndRekey(ProjectDirTest):
                     f"{emoji!r} not followed by space near "
                     f"{cli_text[match.start() : match.start() + 24]!r}",
                 )
+
+
+@unittest.skipIf(os.geteuid() == 0, "root can write a read-only HOME")
+class TestReadOnlyHome(unittest.TestCase):
+    def test_commands_run_when_home_cannot_hold_ansible_tmp(self):
+        # TMPDIR is a scratch directory so the fallback directories this makes
+        # do not pile up in the developer's temp dir.
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as tmpdir:
+            os.chmod(home, 0o500)
+            try:
+                env = {k: v for k, v in os.environ.items() if not k.startswith("ANSIBLE_HOME")}
+                env.pop("ANSIBLE_LOCAL_TEMP", None)
+                env["HOME"] = home
+                env["TMPDIR"] = tmpdir
+                for args in (["--version"], ["agent-guide"]):
+                    result = subprocess.run(
+                        [sys.executable, PILFER_SCRIPT, *args],
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        timeout=60,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            finally:
+                os.chmod(home, 0o700)
+
+
+@unittest.skipIf(os.geteuid() == 0, "root can write anywhere")
+class TestAnsibleLocalTempFallback(unittest.TestCase):
+    def _run(self, env):
+        return subprocess.run(
+            [sys.executable, PILFER_SCRIPT, "--version"],
+            capture_output=True,
+            text=True,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            timeout=60,
+            check=False,
+        )
+
+    def test_a_user_set_unwritable_local_temp_is_one_clean_line(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            blocked = os.path.join(scratch, "blocked")
+            os.mkdir(blocked, 0o500)
+            tmpdir = os.path.join(scratch, "tmp")
+            os.mkdir(tmpdir)
+            env = {k: v for k, v in os.environ.items() if not k.startswith("ANSIBLE_HOME")}
+            env["ANSIBLE_LOCAL_TEMP"] = os.path.join(blocked, "tmp")
+            env["TMPDIR"] = tmpdir
+            try:
+                result = self._run(env)
+            finally:
+                os.chmod(blocked, 0o700)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+            self.assertTrue(result.stderr.startswith("pilfer: "), result.stderr)
+            self.assertEqual(os.listdir(tmpdir), [], "no pilfer-* directory left behind")
+
+    def test_a_failed_retry_removes_the_fallback_directory(self):
+        # The retry fails too (a finder makes ansible.constants raise every
+        # time), so the fresh directory and the variable must not be left behind.
+        preamble = (
+            "import importlib.abc, importlib.util, os, sys\n"
+            "from ansible.errors import AnsibleError\n"
+            # Which pilfer the child would import, found without importing it
+            # (that would load ansible.constants before the finder is in place).
+            "print(importlib.util.find_spec('pilfer').origin)\n"
+            "class Finder(importlib.abc.MetaPathFinder):\n"
+            "    def find_spec(self, name, path, target=None):\n"
+            "        if name == 'ansible.constants':\n"
+            "            raise AnsibleError('cannot create local tmp')\n"
+            "sys.meta_path.insert(0, Finder())\n"
+            "sys.argv = [sys.argv[1], *sys.argv[2:]]\n"
+            f"exec(compile(open({PILFER_SCRIPT!r}).read(), {PILFER_SCRIPT!r}, 'exec'))\n"
+        )
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as tmpdir:
+            os.chmod(home, 0o500)
+            try:
+                env = {k: v for k, v in os.environ.items() if not k.startswith("ANSIBLE_HOME")}
+                env.pop("ANSIBLE_LOCAL_TEMP", None)
+                env["HOME"] = home
+                env["TMPDIR"] = tmpdir
+                # `python -c` puts the cwd, not the repo, first on sys.path: without
+                # this the test could import an installed pilfer instead of this tree.
+                env["PYTHONPATH"] = os.path.dirname(os.path.abspath(PILFER_SCRIPT))
+                result = subprocess.run(
+                    [sys.executable, "-c", preamble, "pilfer", "--version"],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    timeout=60,
+                    check=False,
+                )
+            finally:
+                os.chmod(home, 0o700)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            repo = os.path.dirname(os.path.abspath(PILFER_SCRIPT))
+            self.assertTrue(result.stdout.startswith(repo + os.sep), result.stdout)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+            self.assertTrue(result.stderr.startswith("pilfer: "), result.stderr)
+            self.assertEqual(os.listdir(tmpdir), [], "no pilfer-* directory left behind")
+
+    def test_the_fallback_directory_is_made_only_when_needed(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as tmpdir:
+            os.chmod(home, 0o500)
+            try:
+                env = {k: v for k, v in os.environ.items() if not k.startswith("ANSIBLE_HOME")}
+                env.pop("ANSIBLE_LOCAL_TEMP", None)
+                env["HOME"] = home
+                env["TMPDIR"] = tmpdir
+                result = self._run(env)
+            finally:
+                os.chmod(home, 0o700)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(os.listdir(tmpdir)), 1)
 
 
 class TestVersion(unittest.TestCase):

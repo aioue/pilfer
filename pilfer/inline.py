@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 
 import yaml
 from ansible.parsing.vault import VaultLib
+from ansible.parsing.vault import b_HEADER as VAULT_MAGIC
+from ansible.parsing.yaml.loader import AnsibleLoader
 
 from pilfer.vault_secrets import decrypts, encrypt_like, vault_label
 
@@ -28,10 +30,18 @@ _MARKER_TEXT_RE = re.compile(re.escape(MARKER_PREFIX) + r"(?P<id>\d+)[ \t]*(?=\r
 
 _HEX_LINE = re.compile(rb"^[ \t]*[0-9a-fA-F]+\s*$")
 # Only plain literal block style for now (!vault |). Other styles are skipped.
-_VAULT_TAG_LINE = re.compile(rb"^(?P<prefix>[ \t]*[^:\n#][^:\n]*:\s*)!vault\s*\|\s*\r?\n$")
+# The first class excludes space and tab so it cannot overlap the indent before
+# it: with `[ \t]*[^:\n#]` a long whitespace line backtracked quadratically.
+_VAULT_TAG_LINE = re.compile(rb"^(?P<prefix>[ \t]*[^ \t:\n#][^:\n]*:\s*)!vault\s*\|\s*\r?\n$")
 
 UTF8_BOM = b"\xef\xbb\xbf"
 VAULT_HEADER_PREFIX = b"$ANSIBLE_VAULT;"
+# VAULT_MAGIC (imported above, Ansible's own b_HEADER) is all is_encrypted()
+# needs, and VaultLib ignores header field 0 (it is not HMAC'd), so
+# `$ANSIBLE_VAULTx;1.1;AES256` is still a vault.
+# Every "is this a vault?" test uses the bare magic, so an edited header cannot
+# hide a value from the skip count. find_inline_vault_spans stays strict
+# (VAULT_HEADER_PREFIX): such a value is then skipped, and rekey refuses it.
 # ansible-vault encrypt_string indents the !vault body by ten spaces.
 DEFAULT_BODY_INDENT = b"          "
 
@@ -44,13 +54,13 @@ def strip_leading_vault_noise(data: bytes) -> bytes:
 
 def is_whole_file_vault(data: bytes) -> bool:
     """True if data is (or starts as) an Ansible whole-file vault ciphertext."""
-    return strip_leading_vault_noise(data).startswith(VAULT_HEADER_PREFIX)
+    return strip_leading_vault_noise(data).startswith(VAULT_MAGIC)
 
 
 def normalize_whole_file_vault(data: bytes) -> bytes:
     """Return ciphertext VaultLib accepts if this is a whole-file vault."""
     stripped = strip_leading_vault_noise(data)
-    if stripped.startswith(VAULT_HEADER_PREFIX):
+    if stripped.startswith(VAULT_MAGIC):
         return stripped
     return data
 
@@ -207,7 +217,9 @@ def find_inline_vault_spans(content: bytes) -> list[InlineSpan]:
         encrypted = content[region_start:vault_body_end]
         ciphertext = normalize_vault_ciphertext(content[vault_body_start:vault_body_end])
         if not ciphertext.startswith(VAULT_HEADER_PREFIX):
-            pos = header_idx + 1
+            # Skip the rest of this line: a later header on it cannot start a
+            # block, and header_idx + 1 rescans the line quadratically.
+            pos = header_line_end
             continue
 
         spans.append(
@@ -228,59 +240,173 @@ def find_inline_vault_spans(content: bytes) -> list[InlineSpan]:
     return spans
 
 
-def _ansible_vault_values(content: bytes) -> list[bytes]:
-    """Ciphertext of every !vault value Ansible's YAML loader reads, normalized like spans.
+# A cheap byte test for text Ansible could read a vault value from, run before
+# any parse. Not a plain "vault" substring: a 1 MiB+ tokenizer.json or pytest
+# cache holds the word and would be refused as "too large to parse". Each is a
+# spelling that reaches a vault tag or key without the literal "$ANSIBLE_VAULT;":
+#   !vault          the tag itself (also !vault-encrypted, !<!vault>)
+#   !<%             a verbatim tag naming a local tag with an escape: !<%21vault>
+#                   (a bare "!<" is a common token in 1 MiB+ tokenizer.json
+#                   files; the unescaped !<!vault> holds "!vault", and
+#                   !<!v%61ult> is caught by the %XX regex below)
+#   %TAG            a tag handle that expands to part of the name (!a!ult)
+#   __ansible_vault Ansible's JSON form, {"__ansible_vault": "$ANSIBLE_VAULT;..."}
+#   ![\w%-]*%XX     a tag with a real %XX escape (!v%61ult, !%76ault)
+# No line anchors: YAML also breaks lines on NEL, LS and PS and skips a BOM,
+# which an ASCII `^` misses. Plain substring tests run at memchr speed, and the
+# regex runs only on text with both a "!" and a "%" (minified JS, printf logs),
+# where a "%" must be followed by two hex digits inside a tag-shaped run.
+# JSON keys spelled with escapes ("\u005f_ansible_vault") are not covered, on purpose.
+_VAULT_SUBSTRINGS = (b"!vault", b"__ansible_vault", b"%TAG", b"!<%")
+_ESCAPED_TAG_RE = re.compile(rb"![\w%-]*%[0-9A-Fa-f]{2}")
 
-    Empty when Ansible cannot load the file as YAML: it would not read those
-    values either. Errors are dropped, not shown: YAML errors quote the line.
+
+def may_hold_vault_value(data: bytes) -> bool:
+    """True if data could hold a value Ansible reads as a vault (see above)."""
+    if any(needle in data for needle in _VAULT_SUBSTRINGS):
+        return True
+    return b"%" in data and b"!" in data and _ESCAPED_TAG_RE.search(data) is not None
+
+
+_VAULT_TAGS = frozenset({"!vault", "!vault-encrypted"})
+
+
+def _json_vault_values(text: str) -> int | None:
+    """Count of {"__ansible_vault": "<string>"} values if text is JSON, else None.
+
+    Ansible tries JSON before YAML, and its JSON reader turns that one-key form
+    into a vault. pilfer never handles it, so every one is skipped. The hook
+    mirrors Ansible's own: `__ansible_unsafe` is checked first (so a dict with
+    it is no vault), and a non-string `__ansible_vault` or `__ansible_unsafe`
+    makes the whole JSON parse fail, after which Ansible reads the text as YAML.
     """
-    from ansible.parsing.vault import VaultHelper
-    from ansible.parsing.yaml.loader import AnsibleLoader
+    count = 0
+
+    def hook(obj: dict) -> dict:
+        nonlocal count
+        if "__ansible_unsafe" in obj:
+            if not isinstance(obj["__ansible_unsafe"], str):
+                raise ValueError("__ansible_unsafe is not a string")
+        elif "__ansible_vault" in obj:
+            if not isinstance(obj["__ansible_vault"], str):
+                raise ValueError("__ansible_vault is not a string")
+            # Only an envelope is a vault: "" or "{{ vault_value }}" is no value
+            # to rekey (the YAML path agrees).
+            if obj["__ansible_vault"].startswith(VAULT_MAGIC.decode()):
+                count += 1
+        return obj
 
     try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        return []
-    # Ansible may print a duplicate-key warning here ("Origin: <unknown>", the key
-    # name only). No file name is passed: with a real origin Ansible quotes the
-    # file's lines, plaintext values included, into stderr and CI logs.
-    loader = AnsibleLoader(text)
-    documents = []
+        json.loads(text, object_hook=hook)
+    except (ValueError, RecursionError):
+        return None
+    return count
+
+
+def _compose_as_ansible(text: str) -> list[yaml.Node] | None:
+    """Every YAML document in text, composed by Ansible's own loader. None if it cannot.
+
+    Ansible's loader uses libyaml when it is installed, and libyaml accepts what
+    pure-Python PyYAML rejects (a tab after a scalar or tag, a BOM at the start of
+    a later line). Nothing is constructed.
+    """
     try:
-        while loader.check_data():
-            documents.append(loader.get_data())
+        # compose_all disposes the loader itself, on success and on error.
+        roots = list(yaml.compose_all(text, Loader=AnsibleLoader))
     except Exception:
-        return []
-    finally:
-        loader.dispose()
-    found, stack, seen = [], documents, set()
-    while stack:
-        value = stack.pop()
-        if isinstance(value, dict | list):
-            # An alias can make a collection contain itself.
-            if id(value) in seen:
-                continue
-            seen.add(id(value))
-            stack.extend([*value.keys(), *value.values()] if isinstance(value, dict) else value)
-            continue
-        ciphertext = VaultHelper.get_ciphertext(value, with_tags=False)
-        if ciphertext:
-            found.append(normalize_vault_ciphertext(ciphertext.encode("utf-8")))
-    return found
+        return None
+    return [root for root in roots if root is not None]
+
+
+# YAML's line breaks, as libyaml and PyYAML count them for a mark's line number.
+_YAML_BREAK_RE = re.compile(r"\r\n|[\r\n\x85\u2028\u2029]")
+
+
+def _yaml_lines_of_spans(content: bytes, spans: list[InlineSpan]) -> dict[int, InlineSpan]:
+    """Spans by the line number (as YAML marks count lines) their !vault tag is on.
+
+    The tag, not the start of the "\n"-line: CR, NEL, LS and PS also break YAML
+    lines, so a decoy `key: !vault |` inside a quoted scalar earlier on the same
+    "\n"-line must not take the real tag's line number.
+    """
+    by_line = {}
+    line = 0
+    previous = 0
+    for span in sorted(spans, key=lambda s: s.start):
+        tag = span.start + len(span.line_prefix)
+        # A segment ends at the "!" of a tag, so a "\r\n" is never split.
+        segment = content[previous:tag].decode("utf-8", errors="replace")
+        line += sum(1 for _ in _YAML_BREAK_RE.finditer(segment))
+        by_line[line] = span
+        previous = tag
+    return by_line
 
 
 def vault_values_pilfer_skips(content: bytes) -> int:
     """How many !vault values Ansible reads in content that find_inline_vault_spans does not.
 
-    pilfer opens only `key: !vault |` blocks; a list item, a `|-` block or a
-    flow scalar stays encrypted. Open reports them. Rekey refuses, because
-    rotating the password would leave them on the old one.
+    pilfer opens only `key: !vault |` blocks; a list item, a `|-` block, a flow
+    scalar, a mapping key or a JSON `__ansible_vault` value stays encrypted.
+    Open reports them. Rekey refuses, because rotating the password would leave
+    them on the old one.
+
+    Nothing is constructed: the YAML is only composed, by Ansible's own loader,
+    so the tag a node ends up with is what Ansible sees (%XX escapes and %TAG
+    handles already applied), whatever spelling the file used. A vault is a
+    scalar tagged !vault or !vault-encrypted whose text is a vault envelope
+    ($ANSIBLE_VAULT;...), wherever it sits: a `key: !vault |` with a template or
+    placeholder body is no vault to rekey. It is handled only if a block node
+    starts on the very line of a span (not by ciphertext count: a
+    `key: !vault |` copy inside another block scalar is no node and cannot
+    cancel a real one).
+
+    A file Ansible's loader cannot compose is one Ansible cannot load either, so
+    0, as before. That includes a file nested too deeply to compose: open and
+    rekey refuse it separately (see _compose).
     """
-    if VAULT_HEADER_PREFIX not in content or is_whole_file_vault(content):
+    if not may_hold_vault_value(content) or is_whole_file_vault(content):
         return 0
-    remaining = collections.Counter(_ansible_vault_values(content))
-    remaining.subtract(span.ciphertext for span in find_inline_vault_spans(content))
-    return sum(count for count in remaining.values() if count > 0)
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return 0
+    return _count_vault_values(
+        text, _yaml_lines_of_spans(content, find_inline_vault_spans(content))
+    )
+
+
+def count_vault_values(text: str) -> int:
+    """Every value Ansible would load as a vault from this plaintext.
+
+    Envelope !vault / !vault-encrypted scalars and __ansible_vault JSON strings:
+    vault_values_pilfer_skips with no handled spans. 0 if it does not compose.
+    """
+    return _count_vault_values(text, {})
+
+
+def _count_vault_values(text: str, spans: dict[int, InlineSpan]) -> int:
+    from_json = _json_vault_values(text)
+    if from_json is not None:
+        return from_json
+    documents = _compose_as_ansible(text)
+    if not documents:
+        return 0
+    vaults = [
+        node
+        for root in documents
+        for node in _nodes(root)
+        if isinstance(node, yaml.ScalarNode)
+        and node.tag in _VAULT_TAGS
+        and normalize_vault_ciphertext(node.value.encode("utf-8")).startswith(VAULT_MAGIC)
+    ]
+    handled = 0
+    for node in vaults:
+        if node.tag != "!vault" or node.style != "|":
+            continue
+        span = spans.get(node.start_mark.line)
+        if span and normalize_vault_ciphertext(node.value.encode("utf-8")) == span.ciphertext:
+            handled += 1
+    return len(vaults) - handled
 
 
 def _yaml_double_quoted(text: str) -> str:
@@ -322,7 +448,8 @@ def format_open_value(plaintext: bytes, span: InlineSpan) -> bytes:
 
     marker = MARKER_PREFIX.encode("utf-8") + str(span.span_id).encode("utf-8")
     quoted = _yaml_double_quoted(text).encode("utf-8")
-    return span.line_prefix + quoted + b"  " + marker + b"\n"
+    # The block's own line ending, so a CRLF file stays all CRLF once opened.
+    return span.line_prefix + quoted + b"  " + marker + block_newline(span.encrypted)
 
 
 def splice(content: bytes, replacements: list[tuple[int, int, bytes]]) -> bytes:
@@ -401,13 +528,38 @@ def _nodes(root: yaml.Node):
             stack.extend(node.value)
 
 
-def _compose(content: bytes) -> tuple[str, list[yaml.Node]]:
+# The pure-Python YAML composer takes minutes and gigabytes on a multi-megabyte
+# file (4 MiB of flow list cost 16 s and 2 GB), and an opened or scanned file
+# can be attacker-controlled. Real inline-vault files are tens of KB.
+MAX_COMPOSE_BYTES = 1024 * 1024
+TOO_LARGE_TO_PARSE = f"file is too large to parse (over {MAX_COMPOSE_BYTES >> 20} MiB)"
+
+
+def block_newline(block: bytes) -> bytes:
+    """The line ending a block uses: CRLF if it holds one, else LF."""
+    return b"\r\n" if b"\r\n" in block else b"\n"
+
+
+def _compose(
+    content: bytes, *, limit: bool = True, ansible_fallback: bool = False
+) -> tuple[str, list[yaml.Node]]:
     """Parse every YAML document in content.
 
     Raises OpenedFileError, whose message never quotes the file: YAML errors
     normally quote the offending line, and in an opened file that is a secret.
     Tags such as !vault and !unsafe stay on the nodes; nothing is constructed.
+
+    The size cap is for plaintext inline files (attacker-controlled text);
+    decrypted whole-file plaintext is not capped (callers pass limit=False).
+
+    Ansible loads with libyaml where PyYAML refuses (`port: 80<TAB># http`). On
+    a PyYAML parse error that Ansible's loader does not share: with
+    ansible_fallback, return Ansible's documents (read-only key listing only:
+    mark indexes differ between libyaml builds, so nothing that slices bytes by
+    marks may use it); without, refuse with a message that says so.
     """
+    if limit and len(content) > MAX_COMPOSE_BYTES:
+        raise OpenedFileError(TOO_LARGE_TO_PARSE)
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError:
@@ -417,7 +569,18 @@ def _compose(content: bytes) -> tuple[str, list[yaml.Node]]:
     except yaml.MarkedYAMLError as exc:
         mark = exc.problem_mark or exc.context_mark
         where = f" (line {mark.line + 1})" if mark is not None else ""
+        ansible_documents = _compose_as_ansible(text)
+        if ansible_documents is not None:
+            if ansible_fallback:
+                return text, ansible_documents
+            raise OpenedFileError(
+                f"file does not parse with pilfer's YAML parser{where}, though Ansible reads it "
+                "(often a tab where YAML wants a space); replace the tab with spaces"
+            ) from None
         raise OpenedFileError(f"file does not parse as YAML{where}") from None
+    except RecursionError:
+        # Before the generic clause: a deep nest is not a syntax error.
+        raise OpenedFileError("file is nested too deeply") from None
     except Exception:
         raise OpenedFileError("file does not parse as YAML") from None
     return text, documents
@@ -449,33 +612,47 @@ def read_marked_values(content: bytes) -> list[MarkedValue]:
         nl = text.find("\n", index)
         return len(text) if nl < 0 else nl + 1
 
-    pairs = [
-        pair
-        for root in documents
-        for node in _nodes(root)
-        if isinstance(node, yaml.MappingNode)
-        for pair in node.value
-    ]
+    # Index the pairs by line once: a scan of every pair per marker is
+    # O(markers x file), and a planted file with thousands of markers took
+    # seconds. A block scalar's marker sits on the key's line, any other
+    # scalar's on the line the value ends on.
+    block_by_line: dict[int, list] = collections.defaultdict(list)
+    flow_by_line: dict[int, list] = collections.defaultdict(list)
+    order = 0
+    for root in documents:
+        for node in _nodes(root):
+            if not isinstance(node, yaml.MappingNode):
+                continue
+            for key, value in node.value:
+                if isinstance(value, yaml.ScalarNode):
+                    if value.style in ("|", ">"):
+                        block_by_line[line_of(key.start_mark.index)].append((order, key, value))
+                    else:
+                        flow_by_line[line_of(value.end_mark.index)].append((order, key, value))
+                order += 1
+    # Bytes before each line start, so a character index maps to a byte offset
+    # without re-encoding the whole prefix per marker.
+    line_bytes = [0]
+    for i in range(len(line_starts) - 1):
+        line_bytes.append(line_bytes[-1] + len(text[line_starts[i] : line_starts[i + 1]].encode()))
+
+    def byte_of(index: int) -> int:
+        line = line_of(index)
+        return line_bytes[line] + len(text[line_starts[line] : index].encode())
+
     found = []
     for match in _MARKER_TEXT_RE.finditer(text):
         marker_line = line_of(match.start())
-        owner = None
-        for key, value in pairs:
-            if not isinstance(value, yaml.ScalarNode):
-                continue
-            if value.style in ("|", ">"):
-                hit = (
-                    line_of(key.start_mark.index) == marker_line
-                    and match.start() > value.start_mark.index
-                )
-            else:
-                hit = (
-                    line_of(value.end_mark.index) == marker_line
-                    and match.start() >= value.end_mark.index
-                )
-            if hit:
-                owner = (key, value)
-                break
+        hits = [
+            (rank, key, value)
+            for rank, key, value in block_by_line.get(marker_line, ())
+            if match.start() > value.start_mark.index
+        ] + [
+            (rank, key, value)
+            for rank, key, value in flow_by_line.get(marker_line, ())
+            if match.start() >= value.end_mark.index
+        ]
+        owner = min(hits, key=lambda hit: hit[0])[1:] if hits else None
         if owner is None:
             raise OpenedFileError(
                 f"marker pilfer:vault:{match.group('id')} on line {marker_line + 1} is not "
@@ -493,8 +670,8 @@ def read_marked_values(content: bytes) -> list[MarkedValue]:
                 span_id=int(match.group("id")),
                 key_text=text[key.start_mark.index : key.end_mark.index],
                 value=value.value.encode("utf-8"),
-                start=len(text[:start].encode("utf-8")),
-                end=len(text[:end].encode("utf-8")),
+                start=byte_of(start),
+                end=byte_of(end),
                 key_index=key.start_mark.index,
                 yaml_type=None if resolved in ("str", value.tag) else resolved,
             )
@@ -582,12 +759,17 @@ def format_encrypted_block(
     encrypted_ciphertext: bytes,
     line_prefix: bytes,
     body_indent: bytes,
+    newline: bytes = b"\n",
 ) -> bytes:
-    """Format VaultLib.encrypt output as a !vault | block (encrypt_string style)."""
+    """Format VaultLib.encrypt output as a !vault | block (encrypt_string style).
+
+    newline is the file's line ending (b"\r\n" when the block it replaces used
+    it), so a CRLF file does not gain bare LF lines.
+    """
     indent = body_indent or DEFAULT_BODY_INDENT
     lines = encrypted_ciphertext.strip().splitlines()
-    body = b"".join(indent + line + b"\n" for line in lines)
-    return line_prefix + b"!vault |\n" + body
+    body = b"".join(indent + line + newline for line in lines)
+    return line_prefix + b"!vault |" + newline + body
 
 
 def _yaml_key_present(content: bytes, var_name: str) -> bool:
@@ -789,7 +971,12 @@ def recrypt_inline_content(
                 (
                     marked.start,
                     marked.end,
-                    format_encrypted_block(new_cipher, line_prefix, body_indent),
+                    format_encrypted_block(
+                        new_cipher,
+                        line_prefix,
+                        body_indent,
+                        block_newline(original_encrypted),
+                    ),
                 )
             )
             modified += 1

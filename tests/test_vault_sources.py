@@ -814,6 +814,21 @@ class TestRekeyPreconditions(ProjectTest):
                 self.assertEqual(result.returncode, 1)
                 self.assert_untouched()
 
+    def test_a_whole_file_vault_holding_inline_values_refuses_before_any_write(self):
+        # Rekey would rotate only the outer blob; the nested value would stay on
+        # the old password while rekey reported success.
+        inner_ct = only("old-password").encrypt(b"nested-secret")
+        plaintext = inline("inner", inner_ct) + "plain: x\n"
+        self.write("nested.yml", only("old-password").encrypt(plaintext.encode()))
+        self.before["nested.yml"] = (self.dir / "nested.yml").read_bytes()
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                result = self.rotate(*extra)
+                self.refused(result, "inline vault value(s) pilfer cannot rotate")
+                self.assertIn("nested.yml", result.stderr)
+                self.assertEqual(result.returncode, 1)
+                self.assert_untouched()
+
     def test_a_symlinked_password_file_refuses_before_any_file_is_written(self):
         (self.dir / "old-pass").rename(self.dir / "real-pass")
         (self.dir / "old-pass").symlink_to("real-pass")
