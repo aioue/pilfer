@@ -1664,10 +1664,9 @@ def _read_no_follow(path: str, what: str) -> bytes:
 
 # Help layout, after gh and ripgrep: summary, Usage, Examples, then option
 # groups. argparse prints Usage first, so _Parser.format_help reorders.
-# Legacy spellings that still work but only clutter --help.
-_HIDDEN_ALIASES = frozenset(
-    {"--vault-pass-file", "--ask-vault-pass", "--no-include-encrypted-vars"}
-)
+# ansible-vault's short spellings. They work and are named in the help text,
+# not in the option column, where they made the -p line wrap.
+_HIDDEN_ALIASES = frozenset({"--vault-pass-file", "--ask-vault-pass"})
 
 
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
@@ -1696,6 +1695,9 @@ class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
         """'-p, --long METAVAR' rather than argparse's '-p METAVAR, --long METAVAR'."""
         if not action.option_strings:
             return super()._format_action_invocation(action)
+        if isinstance(action, argparse.BooleanOptionalAction):
+            # One "--[no-]name" entry instead of two flags.
+            return action.option_strings[0].replace("--", "--[no-]", 1)
         names = ", ".join(s for s in action.option_strings if s not in _HIDDEN_ALIASES)
         if action.nargs == 0:
             return names
@@ -1910,7 +1912,7 @@ def _add_vault_options(parser, help_text: str) -> None:
         dest="vault_password_files",
         metavar="FILE",
         type=_UNFRACK_PATH,
-        help=help_text,
+        help=f"{help_text}. Also --vault-pass-file",
     )
     exclusive.add_argument(
         "-J",
@@ -1919,7 +1921,7 @@ def _add_vault_options(parser, help_text: str) -> None:
         action="store_true",
         default=C.DEFAULT_ASK_VAULT_PASS,
         dest="ask_vault_pass",
-        help="Ask for the vault password (not with -p)",
+        help="Ask for the vault password (not with -p). Also --ask-vault-pass",
     )
 
 
@@ -2164,7 +2166,7 @@ def _build_argument_parser():
         "--include-encrypted-vars",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Rekey inline !vault values too (on by default; --no-include-encrypted-vars turns it off)",
+        help="Rekey inline !vault values too (default: on)",
     )
     rekey_parser.add_argument(
         "--dry-run",
