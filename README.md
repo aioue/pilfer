@@ -69,14 +69,14 @@ vault_password_file = ~/.ansible-vault/.vault-file
 
 ## Features
 
-- **Fail-safe and battle tested** - Power outages and fat fingers won't lose data
-- **Recursive** - Finds whole-file vaults anywhere under the current directory
-- **Inline `!vault` values** - Decrypted in place inside normal YAML, with `pilfer open --include-encrypted-vars`
-- **Clean diffs** - Only modified files are re-encrypted; unchanged files keep their original ciphertext
-- **Re-keying** - `pilfer rekey` re-encrypts all your vaults with a new password after a leak
-- **Native Ansible** - Uses Ansible's own code for vault operations and password loading, so no surprises
-- **Better than native** - `pilfer set` inserts a secret into a vault file in one command
-- **New in 3.0, keyring client** - Keep the vault password in the macOS Keychain or Linux Secret Service with `pilfer-vault-keyring-client` (needs the `pilfer[keyring]` extra)
+- **Fail-safe:** & battle tested. Power outages and fat-fingers won't lose data
+- **Recursive:** finds whole-file vaults anywhere under the current directory
+- **Supports inline `!vault` values:** decrypted in place inside normal YAML
+- **Clean diffs:** only modified files are re-encrypted
+- **Re-keying:** re-encrypts all your vaults with a new password after a leak
+- **Native Ansible:** uses Ansible's own code for operations - no surprises
+- **Better than native:** `pilfer set` inserts a key secret into a vault file in one command
+- **New in 3.0, keyring client:** keep the vault password in the macOS Keychain or Linux Secret Service
 
 ## Usage
 
