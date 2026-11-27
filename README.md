@@ -74,14 +74,14 @@ vault_password_file = ~/.ansible-vault/.vault-file
 
 ## Features
 
-- **Ansible's password sources** - Loads vault passwords the way `ansible-vault` does: `vault_password_file` and `vault_identity_list` from Ansible's config, `--vault-id`, password scripts and `-client` scripts
-- **System keyring** - `pilfer-vault-keyring-client`, a vault password client script for the macOS Keychain or Secret Service; needs the `pilfer[keyring]` extra
-- **Change detection** - Only re-encrypts files that were actually modified (using SHA256)
-- **Safe operation** - Preserves original encrypted content for unchanged files
-- **Ansible vault** - Calls Ansible's VaultLib. `pip install pilfer` installs ansible-core; a checkout needs it installed
-- **Binary data preservation** - Preserves exact line endings and formatting (critical for certificates)
-- **Inline `encrypt_string` support** - Opt-in via `pilfer open --include-encrypted-vars`; decrypts YAML `!vault` scalars in place (with `# pilfer:vault:N` markers); `close` always re-encrypts whatever the session opened
-- **Fail-closed sessions** - Refuses double-`open`, keeps session state if `close` partially fails, non-zero exit codes on errors
+- **Fail-safe:** & battle tested. Power outages and fat-fingers won't lose data
+- **Recursive:** finds whole-file vaults anywhere under the current directory
+- **Supports inline `!vault` values:** decrypted in place inside normal YAML
+- **Clean diffs:** only modified files are re-encrypted
+- **Re-keying:** re-encrypts all your vaults with a new password after a leak
+- **Native Ansible:** uses Ansible's own code for operations - no surprises
+- **Better than native:** `pilfer set` inserts a key secret into a vault file in one command
+- **New in 3.0, keyring client:** keep the vault password in the macOS Keychain or Linux Secret Service
 - **Extensible:** works with any client script, e.g. `age` with a YubiKey or Secure Enclave plugin
 
 ## Usage
