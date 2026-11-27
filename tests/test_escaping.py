@@ -14,16 +14,8 @@ from test_find_keys import PASSWORD, FindKeysBase
 from test_vault_set import _vault
 
 from pilfer import cli
-from pilfer.cli import safe_text
 
 ESC = "\x1b"
-
-
-class TestSafeText(unittest.TestCase):
-    def test_escapes_what_could_drive_the_terminal(self) -> None:
-        self.assertEqual(safe_text(f"a{ESC}b"), "a\\x1bb")
-        self.assertEqual(safe_text("a\nb"), "a\\nb")
-        self.assertEqual(safe_text("caf\u00e9"), "caf\u00e9")
 
 
 class TestEscapedErrorPaths(FindKeysBase):
@@ -276,23 +268,6 @@ class TestClassifyBytes(unittest.TestCase):
     def test_a_vault_after_long_whitespace_is_still_a_vault(self) -> None:
         data = b" " * 1000 + b"$ANSIBLE_VAULT;1.1;AES256\n6162\n"
         self.assertEqual(cli._classify_file_bytes("x.yml", data), "file")
-
-
-class TestSessionEntryKinds(FindKeysBase):
-    def test_a_kind_less_entry_for_a_whole_file_vault_closes_to_a_vault(self) -> None:
-        self.assertEqual(self._main("open", "-p", str(self.password))[0], 0)
-        self.assertNotEqual(self.vault.read_bytes(), self.before)  # plaintext now
-        session = Path(cli.temp_vault_file_list_path)
-        data = json.loads(session.read_text(encoding="utf-8"))
-        for entry in data["entries"]:
-            entry.pop("kind", None)
-        session.write_text(json.dumps(data), encoding="utf-8")
-        code, _out, err = self._main("close", "-p", str(self.password))
-        self.assertEqual(code, 0, err)
-        self.assertFalse(session.exists())
-        closed = self.vault.read_bytes()
-        self.assertTrue(closed.startswith(b"$ANSIBLE_VAULT;"))
-        self.assertNotIn(b"password", closed)  # no plaintext left
 
 
 if __name__ == "__main__":

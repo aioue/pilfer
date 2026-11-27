@@ -29,7 +29,6 @@ pilfer find-keys --json '*token*'
 - Keys that are inline `!vault` strings are skipped unless you pass `--include-encrypted-vars`.
 - Exit status: 0 a key matched, 1 none matched, 2 an error. An unreadable possible vault file, or a directory that could not be listed, is an error (exit 2); unreadable non-vault files only warn (a file over 64 MiB counts as unreadable only if its first 64 MiB holds `$ANSIBLE_VAULT;` or a pilfer marker). A vault header is recognised by `$ANSIBLE_VAULT` alone, as Ansible does. It exits 141 if its output pipe closes early.
 - With `--include-encrypted-vars`, `find-keys` warns about `!vault` values other than `key: !vault |` blocks: list items, flow values, `|-`, `|+` and `>` blocks, and JSON `__ansible_vault` values; their keys are not searched. `rekey` refuses while any exist, and refuses a whole-file vault whose plaintext holds inline vault values.
-- A file Ansible reads but pilfer's YAML parser rejects (often a tab where YAML wants a space) is listed by `find-keys`; `set` and `update` refuse it, and so do `open --include-encrypted-vars` and `close` on an inline file; a whole-file vault with a tab opens and closes normally. Replace the tab with spaces.
 - A whole-file vault with a binary file name (`.zip`, `.tar.gz`, `.bin`, `.db`, ...) is not rekeyed: `rekey` refuses while one is in the tree (use `ansible-vault rekey` or move it out), and `find-keys` and `open` warn. Symlinks are not followed, so `rekey` misses a vault reached only through a symlink to outside the tree.
 
 ## Change a value

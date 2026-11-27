@@ -251,8 +251,8 @@ def read_capped(path, what: str) -> bytes:
     return data
 
 
-def _read_closed_vault(path: Path) -> bytes:
-    """Refuse symlinks, pilfer sessions, and plaintext on disk. Returns ciphertext bytes."""
+def _read_unopened(path: Path) -> bytes:
+    """Refuse symlinks, non-files and files open in a pilfer session; return the bytes."""
     if path.is_symlink():
         # os.replace would turn the link into a regular file.
         raise PilferError(f"refusing to edit symlink {path}")
@@ -260,7 +260,12 @@ def _read_closed_vault(path: Path) -> bytes:
         raise PilferError(f"not a vault file: {path}")
     if os.path.exists(_open_sidecar_path(str(path))):
         raise PilferError(f"{path} is open in a pilfer session; run 'pilfer close' first")
-    original = read_capped(path, "vault file")
+    return read_capped(path, "vault file")
+
+
+def _read_closed_vault(path: Path) -> bytes:
+    """Like _read_unopened, and also refuse plaintext on disk. Returns ciphertext bytes."""
+    original = _read_unopened(path)
     if not is_whole_file_vault(original):
         # A file pilfer opened has its sidecar, refused above. This one was
         # never encrypted, or was decrypted by something other than pilfer.
@@ -638,13 +643,7 @@ def _check_value(key: str, value: str) -> None:
 @locked_by_path
 def _update_inline(path: Path, keypath: list, value: str, vault: VaultLib, check_only: bool) -> str:
     shown = _shown_path(keypath)
-    if path.is_symlink():
-        raise PilferError(f"refusing to edit symlink {path}")
-    if not path.is_file():
-        raise PilferError(f"not a vault file: {path}")
-    if os.path.exists(_open_sidecar_path(str(path))):
-        raise PilferError(f"{path} is open in a pilfer session; run 'pilfer close' first")
-    original = read_capped(path, "vault file")
+    original = _read_unopened(path)
     try:
         text, documents = _compose(original)
     except ValueError as exc:

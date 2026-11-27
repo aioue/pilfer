@@ -702,12 +702,15 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
     return result
 
 
-def _first_five(lines: list[str]) -> list[str]:
-    """The first five lines, then one saying how many more there are."""
-    shown = lines[:5]
-    if len(lines) > 5:
-        shown.append(f"and {len(lines) - 5} more (fix these and run again to see the rest)")
-    return shown
+# Per-file failure lines printed before the rest are summarised.
+MAX_FAILURE_LINES = 5
+_FIX_AND_RERUN = "and {n} more (fix these and run again to see the rest)"
+
+
+def _capped(lines: list[str], more: str) -> list[str]:
+    """The first MAX_FAILURE_LINES lines, then `more` (with {n} the rest), so a mass failure stays short."""
+    extra = len(lines) - MAX_FAILURE_LINES
+    return lines[:MAX_FAILURE_LINES] + ([more.format(n=extra)] if extra > 0 else [])
 
 
 def _describe_skipped_vault_values(scan: ProjectScan) -> str:
@@ -869,11 +872,12 @@ def open_vault_files(
     assert_no_orphaned_open_state(scan)
     unread_all = sorted(scan.unreadable + scan.unreadable_other)
     # It may be a vault; it stays as it is, so the user must know.
-    for line in _first_five(
+    for line in _capped(
         [
             f"Could not read {safe_text(path)} ({safe_text(reason)}); it was not opened."
             for path, reason in unread_all
-        ]
+        ],
+        _FIX_AND_RERUN,
     ):
         print(f"⚠️  {line}", file=sys.stderr)
     found = scan.targets
@@ -1627,7 +1631,9 @@ def rekey_vault_files(
     if blocked:
         shown = "\n".join(
             f"  {line}"
-            for line in _first_five([f"{safe_text(p)} ({safe_text(reasons[p])})" for p in blocked])
+            for line in _capped(
+                [f"{safe_text(p)} ({safe_text(reasons[p])})" for p in blocked], _FIX_AND_RERUN
+            )
         )
         raise PilferError(
             "Rekey refused: pilfer could not read these files, and one may be a vault "

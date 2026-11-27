@@ -266,7 +266,7 @@ pilfer close   # no flag needed; re-encrypts everything this session opened
 
 pilfer opens `key: !vault |` blocks. Ansible also reads `!vault` values other than `key: !vault |` blocks: list items, flow values, `|-`, `|+` and `>` blocks, and JSON `__ansible_vault` values (the format `ansible-inventory` writes); pilfer does not open or rewrite these, so they stay encrypted. `open` and `find-keys` name the files that have them, and `find-keys` says their keys are not searched.
 
-A vault header is recognised by `$ANSIBLE_VAULT` alone, as Ansible does. Pilfer's YAML parser is stricter than Ansible's: a file Ansible reads but pilfer rejects (often a tab where YAML wants a space, as in `port: 80<TAB># http`) is still listed by `find-keys`, while `set` and `update` refuse it, and so do `open --include-encrypted-vars` and `close` on an inline file; a whole-file vault with a tab opens and closes normally. Replace the tab with spaces (edit a whole-file vault with `ansible-vault edit`).
+A vault header is recognised by `$ANSIBLE_VAULT` alone, as Ansible does.
 
 `close` always re-encrypts session entries (whole-file and inline). The
 `--include-encrypted-vars` flag is only meaningful on `open`.

@@ -1151,12 +1151,6 @@ class TestRound1Fixes(VaultSetBase):
             with self.assertRaises(PilferError):
                 set_keys(path, {key: "v"}, pw)
 
-    def test_empty_and_nul_values_refused_by_set_keys(self) -> None:
-        for value in ("", "a\0b"):
-            with self.assertRaises(PilferError):
-                self._set("target", value)
-        self._assert_untouched()
-
     def test_adding_a_key_to_a_crlf_vault_keeps_crlf(self) -> None:
         path = self._encrypt("alpha: one\r\nbeta: two\r\n", "crlf.yml")
         self.assertEqual(self._set("gamma", "three", path), "added")

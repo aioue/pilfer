@@ -23,7 +23,9 @@ from dataclasses import dataclass
 from ansible.parsing.vault import AnsibleVaultFormatError
 
 from pilfer.cli import (
+    MAX_FAILURE_LINES,
     PilferError,
+    _capped,
     _classify_file_bytes,
     _describe_skipped_vault_values,
     _encrypted_backup_path,
@@ -53,15 +55,6 @@ from pilfer.vault_secrets import (
     vault_label,
 )
 from pilfer.vault_set import CHECK_PLACEHOLDER, DRY_RUN_UNCHECKED, _shown_path, read_capped
-
-# Per-file failure lines printed before the rest are summarised.
-MAX_FAILURE_LINES = 5
-
-
-def _capped(lines: list[str], more: str) -> list[str]:
-    """The first MAX_FAILURE_LINES lines, then `more` (with {n} the rest), so a mass failure stays short."""
-    extra = len(lines) - MAX_FAILURE_LINES
-    return lines[:MAX_FAILURE_LINES] + ([more.format(n=extra)] if extra > 0 else [])
 
 
 def _listing(names) -> str:
