@@ -1840,7 +1840,7 @@ def _build_argument_parser():
         # into tickets. Subparsers hand unrecognized arguments to this, the
         # top-level parser, so set needs no hook of its own.
         argv = getattr(parser, "_pilfer_argv", ())
-        if "set" in argv and _hides_unrecognized_set_value(message):
+        if ("set" in argv or "update" in argv) and _hides_unrecognized_set_value(message):
             parser.exit(2, f"{parser.prog}: error: put -- before a value that starts with -\n")
         argparse.ArgumentParser.error(parser, message)
 
@@ -1958,7 +1958,11 @@ def _build_argument_parser():
         epilog=_SET_EPILOG,
     )
     set_parser.add_argument("file", help="Whole-file vault YAML")
-    set_parser.add_argument("key", help="Top-level key to add or replace")
+    set_parser.add_argument(
+        "key",
+        help="Key to add or replace: a name, or a path such as aws.prod.key or users[0].password "
+        "(missing mappings along it are created)",
+    )
     set_parser.add_argument(
         "value",
         nargs="?",
@@ -1966,6 +1970,85 @@ def _build_argument_parser():
         "(use -- before a value with a leading dash)",
     )
     _add_vault_options(set_parser, _DEFAULT_PASSWORD_HELP)
+
+    find_parser = subparsers.add_parser(
+        "find-keys",
+        formatter_class=_HELP_FORMATTER,
+        help="list the keys in vault files whose names match, never their values",
+        description=(
+            "List key names in the project's vault files. Prints file and key path, "
+            "never a value, a length or a hash. Whole-file vaults are decrypted in "
+            "memory, so this shows key names that those vaults otherwise hide. "
+            "Exit status: 0 a key matched, 1 none matched, 2 an error."
+        ),
+    )
+    find_parser.add_argument(
+        "patterns",
+        nargs="*",
+        metavar="PATTERN",
+        help="match the whole key name, with * and ? wildcards; several patterns match "
+        "if any one does; no pattern lists every key",
+    )
+    find_parser.add_argument(
+        "-E",
+        "--regex",
+        action="store_true",
+        help="treat each pattern as a regular expression that matches anywhere in the name",
+    )
+    find_parser.add_argument(
+        "-i", "--ignore-case", action="store_true", help="ignore case when matching"
+    )
+    find_parser.add_argument(
+        "--path",
+        action="store_true",
+        help="match the full key path (such as aws.prod.key) instead of the last name",
+    )
+    find_parser.add_argument(
+        "--include-encrypted-vars",
+        action="store_true",
+        help="also list keys whose value is an inline !vault string",
+    )
+    find_parser.add_argument(
+        "-l",
+        "--files-with-matches",
+        action="store_true",
+        help="print only the names of files that have a match",
+    )
+    find_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print one JSON object per line: file, key, path, kind, open, vault_id",
+    )
+    _add_vault_options(find_parser, _DEFAULT_PASSWORD_HELP)
+
+    update_parser = subparsers.add_parser(
+        "update",
+        formatter_class=_HELP_FORMATTER,
+        help="replace the value of an existing key, found by name, in whichever vault holds it",
+        description=(
+            "Replace the value of a key that already exists, without opening a session. "
+            "Finds the file itself; if the key is in more than one file it lists them and "
+            "asks for --file. To create a key, use 'pilfer set FILE KEY'."
+        ),
+    )
+    update_parser.add_argument(
+        "key", help="Key name or path, such as db_password or aws.prod.secret_key"
+    )
+    update_parser.add_argument(
+        "value",
+        nargs="?",
+        help="New string value. Omit it to read stdin or get a hidden prompt "
+        "(use -- before a value with a leading dash)",
+    )
+    update_parser.add_argument(
+        "--file", metavar="FILE", help="only look in this vault file, to pick between several"
+    )
+    update_parser.add_argument(
+        "--include-encrypted-vars",
+        action="store_true",
+        help="also replace inline !vault values, keeping each one's vault id",
+    )
+    _add_vault_options(update_parser, _DEFAULT_PASSWORD_HELP)
 
     return parser
 
@@ -1995,6 +2078,13 @@ def main(argv=None):
     try:
         if args.action == "set":
             return _run_set(args)
+        if args.action in ("find-keys", "update"):
+            # Imported here: find_keys imports helpers from this module.
+            from pilfer import find_keys
+
+            if args.action == "find-keys":
+                return find_keys.run_find_keys(args)
+            return find_keys.run_update(args)
         with project_session_lock():
             if args.action == "open":
                 print("🔓 Searching for and decrypting vault files...")

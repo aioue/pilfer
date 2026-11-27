@@ -31,10 +31,10 @@ string is refused. Other values stay plain double-quoted scalars, the form line
 readers such as homelab's ha_token.py parse.
 """
 
+import copy
 import getpass
 import json
 import os
-import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -44,10 +44,13 @@ from ansible.parsing.vault import VaultLib
 
 from pilfer.cli import PilferError, _open_sidecar_path
 from pilfer.inline import (
+    _compose,
     find_inline_vault_spans,
+    format_encrypted_block,
     is_whole_file_vault,
     normalize_whole_file_vault,
 )
+from pilfer.key_paths import IDENTIFIER_RE, parse_key_path, render_key_path, walk_keys
 from pilfer.publish import locked_by_path, publish_vault
 from pilfer.vault_secrets import (
     RoundTripError,
@@ -57,7 +60,6 @@ from pilfer.vault_secrets import (
     vault_label,
 )
 
-KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 UNSAFE_TAG = "!unsafe"
 # Jinja's default block, variable and comment openers, which Ansible uses.
 JINJA_DELIMITERS = ("{{", "{%", "{#")
@@ -98,6 +100,7 @@ def set_keys(
     vault_password_file=None,
     *,
     check_only: bool = False,
+    create: bool = True,
 ) -> dict[str, str]:
     """Insert or replace top-level scalars in one encrypt. Returns key -> added/updated/unchanged.
 
@@ -106,7 +109,9 @@ def set_keys(
     Ansible's config as of import, then pilfer's fallback paths.
 
     All keys land in one write, so a crash cannot leave some of them set. A new
-    key is appended at the end. If nothing changes, the file bytes are left alone
+    key is appended at the end. A key may be a Jinja path (`aws.prod.key`,
+    `users[0].password`); missing mappings along it are created. create=False
+    refuses a key that does not exist (pilfer update). If nothing changes, the file bytes are left alone
     so git does not see a new vault blob. Error messages never contain a value or
     a decrypted line. Every refusal and failure is a PilferError.
 
@@ -130,7 +135,7 @@ def set_keys(
             raise PilferError(f"refusing a value for {key} that contains NUL")
 
     try:
-        return _set_keys(path, values, vault_password_file, check_only)
+        return _set_keys(path, values, vault_password_file, check_only, create)
     except VaultLabelError as exc:
         raise PilferError(str(exc)) from None
     except OSError as exc:
@@ -147,18 +152,19 @@ def set_keys(
 
 
 def _check_key(key: str) -> None:
-    if not isinstance(key, str) or not KEY_RE.fullmatch(key):
-        # The key slot is where a pasted secret shows up. Do not echo it.
-        raise PilferError("refusing key; use a single YAML identifier")
+    # parse_key_path never quotes the key: the key slot is where a pasted secret shows up.
+    top = parse_key_path(key)[0]
+    if not IDENTIFIER_RE.fullmatch(top):
+        raise PilferError("refusing key; a top-level name must be a YAML identifier")
     # YAML 1.1 reads yes/no/on/off/true/false/null keys as bools or None, so
     # `yes: x` would never be the key "yes" a playbook asks for.
-    if yaml.safe_load(key) != key:
+    if yaml.safe_load(top) != top:
         raise PilferError("refusing key; YAML reads it as a bool or null, not a name")
 
 
 @locked_by_path
 def _set_keys(
-    path: Path, values: Mapping[str, str], vault_password_file, check_only: bool
+    path: Path, values: Mapping[str, str], vault_password_file, check_only: bool, create: bool
 ) -> dict[str, str]:
     """The edit itself. No sidecar recheck before the write is needed: this holds
     vault_file_lock from its first read, and open writes its sidecar under it.
@@ -183,7 +189,7 @@ def _set_keys(
     actions = {}
     edited = text
     for key, value in values.items():
-        edited, actions[key] = _edit_plaintext(edited, key, value)
+        edited, actions[key] = _edit_plaintext(edited, key, value, create=create)
     if edited == text:
         if check_only:
             # A no-op edit used to return before the temp write, so a placeholder
@@ -260,12 +266,115 @@ def _load(text: str):
         loader.dispose()
 
 
-def _tagged(mapping: dict) -> dict:
-    # A plain str and an _Unsafe compare equal; the tag must match too.
-    return {k: (isinstance(v, _Unsafe), v) for k, v in mapping.items()}
+def _deep_tagged(obj):
+    """Structure with each string's !unsafe flag, at every depth.
+
+    A plain str and an _Unsafe compare equal; the tag must match too.
+    """
+    if isinstance(obj, dict):
+        return {k: _deep_tagged(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_tagged(v) for v in obj]
+    return (isinstance(obj, _Unsafe), obj)
 
 
-def _edit_plaintext(text: str, key: str, value: str) -> tuple[str, str]:
+_MISSING = object()
+
+
+def _value_at(obj, path: list):
+    """The loaded value at path, or _MISSING."""
+    for segment in path:
+        try:
+            obj = obj[segment]
+        except (KeyError, IndexError, TypeError):
+            return _MISSING
+    return obj
+
+
+def _assign(obj, path: list, value) -> None:
+    """Set value at path in a loaded structure, creating mappings for missing names."""
+    for segment in path[:-1]:
+        obj = obj[segment] if isinstance(segment, int) else obj.setdefault(segment, {})
+    obj[path[-1]] = value
+
+
+def _locate(root, path: list):
+    """Walk path through the composed document.
+
+    Returns (depth, container, target). target is the node at the whole path, or
+    None when a name is missing: depth is then the first missing segment and
+    container the mapping that should hold it (None for an empty document).
+    Refuses a parent that is not a mapping or list, a list index out of range, and
+    duplicate keys, none of which can be edited safely.
+    """
+    node = root
+    for depth, segment in enumerate(path):
+        if node is None:
+            return depth, None, None
+        where = render_key_path(path[:depth]) if depth else "the document"
+        if isinstance(segment, int):
+            if not isinstance(node, yaml.SequenceNode):
+                raise PilferError(f"{where} is not a list; refusing to index it")
+            if segment >= len(node.value):
+                raise PilferError(
+                    f"{where} has {len(node.value)} item(s); index {segment} is out of range"
+                )
+            child = node.value[segment]
+        else:
+            if not isinstance(node, yaml.MappingNode):
+                raise PilferError(f"{where} is not a mapping; refusing to replace it")
+            # The composer keeps duplicate keys that safe_load would silently collapse.
+            matches = [
+                value
+                for key, value in node.value
+                if isinstance(key, yaml.ScalarNode) and key.value == segment
+            ]
+            if len(matches) > 1:
+                raise PilferError(
+                    f"{render_key_path(path[: depth + 1])} appears {len(matches)} times; "
+                    "refusing to guess"
+                )
+            if not matches:
+                return depth, node, None
+            child = matches[0]
+        if depth == len(path) - 1:
+            return depth, node, child
+        node = child
+    raise AssertionError("empty path")  # parse_key_path never returns one
+
+
+def _after_last_line(text: str, node: yaml.Node) -> int:
+    """Offset of the line after node's last value, where a new sibling key goes.
+
+    Descends to the last scalar or flow collection, since a block collection's own
+    end mark can sit past trailing comments. Inserting after that line keeps an
+    inline comment on it. An alias would report its anchor's marks; the round-trip
+    check in _edit_plaintext refuses that edit.
+    """
+    while True:
+        if isinstance(node, yaml.MappingNode) and not node.flow_style and node.value:
+            node = node.value[-1][1]
+        elif isinstance(node, yaml.SequenceNode) and not node.flow_style and node.value:
+            node = node.value[-1]
+        else:
+            break
+    end = node.end_mark.index
+    if end > 0 and text[end - 1] == "\n":
+        return end
+    newline = text.find("\n", end)
+    return len(text) if newline < 0 else newline + 1
+
+
+def _yaml_key(name: str) -> str:
+    """A mapping key as YAML text: plain when YAML reads it back as the same string."""
+    if IDENTIFIER_RE.fullmatch(name) and yaml.safe_load(name) == name:
+        return name
+    return json.dumps(name, ensure_ascii=False)
+
+
+def _edit_plaintext(text: str, key: str, value: str, *, create: bool = True) -> tuple[str, str]:
+    path = parse_key_path(key)
+    shown = render_key_path(path)
     # YAML errors quote the offending line, which is vault plaintext. Constructors
     # also raise plain ValueError (a "2023-02-30" date names its digits), so catch
     # every Exception here and in the round-trip load below, and drop the detail.
@@ -279,17 +388,26 @@ def _edit_plaintext(text: str, key: str, value: str) -> tuple[str, str]:
     if not isinstance(old, dict) or not isinstance(root, yaml.MappingNode | None):
         raise PilferError("vault plaintext is not a YAML mapping")
 
-    # The composer keeps duplicate keys that safe_load would silently collapse.
-    nodes = [node for name, node in (root.value if root else []) if name.value == key]
-    if len(nodes) > 1:
-        raise PilferError(f"{key} appears {len(nodes)} times; refusing to guess")
+    depth, container, node = _locate(root, path)
+    if node is None:
+        if not create:
+            raise PilferError(f"{shown} does not exist")
+        if any(isinstance(segment, int) for segment in path[depth:]):
+            raise PilferError(
+                f"refusing to create {shown}: a list cannot be created here; "
+                "edit it in a pilfer open session"
+            )
+        if depth and container.flow_style:
+            raise PilferError(
+                f"refusing to add to {render_key_path(path[:depth])}: it is a flow mapping; "
+                "edit it in a pilfer open session"
+            )
 
     unsafe = any(delimiter in value for delimiter in JINJA_DELIMITERS)
     tagged = False
-    if nodes:
-        node = nodes[0]
+    if node is not None:
         if not isinstance(node, yaml.ScalarNode) or node.style in ("|", ">"):
-            raise PilferError(f"{key} is not a flow scalar; edit it in a pilfer open session")
+            raise PilferError(f"{shown} is not a flow scalar; edit it in a pilfer open session")
         tagged = node.tag == UNSAFE_TAG
     # !unsafe re-resolves the scalar as a plain YAML value. Keep the tag only
     # when Ansible would still load this string. Call the loader only when the
@@ -298,16 +416,16 @@ def _edit_plaintext(text: str, key: str, value: str) -> tuple[str, str]:
         stays = _ansible_keeps_string(value)
         if unsafe and not stays:
             raise PilferError(
-                f"refusing to write {key}: !unsafe would change the value Ansible loads"
+                f"refusing to write {shown}: !unsafe would change the value Ansible loads"
             )
         unsafe = unsafe or (tagged and stays)
-    if nodes and old.get(key) == value and tagged == unsafe:
+    if node is not None and _value_at(old, path) == value and tagged == unsafe:
         return text, "unchanged"
     # json.dumps gives a double-quoted scalar, so YAML 1.1 does not coerce yes/no/numbers.
     rendered = json.dumps(value, ensure_ascii=False)
     if unsafe:
         rendered = f"{UNSAFE_TAG} {rendered}"
-    if nodes:
+    if node is not None:
         # Replace only the scalar's span, so an inline comment on the line survives.
         # The span starts at a tag or anchor when there is one, so a kept !unsafe is
         # written again above and an anchor is dropped (an alias to it then fails
@@ -319,8 +437,19 @@ def _edit_plaintext(text: str, key: str, value: str) -> tuple[str, str]:
         new_text = text[:start] + rendered + text[end:]
         action = "updated"
     else:
-        separator = "\n" if text and not text.endswith("\n") else ""
-        new_text = f"{text}{separator}{key}: {rendered}\n"
+        # A missing name goes after the mapping's last line, indented like its keys;
+        # missing parents above it are created as nested mappings. At the top level
+        # that is the end of the file.
+        if depth:
+            indent = container.value[0][0].start_mark.column
+            position = _after_last_line(text, container)
+        else:
+            indent, position = 0, len(text)
+        names = path[depth:]
+        lines = [" " * (indent + 2 * i) + f"{_yaml_key(name)}:" for i, name in enumerate(names)]
+        lines[-1] += f" {rendered}"
+        separator = "\n" if position and text[position - 1] != "\n" else ""
+        new_text = f"{text[:position]}{separator}" + "\n".join(lines) + f"\n{text[position:]}"
         action = "added"
 
     # The quoted form cannot carry everything: U+0085 (NEL) is a YAML 1.1 line break and
@@ -329,13 +458,94 @@ def _edit_plaintext(text: str, key: str, value: str) -> tuple[str, str]:
     try:
         new = _load(new_text)
     except Exception:
-        raise PilferError(f"refusing to write {key}: edit did not produce valid YAML") from None
-    expected = {**old, key: _Unsafe(value) if unsafe else value}
-    if not isinstance(new, dict) or _tagged(new) != _tagged(expected):
+        raise PilferError(f"refusing to write {shown}: edit did not produce valid YAML") from None
+    expected = copy.deepcopy(old)
+    _assign(expected, path, _Unsafe(value) if unsafe else value)
+    if not isinstance(new, dict) or _deep_tagged(new) != _deep_tagged(expected):
         raise PilferError(
-            f"refusing to write {key}: YAML round-trip did not preserve the value or other keys"
+            f"refusing to write {shown}: YAML round-trip did not preserve the value or other keys"
         )
     return new_text, action
+
+
+def update_inline_value(
+    path: str | os.PathLike,
+    key: str,
+    value: str,
+    vault: VaultLib,
+    *,
+    check_only: bool = False,
+) -> str:
+    """Replace one inline `key: !vault |` value, re-encrypted under its existing label.
+
+    Only that value's block is rewritten; every other byte of the file stays, so
+    git sees one changed value. Same refusals and error contract as set_keys:
+    messages never carry a value. check_only stops before the final os.replace.
+    """
+    path = Path(path)
+    _check_value(key, value)
+    keypath = parse_key_path(key)
+    try:
+        return _update_inline(path, keypath, value, vault, check_only)
+    except OSError as exc:
+        raise PilferError(f"{exc.strerror}: {exc.filename or path}") from None
+
+
+def _check_value(key: str, value: str) -> None:
+    if not isinstance(value, str) or value == "":
+        raise PilferError(f"refusing an empty value for {key}")
+    if "\0" in value:
+        raise PilferError(f"refusing a value for {key} that contains NUL")
+
+
+@locked_by_path
+def _update_inline(path: Path, keypath: list, value: str, vault: VaultLib, check_only: bool) -> str:
+    shown = render_key_path(keypath)
+    if path.is_symlink():
+        raise PilferError(f"refusing to edit symlink {path}")
+    if not path.is_file():
+        raise PilferError(f"not a vault file: {path}")
+    if os.path.exists(_open_sidecar_path(str(path))):
+        raise PilferError(f"{path} is open in a pilfer session; run 'pilfer close' first")
+    original = path.read_bytes()
+    try:
+        text, documents = _compose(original)
+    except ValueError as exc:
+        raise PilferError(f"{path}: {exc}") from None
+    hits = [
+        found
+        for document in documents
+        for found in walk_keys(document)
+        if found.path == keypath and found.value_node.tag == "!vault"
+    ]
+    if len(hits) != 1:
+        raise PilferError(
+            f"{shown} is not a single inline !vault value in {path}"
+            if not hits
+            else f"{shown} appears {len(hits)} times in {path}; refusing to guess"
+        )
+    offset = len(text[: hits[0].value_node.start_mark.index].encode("utf-8"))
+    spans = [s for s in find_inline_vault_spans(original) if s.start <= offset < s.end]
+    if len(spans) != 1:
+        # `key: !vault "..."` and list items have no `!vault |` block to rewrite.
+        raise PilferError(f"{shown} in {path} is not in the `!vault |` block form pilfer rewrites")
+    span = spans[0]
+    try:
+        vault.decrypt(span.ciphertext)
+    except Exception:
+        raise PilferError(f"could not decrypt {shown} in {path} with this vault password") from None
+    try:
+        ciphertext = encrypt_like(vault, value.encode("utf-8"), span.ciphertext)
+    except RoundTripError:
+        raise PilferError(f"encryption did not round-trip; {path} unchanged") from None
+    except VaultLabelError as exc:
+        raise PilferError(str(exc)) from None
+    except Exception as exc:
+        raise PilferError(f"could not encrypt {path} ({type(exc).__name__}); unchanged") from None
+    block = format_encrypted_block(ciphertext, span.line_prefix, span.body_indent)
+    edited = original[: span.start] + block + original[span.end :]
+    publish_vault(path, edited, expected=original, action="update", publish=not check_only)
+    return "updated"
 
 
 def read_value(key: str) -> str:

@@ -525,7 +525,7 @@ class TestVaultSet(VaultSetBase):
         cases = [
             ("empty value", "target", ""),
             ("NUL", "target", "a\0b"),
-            ("dotted key", "a.b", SENTINEL),
+            ("dashed key", "a-b", SENTINEL),
             ("YAML key syntax", "a: b", SENTINEL),
             ("empty key", "", SENTINEL),
         ]
