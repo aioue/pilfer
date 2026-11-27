@@ -133,8 +133,8 @@ class TestFindKeys(FindKeysBase):
         first = records[0]
         self.assertEqual(set(first), {"file", "key", "path", "kind", "open", "vault_id"})
         self.assertEqual(
-            (first["file"], first["key"], first["kind"], first["open"]),
-            ("secrets.yml", "password", "file", False),
+            (first["file"], first["key"], first["kind"], first["open"], first["vault_id"]),
+            ("secrets.yml", "password", "file", False, "default"),
         )
 
     def test_files_with_matches(self) -> None:

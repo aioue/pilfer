@@ -132,7 +132,7 @@ pilfer find-keys --path 'aws.*.secret_key'
 pilfer find-keys --json '*token*'     # one JSON object per line
 ```
 
-A pattern matches the whole key name, and `*` and `?` are wildcards. With several patterns, a key matches if any one does. With none, every key is listed. `-E` treats patterns as regular expressions that match anywhere in the name, `-i` ignores case, and `--path` matches the full path (`aws.prod.secret_key`) instead of the last name. `-l` prints only file names. Each `--json` line has `file`, `key`, `path` (a list; list indexes are integers), `kind`, `open` and `vault_id`. The exit status is 0 when a key matched, 1 when none did and 2 on an error.
+A pattern matches the whole key name, and `*` and `?` are wildcards. With several patterns, a key matches if any one does. With none, every key is listed. `-E` treats patterns as regular expressions that match anywhere in the name, `-i` ignores case, and `--path` matches the full path (`aws.prod.secret_key`) instead of the last name. `-l` prints only file names. Each `--json` line has `file`, `key`, `path` (a list; list indexes are integers), `kind`, `open` and `vault_id`, which is `default` for a file with no vault label. The exit status is 0 when a key matched, 1 when none did and 2 on an error.
 
 A whole-file vault hides its key names from `grep`. `find-keys` decrypts each file in memory, so it shows those names to anyone who has the password. Pilfer prints no values and has no value search, which would let you guess a secret. Files open in a session are read from their plaintext and tagged `(open)`. Keys whose value is an inline `!vault` string are skipped unless you pass `--include-encrypted-vars`; they are tagged `(inline)`.
 

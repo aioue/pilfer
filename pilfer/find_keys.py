@@ -263,7 +263,9 @@ def run_find_keys(args) -> int:
                     "path": hit.path,
                     "kind": hit.kind,
                     "open": hit.open,
-                    "vault_id": hit.vault_id,
+                    # A 1.1 header has no label: ansible-vault writes one when it
+                    # encrypts under the id "default" (or none), so report that id.
+                    "vault_id": hit.vault_id or "default",
                 }
                 print(json.dumps(record, ensure_ascii=False))
             else:
