@@ -33,9 +33,10 @@ class CompletionScriptTests(unittest.TestCase):
         script = _script(shell)
         for name in COMMANDS:
             # A subcommand's own entry, not the word inside another command's text:
-            # zsh lists `  name:'help'`, bash a `_subparsers=(a b c)` array.
+            # zsh lists `  name:'help'` (shtab 1.7: `  "name:help"`), bash a
+            # `_subparsers=(a b c)` array.
             entry = (
-                rf"^\s+{re.escape(name)}:'"
+                rf"^\s+\"?{re.escape(name)}:"
                 if shell == "zsh"
                 else rf"_subparsers=\(.*\b{re.escape(name)}\b"
             )
