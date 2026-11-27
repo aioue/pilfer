@@ -2,3 +2,4 @@ include README.md
 include pilfer.py
 include PILFER_LICENSE.txt
 recursive-include pilfer *.py 
+recursive-include pilfer *.md

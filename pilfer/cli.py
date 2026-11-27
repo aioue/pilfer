@@ -6,6 +6,7 @@
 # pilfer [open|close|rekey|set]
 
 import argparse
+import contextlib
 import functools
 import hashlib
 import json
@@ -13,6 +14,7 @@ import os
 import re
 import stat
 import sys
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,8 +22,8 @@ import ansible.constants as C
 from ansible.parsing.vault import VaultLib, VaultSecret, is_encrypted
 from ansible.utils.path import unfrackpath
 
-from pilfer import __version__
-from pilfer.errors import PilferError
+from pilfer import __version__, completion
+from pilfer.errors import PilferError, safe_multiline, safe_text
 from pilfer.inline import (
     INLINE_FORMAT,
     MARKER_PREFIX,
@@ -30,11 +32,14 @@ from pilfer.inline import (
     InlineCloseRefusal,
     MarkerMissingSecretPresent,
     SecretLineDeleted,
+    block_newline,
+    count_vault_values,
     decrypt_inline_content,
     find_inline_vault_spans,
     format_encrypted_block,
     intentional_removal_candidate_names,
     is_whole_file_vault,
+    may_hold_vault_value,
     normalize_whole_file_vault,
     recrypt_inline_content,
     splice,
@@ -60,7 +65,6 @@ from pilfer.vault_secrets import (
     is_plain_password_file,
     load_new_secret,
     load_vault,
-    secret_for,
     single_secret_vault,
     vault_label,
 )
@@ -140,8 +144,11 @@ _SKIP_FILE_EXTENSIONS = frozenset(
     }
 )
 
-# Enough bytes to see `$ANSIBLE_VAULT;` even after a UTF-8 BOM and light leading WS.
-_VAULT_HEADER_READ_SIZE = 256
+# Leading bytes read to ask "does this file start as a vault?" (a session entry).
+# strip_leading_vault_noise skips any amount of leading
+# whitespace, so the read must be generous or whitespace would hide a
+# $ANSIBLE_VAULT header.
+_HEADER_READ_BYTES = 4096
 
 
 def _session_is_open() -> bool:
@@ -192,7 +199,7 @@ def _remove_file(path: str) -> None:
     except FileNotFoundError:
         pass
     except OSError as exc:
-        print(f"Warning: could not remove {path}: {exc.strerror}", file=sys.stderr)
+        print(f"Warning: could not remove {safe_text(path)}: {exc.strerror}", file=sys.stderr)
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -201,12 +208,14 @@ def _sha256_hex(data: bytes) -> str:
 
 def _validate_target_path(vaulted_file_path: str, cwd: Path) -> Path:
     path = Path(vaulted_file_path)
-    if path.is_symlink():
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        raise PilferError(f"Vault file does not exist: {vaulted_file_path}") from None
+    if stat.S_ISLNK(mode):
         raise PilferError(
             f"Refusing to operate on symlink (decrypt would write through it): {vaulted_file_path}"
         )
-    if not path.exists():
-        raise PilferError(f"Vault file does not exist: {vaulted_file_path}")
 
     resolved = path.resolve()
     try:
@@ -269,6 +278,12 @@ def _ensure_private_dir(path: str) -> None:
         pass
 
 
+_SESSION_LIST_RECOVERY = (
+    "To recover, restore the files from the .vault/ backups or fix "
+    f"{temp_vault_file_list_path}, then run pilfer close."
+)
+
+
 def _normalize_entries(data):
     """Return session entries from session JSON.
 
@@ -281,21 +296,27 @@ def _normalize_entries(data):
         return data["entries"]
     raise PilferError(
         f"{temp_vault_file_list_path} was written by an older pilfer or is damaged. "
-        "Close the session with the pilfer release that opened it."
+        "Close the session with the pilfer release that opened it. "
+        f"{_SESSION_LIST_RECOVERY}"
     )
 
 
 def _load_session():
-    with open(temp_vault_file_list_path) as vault_list_file:
-        data = json.load(vault_list_file)
+    try:
+        data = json.loads(_read_no_follow(temp_vault_file_list_path, "session list"))
+    except ValueError:
+        raise PilferError(
+            f"{temp_vault_file_list_path} is damaged. {_SESSION_LIST_RECOVERY}"
+        ) from None
     return _normalize_entries(data)
 
 
 def _emit_warning_block(title: str, detail: str) -> None:
     """Print a fail-closed warning with ⚠️ prefix and paragraph spacing."""
-    print(f"⚠️  {title}", file=sys.stderr)
+    # One escape layer: callers pass raw text, escaped here once.
+    print(f"⚠️  {safe_multiline(title)}", file=sys.stderr)
     print(file=sys.stderr)
-    detail = detail.strip()
+    detail = safe_multiline(detail).strip()
     if not detail:
         return
     parts = re.split(r"(?<=\.)\s+", detail)
@@ -309,9 +330,10 @@ def _emit_warning_block(title: str, detail: str) -> None:
 
 def _emit_inline_close_refusal(file_path: str, exc: InlineCloseRefusal) -> None:
     """Print structured inline close errors (marker missing vs secret line deleted)."""
+    file_path = safe_text(file_path)
     if isinstance(exc, MarkerMissingSecretPresent):
         print(f"⚠️  {file_path} — cannot close (marker missing)", file=sys.stderr)
-        print(f"  Variable:     {exc.var_name}", file=sys.stderr)
+        print(f"  Variable:     {safe_text(exc.var_name)}", file=sys.stderr)
         print(
             f"  Problem:      # pilfer:vault:{exc.span_id} marker was removed but the "
             "secret is still in the file.",
@@ -326,7 +348,7 @@ def _emit_inline_close_refusal(file_path: str, exc: InlineCloseRefusal) -> None:
     if isinstance(exc, SecretLineDeleted):
         print(f"⚠️  {file_path} — cannot close (secret line deleted)", file=sys.stderr)
         print(
-            f"  Variable:     {exc.var_name}  (# pilfer:vault:{exc.span_id})",
+            f"  Variable:     {safe_text(exc.var_name)}  (# pilfer:vault:{exc.span_id})",
             file=sys.stderr,
         )
         print("  Problem:      opened inline secret was removed from the file.", file=sys.stderr)
@@ -373,19 +395,22 @@ def _session_is_incomplete(entries) -> bool:
         return False
     saw_encrypted = False
     for entry in entries:
-        path = entry["path"]
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "rb") as handle:
-                data = handle.read()
-        except OSError:
+        data = _read_session_file(entry["path"])
+        if data is None:
             continue
         if _path_still_vault_ciphertext(entry, data):
             saw_encrypted = True
         else:
             return False
     return saw_encrypted
+
+
+def _read_session_file(path: str) -> bytes | None:
+    """The bytes of a session entry's file, or None if it is gone or unreadable."""
+    try:
+        return _read_no_follow(path, "session entry")
+    except PilferError:
+        return None
 
 
 class NothingOpened(PilferError):
@@ -424,8 +449,7 @@ def _require_close_password(entries, vault: SourceVault) -> None:
         backup = _encrypted_backup_path(entry["path"])
         if not os.path.isfile(backup):
             continue
-        with open(backup, "rb") as handle:
-            data = handle.read()
+        data = _read_no_follow(backup, "backup")
         if entry.get("kind") == "inline":
             ciphertexts = [span.ciphertext for span in find_inline_vault_spans(data)]
         else:
@@ -501,10 +525,11 @@ def _classify_file_bytes(file_path: str, data: bytes, include_encrypted_vars: bo
     """Classify from already-read bytes (avoids a second open during scan)."""
     if file_path.endswith(OPEN_SIDECAR_SUFFIX):
         return None
-    header = data[:_VAULT_HEADER_READ_SIZE]
-    if not header:
+    if not data:
         return None
-    if is_whole_file_vault(header):
+    # The whole buffer, not a prefix: a slice would let >256 bytes of leading
+    # whitespace hide the vault header from this check.
+    if is_whole_file_vault(data):
         return "file"
     if not include_encrypted_vars:
         return None
@@ -524,6 +549,43 @@ class ProjectScan:
     # (path, count) of !vault values Ansible reads that pilfer does not open.
     # Only collected with include_encrypted_vars.
     skipped_vault_values: list = field(default_factory=list)
+    # (path, strerror) of files that could not be opened. A vault file that is
+    # unreadable must not vanish from the result, so find-keys reports these.
+    unreadable: list = field(default_factory=list)
+    # Same, for files that cannot be a vault by extension: warned about, not failures.
+    unreadable_other: list = field(default_factory=list)
+
+
+# Largest file pilfer reads whole. A vault bigger than this is not a real one, and
+# reading it would let a planted file exhaust memory.
+MAX_READ_BYTES = 64 * 1024 * 1024
+
+
+def _too_large_message() -> str:
+    return f"too large (over {MAX_READ_BYTES // 2**20} MiB)"
+
+
+def _could_hold_vault(name: str) -> bool:
+    """Whether a file of this name can be a vault target, by name alone.
+
+    Ansible's YAML extensions (.yml, .yaml, .json by default) and extensionless
+    files. A dotfile with no extension (.env) does not count, but one with a
+    YAML extension (.vault.yml) does. marker_files keeps its own, wider test: a
+    marker in any dotfile or extensionless file is orphan evidence, and missing
+    one would fail open.
+    """
+    extension = os.path.splitext(name)[1].lower()
+    if not extension:
+        return not name.startswith(".")
+    return extension in C.YAML_FILENAME_EXTENSIONS
+
+
+def _is_regular_file(path: str) -> bool:
+    """True for a regular file, not a symlink, FIFO or device. lstat, so nothing is opened."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
 
 
 def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = True) -> ProjectScan:
@@ -532,7 +594,22 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
     result = ProjectScan()
     walk_dir = os.path.abspath(os.getcwd())
 
-    for dirpath, dirnames, filenames in os.walk(walk_dir):
+    def note_unreadable_dir(exc: OSError) -> None:
+        # os.walk skips a directory it cannot list. A vault could be inside, so
+        # find-keys must not report a clean result for the tree.
+        result.unreadable.append((exc.filename or walk_dir, exc.strerror or "unreadable"))
+
+    def note_unreadable(name: str, file_path: str, denylisted: bool, reason: str) -> None:
+        # Only a file that could hold a vault counts. A bad .pem, .txt or
+        # dotfile is a warning, not a failure.
+        if denylisted:
+            return
+        if _could_hold_vault(name):
+            result.unreadable.append((file_path, reason))
+        else:
+            result.unreadable_other.append((file_path, reason))
+
+    for dirpath, dirnames, filenames in os.walk(walk_dir, onerror=note_unreadable_dir):
         kept = []
         for d in dirnames:
             if d in _SKIP_DIR_NAMES:
@@ -542,7 +619,7 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
                 result.nested_skipped.append(child)
                 if announce_skips:
                     print(
-                        f"⏭️  Skipping nested git repo: {child}"
+                        f"⏭️  Skipping nested git repo: {safe_text(child)}"
                         f" (run 'pilfer open' from that directory instead)"
                     )
                 continue
@@ -551,7 +628,9 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
 
         for name in filenames:
             file_path = os.path.join(dirpath, name)
-            if os.path.islink(file_path):
+            # lstat, not islink: open() on a FIFO or device blocks the walk, and
+            # a symlink is never a target.
+            if not _is_regular_file(file_path):
                 continue
             # Sibling used by vault_file_lock (it can exist while another pilfer
             # runs, or after a killed one). Not a vault target.
@@ -564,24 +643,47 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
                 result.sidecar_files.append(file_path)
                 continue
             denylisted = _should_skip_by_extension(file_path)
+            # Markers count in YAML and extensionless Ansible files (group_vars/all)
+            # and in denylisted renames (.pyc, .db), which must still block open.
+            # Docs and scripts that quote the prefix are not orphan evidence.
+            marker_capable = denylisted or os.path.splitext(name)[1].lower() in (
+                ".yml",
+                ".yaml",
+                "",
+            )
             try:
                 with open(file_path, "rb") as open_file:
                     # Cap denylisted reads: markers are small ASCII; avoid
                     # slurping multi-GB binaries during orphan detection.
-                    data = open_file.read(1_048_576) if denylisted else open_file.read()
-            except OSError:
+                    data = open_file.read(1_048_576 if denylisted else MAX_READ_BYTES + 1)
+            except OSError as exc:
+                note_unreadable(name, file_path, denylisted, exc.strerror or "unreadable")
                 continue
             if not data:
                 continue
-            if marker in data:
-                # Markers in YAML and in extensionless Ansible files (group_vars/all)
-                # are orphan evidence. Docs and scripts that quote the prefix are
-                # not. Denylisted renames (.pyc, .db) must still block open.
-                _, ext = os.path.splitext(name)
-                ext_lc = ext.lower()
-                if ext_lc in (".yml", ".yaml", "") or denylisted:
-                    result.marker_files.append(file_path)
+            marker_found = marker in data and marker_capable
+            if marker_found:
+                result.marker_files.append(file_path)
+            if len(data) > MAX_READ_BYTES and not denylisted:
+                # Never classified as a target. One with no vault header and no
+                # marker in the part read (a 70 MB log or .csv) cannot hold a
+                # vault: skip it silently, so it does not block rekey or fail
+                # find-keys.
+                if VAULT_HEADER_PREFIX in data or marker_found:
+                    note_unreadable(name, file_path, denylisted, _too_large_message())
+                continue
             if denylisted:
+                # A vault under a binary file name (certs.tar.gz) is never a target,
+                # so rekey would skip it and report success with it still on the old
+                # password. Warn, so rekey refuses. data is the first 1 MiB only.
+                if is_whole_file_vault(data):
+                    result.unreadable_other.append(
+                        (
+                            file_path,
+                            "a vault with a binary file name; pilfer does not rekey it "
+                            "(use ansible-vault rekey, or move it out of the tree)",
+                        )
+                    )
                 continue
             # Staging leftovers are never vault targets, but may still carry
             # orphan markers above.
@@ -590,18 +692,33 @@ def scan_project(include_encrypted_vars: bool = False, announce_skips: bool = Tr
             kind = _classify_file_bytes(
                 file_path, data, include_encrypted_vars=include_encrypted_vars
             )
+            inline_scan = include_encrypted_vars and kind != "file"
             if kind:
                 result.targets.append({"kind": kind, "path": file_path})
-            if include_encrypted_vars and kind != "file":
+            if inline_scan:
                 skipped = vault_values_pilfer_skips(data)
                 if skipped:
                     result.skipped_vault_values.append((file_path, skipped))
     return result
 
 
+# Per-file failure lines printed before the rest are summarised.
+MAX_FAILURE_LINES = 5
+_FIX_AND_RERUN = "and {n} more (fix these and run again to see the rest)"
+
+
+def _capped(lines: list[str], more: str) -> list[str]:
+    """The first MAX_FAILURE_LINES lines, then `more` (with {n} the rest), so a mass failure stays short."""
+    extra = len(lines) - MAX_FAILURE_LINES
+    return lines[:MAX_FAILURE_LINES] + ([more.format(n=extra)] if extra > 0 else [])
+
+
 def _describe_skipped_vault_values(scan: ProjectScan) -> str:
     total = sum(count for _path, count in scan.skipped_vault_values)
-    shown = ", ".join(f"{path} ({count})" for path, count in scan.skipped_vault_values[:5])
+    shown = ", ".join(
+        f"{safe_text(os.path.relpath(path))} ({count})"
+        for path, count in sorted(scan.skipped_vault_values)[:5]
+    )
     more = " ..." if len(scan.skipped_vault_values) > 5 else ""
     return (
         f"{total} !vault value(s) that Ansible reads are in a form pilfer does not "
@@ -638,9 +755,9 @@ def _remove_stale_temps(root: str | None = None) -> int:
             if not _STALE_TEMP_RE.fullmatch(name):
                 continue
             path = os.path.join(dirpath, name)
+            if not _is_regular_file(path):
+                continue
             try:
-                if not stat.S_ISREG(os.lstat(path).st_mode):
-                    continue
                 os.unlink(path)
                 removed += 1
             except OSError:
@@ -753,8 +870,30 @@ def open_vault_files(
         include_encrypted_vars=include_encrypted_vars, announce_skips=announce_skips
     )
     assert_no_orphaned_open_state(scan)
+    unread_all = sorted(scan.unreadable + scan.unreadable_other)
+    # It may be a vault; it stays as it is, so the user must know.
+    for line in _capped(
+        [
+            f"Could not read {safe_text(path)} ({safe_text(reason)}); it was not opened."
+            for path, reason in unread_all
+        ],
+        _FIX_AND_RERUN,
+    ):
+        print(f"⚠️  {line}", file=sys.stderr)
     found = scan.targets
     if not found:
+        unread = len(scan.unreadable) + len(scan.unreadable_other)
+        if unread:
+            # An error, not "No vault files found": the vault may be among them.
+            raise PilferError(
+                f"No readable vault files found ({unread} could not be read, see above)"
+            )
+        if include_encrypted_vars and scan.skipped_vault_values:
+            # Unsupported !vault forms only: say so rather than hide them.
+            print(
+                f"⚠️  {_describe_skipped_vault_values(scan)}. They stay encrypted.",
+                file=sys.stderr,
+            )
         print("No vault files found in current directory tree.")
         return 0
 
@@ -940,7 +1079,7 @@ def decrypt_vault_files(vault_password_file_path=None, *, vault: VaultLib | None
                 _decrypt_whole_file(path, vault, cwd)
             succeeded.append(entry)
         except Exception as e:
-            print(f"Failed to decrypt {path}: {e}")
+            print(f"Failed to decrypt {safe_text(path)}: {safe_multiline(str(e))}")
             failed.append(path)
 
     if failed and not succeeded:
@@ -995,14 +1134,11 @@ def _recrypt_whole_file(
     encrypted_backup = _encrypted_backup_path(vaulted_file_path)
     hash_path = _hash_backup_path(vaulted_file_path)
 
-    with open(encrypted_backup, "rb") as f:
-        old_encrypted_data = f.read()
-
-    with open(hash_path) as f:
-        old_hash = f.read().strip()
-
-    with open(vaulted_file_path, "rb") as f:
-        new_data_bytes = f.read()
+    # _read_no_follow: a FIFO or link planted as the backup, hash or target must
+    # fail the close, not block it.
+    old_encrypted_data = _read_no_follow(encrypted_backup, "backup")
+    old_hash = _read_no_follow(hash_path, "hash backup").decode("utf-8", "replace").strip()
+    new_data_bytes = _read_no_follow(vaulted_file_path, "vault file")
 
     if old_hash != _sha256_hex(new_data_bytes):
         if is_whole_file_vault(new_data_bytes):
@@ -1015,14 +1151,14 @@ def _recrypt_whole_file(
                     "File is already vault-encrypted but not with the session password; "
                     "refusing to continue"
                 )
-            print(f"ℹ️  Already re-encrypted (retrying close): {vaulted_file_path}")
+            print(f"ℹ️  Already re-encrypted (retrying close): {safe_text(vaulted_file_path)}")
             return True
         # The secret that decrypts the backup, under its vault-id label (a 1.2
         # header stays 1.2), as ansible-vault edit does.
         new_encrypted_data = encrypt_like(
             vault, new_data_bytes, normalize_whole_file_vault(old_encrypted_data)
         )
-        print(f"ℹ️  Re-encrypting modified file: {vaulted_file_path}")
+        print(f"ℹ️  Re-encrypting modified file: {safe_text(vaulted_file_path)}")
         modified = True
     else:
         new_encrypted_data = old_encrypted_data
@@ -1059,12 +1195,13 @@ def _recrypt_inline_file(
     """
     _validate_target_path(vaulted_file_path, cwd)
 
-    with open(_hash_backup_path(vaulted_file_path)) as f:
-        old_hash = f.read().strip()
-    with open(_encrypted_backup_path(vaulted_file_path), "rb") as f:
-        backup = f.read()
-    with open(vaulted_file_path, "rb") as f:
-        current = f.read()
+    old_hash = (
+        _read_no_follow(_hash_backup_path(vaulted_file_path), "hash backup")
+        .decode("utf-8", "replace")
+        .strip()
+    )
+    backup = _read_no_follow(_encrypted_backup_path(vaulted_file_path), "backup")
+    current = _read_no_follow(vaulted_file_path, "vault file")
 
     if old_hash == _sha256_hex(current):
         publish_vault(
@@ -1076,8 +1213,7 @@ def _recrypt_inline_file(
     if current == backup:
         return False
 
-    with open(_inline_meta_path(vaulted_file_path)) as f:
-        meta = json.load(f)
+    meta = json.loads(_read_no_follow(_inline_meta_path(vaulted_file_path), "inline metadata"))
     if meta.get("format") != INLINE_FORMAT:
         raise PilferError(
             f"{vaulted_file_path} was opened by an older pilfer, which showed some secrets "
@@ -1103,7 +1239,9 @@ def _recrypt_inline_file(
             span_id = _span_id_for(removed_like[0], spans)
             if span_id is not None:
                 raise SecretLineDeleted(removed_like[0], span_id)
-        print(f"⏭️  Already re-encrypted inline file (retrying close): {vaulted_file_path}")
+        print(
+            f"⏭️  Already re-encrypted inline file (retrying close): {safe_text(vaulted_file_path)}"
+        )
         return True
 
     # recrypt_inline_content refuses (ValueError) unless its output reads back
@@ -1116,19 +1254,19 @@ def _recrypt_inline_file(
     if result.removed_vars:
         print(f"🔍 Detected removal of {len(result.removed_vars)} encrypted vars:")
         for name in result.removed_vars:
-            print(f"  - {name}")
+            print(f"  - {safe_text(name)}")
 
     if result.modified_count > len(result.removed_vars):
         changed = result.modified_count - len(result.removed_vars)
         print(
-            f"ℹ️  Re-encrypting modified inline vault string(s) in: {vaulted_file_path}"
+            f"ℹ️  Re-encrypting modified inline vault string(s) in: {safe_text(vaulted_file_path)}"
             f" ({changed} changed)"
         )
 
     for name, yaml_type in result.typed_notes:
         # Never the value: it is a secret.
         print(
-            f"ℹ️  {name}: stored as a string, though plain YAML would read it as {yaml_type}. "
+            f"ℹ️  {safe_text(name)}: stored as a string, though plain YAML would read it as {yaml_type}. "
             "An inline !vault value is always a string; convert it where it is used "
             "(for example | int or | bool)."
         )
@@ -1150,6 +1288,16 @@ def _cleanup_entry_backups(vaulted_file_path: str) -> None:
         pass  # not empty: close reports what is left in .vault
 
 
+def _never_opened(entry) -> bool:
+    """True for an entry an interrupted open never reached (see _drop_never_opened)."""
+    if _entry_has_open_artifacts(entry):
+        return False
+    data = _read_session_file(entry["path"])
+    if data is None:
+        return False
+    return _path_still_vault_ciphertext(entry, data)
+
+
 def _drop_never_opened(entries):
     """Leave out entries an interrupted open never reached.
 
@@ -1160,16 +1308,9 @@ def _drop_never_opened(entries):
     """
     kept = []
     for entry in entries:
-        path = entry["path"]
-        if not _entry_has_open_artifacts(entry):
-            try:
-                with open(path, "rb") as handle:
-                    data = handle.read()
-            except OSError:
-                data = None
-            if data is not None and _path_still_vault_ciphertext(entry, data):
-                print(f"ℹ️  Skipping {path}: it was never opened.")
-                continue
+        if _never_opened(entry):
+            print(f"ℹ️  Skipping {safe_text(entry['path'])}: it was never opened.")
+            continue
         kept.append(entry)
     return kept
 
@@ -1209,9 +1350,17 @@ def recrypt_vault_files(vault_password_file_path=None, confirm_delete: bool = Fa
                     path, vault, cwd, confirm_delete=confirm_delete, restore=restore
                 ):
                     modified_count += 1
-            else:
-                if _recrypt_whole_file(path, vault, cwd, restore):
-                    modified_count += 1
+            elif not os.path.lexists(path):
+                # Deleted while open: drop it on request, or say how to get out.
+                if not confirm_delete:
+                    raise PilferError(
+                        f"{path} was deleted while open; restore it from git "
+                        "and run 'pilfer close' again, or run 'pilfer close --confirm-delete' "
+                        "to drop it from the session"
+                    )
+                print(f"Dropped deleted file from the session: {path}")
+            elif _recrypt_whole_file(path, vault, cwd, restore):
+                modified_count += 1
             # Persist session removal before deleting backups so a crash mid-close
             # leaves a retryable list (already-closed files are not re-listed).
             remaining = [e for e in remaining if e["path"] != path]
@@ -1266,7 +1415,7 @@ class NewSecret:
 
 
 def _rekey_probe_file(
-    path: str, kind: str, old_vault: VaultLib, new: NewSecret
+    path: str, kind: str, old_vault: VaultLib, new: NewSecret, include_inline: bool
 ) -> tuple[str, int, set[bytes]]:
     """Classify a target for rekey resume.
 
@@ -1275,8 +1424,7 @@ def _rekey_probe_file(
     secret that decrypts a value, so rekey can refuse a tree on several.
     Raises PilferError if neither password decrypts the file cleanly.
     """
-    with open(path, "rb") as handle:
-        data = handle.read()
+    data = _read_no_follow(path, "vault file")
     if kind == "inline":
         ciphertexts = [span.ciphertext for span in find_inline_vault_spans(data)]
         if not ciphertexts:
@@ -1284,9 +1432,24 @@ def _rekey_probe_file(
     else:
         ciphertexts = [normalize_whole_file_vault(data)]
     try:
-        used = {secret_for(old_vault, c).bytes for c in ciphertexts}
+        used = set()
+        for c in ciphertexts:
+            plaintext, _, secret = old_vault.decrypt_and_get_vault_id(c)
+            used.add(secret.bytes)
     except Exception:
         used = None
+    # --no-include-encrypted-vars leaves inline values alone, nested ones included.
+    if used is not None and kind != "inline" and include_inline and may_hold_vault_value(plaintext):
+        # Rekey rotates the outer blob only. Inline values inside the plaintext
+        # would stay on the old password while rekey reported success.
+        # (A whole-file vault has one ciphertext, so plaintext is its plaintext.)
+        nested = count_vault_values(plaintext.decode("utf-8", "replace"))
+        if nested:
+            raise PilferError(
+                f"{path} is a whole-file vault that contains {nested} inline vault "
+                "value(s) pilfer cannot rotate inside it. Decrypt it with ansible-vault, "
+                "rekey, and re-encrypt it, or move the file out of the tree."
+            )
     if used is not None:
         return "needs_rekey", len(ciphertexts), used
     if all(new.decrypts(c) for c in ciphertexts):
@@ -1299,8 +1462,7 @@ def _rekey_probe_file(
 
 @locked_by_path
 def _rekey_whole_file(path: str, old_vault: VaultLib, new: NewSecret) -> None:
-    with open(path, "rb") as handle:
-        data = handle.read()
+    data = _read_no_follow(path, "vault file")
     normalized = normalize_whole_file_vault(data)
     plaintext = old_vault.decrypt(normalized)
     # encrypt_with reads the result back with the new secret alone.
@@ -1310,8 +1472,7 @@ def _rekey_whole_file(path: str, old_vault: VaultLib, new: NewSecret) -> None:
 
 @locked_by_path
 def _rekey_inline_file(path: str, old_vault: VaultLib, new: NewSecret) -> int:
-    with open(path, "rb") as handle:
-        content = handle.read()
+    content = _read_no_follow(path, "vault file")
     spans = find_inline_vault_spans(content)
     if not spans:
         raise PilferError(f"No inline vault spans found in {path}")
@@ -1325,7 +1486,12 @@ def _rekey_inline_file(path: str, old_vault: VaultLib, new: NewSecret) -> int:
             (
                 span.start,
                 span.end,
-                format_encrypted_block(new_cipher, span.line_prefix, span.body_indent),
+                format_encrypted_block(
+                    new_cipher,
+                    span.line_prefix,
+                    span.body_indent,
+                    block_newline(span.encrypted),
+                ),
             )
         )
     new_content = splice(content, replacements)
@@ -1462,11 +1628,32 @@ def rekey_vault_files(
         include_encrypted_vars=include_encrypted_vars, announce_skips=announce_skips
     )
     assert_no_orphaned_open_state(scan)
+    # A vault pilfer could not read would stay on the old password while rekey
+    # reports success, and --rotate-password-file would then strand it. A whole
+    # file vault can be named key.pem or secret.txt, so files that cannot be a
+    # vault by name count too: pilfer cannot tell without reading them.
+    reasons: dict[str, str] = {}
+    for p, reason in scan.unreadable + scan.unreadable_other:
+        reasons.setdefault(os.path.relpath(p), reason)
+    blocked = sorted(reasons)
+    if blocked:
+        shown = "\n".join(
+            f"  {line}"
+            for line in _capped(
+                [f"{safe_text(p)} ({safe_text(reasons[p])})" for p in blocked], _FIX_AND_RERUN
+            )
+        )
+        raise PilferError(
+            "Rekey refused: pilfer could not read these files, and one may be a vault "
+            "that would stay on the old password:\n"
+            f"{shown}\n"
+            "Fix the permissions or size, or move it out of the tree."
+        )
     if scan.skipped_vault_values:
         raise PilferError(
             f"Rekey refused: {_describe_skipped_vault_values(scan)}. They would stay on the "
-            "old password. Rewrite them as `key: !vault |` blocks, or rekey them with "
-            "ansible-vault, first."
+            "old password. Rewrite them as `key: !vault |` blocks, rekey them with "
+            "ansible-vault, or move the file out of the tree, first."
         )
     targets = scan.targets
     if not targets:
@@ -1495,7 +1682,9 @@ def rekey_vault_files(
         path = entry["path"]
         kind = entry.get("kind", "file")
         _validate_target_path(path, cwd)
-        status, span_count, used = _rekey_probe_file(path, kind, old_vault, new)
+        status, span_count, used = _rekey_probe_file(
+            path, kind, old_vault, new, include_encrypted_vars
+        )
         plan.append((path, kind, span_count, status))
         used_secrets |= used
 
@@ -1534,7 +1723,10 @@ def rekey_vault_files(
     if dry_run:
         for path, kind, n, status in plan:
             tag = "skip" if status == "already_new" else "rewrite"
-            print(f"  - [{kind}/{tag}] {path}" + (f" ({n} spans)" if kind == "inline" else ""))
+            print(
+                f"  - [{kind}/{tag}] {safe_text(path)}"
+                + (f" ({n} spans)" if kind == "inline" else "")
+            )
         print("Dry run only - no files written.")
         return 0
 
@@ -1563,7 +1755,7 @@ def rekey_vault_files(
     failed = []
     for path, kind, _n, status in plan:
         if status == "already_new":
-            print(f"⏭️  Already on new password (resume): {path}")
+            print(f"⏭️  Already on new password (resume): {safe_text(path)}")
             continue
         try:
             if kind == "inline":
@@ -1571,9 +1763,9 @@ def rekey_vault_files(
             else:
                 _rekey_whole_file(path, old_vault, new)
             succeeded.append(path)
-            print(f"✅  Re-keyed {path}")
+            print(f"✅  Re-keyed {safe_text(path)}")
         except Exception as exc:
-            print(f"Failed to rekey {path}: {exc}")
+            print(f"Failed to rekey {safe_text(path)}: {safe_multiline(str(exc))}")
             failed.append(path)
 
     if failed:
@@ -1595,6 +1787,10 @@ def _confirm_rekey(yes: bool, *, action: str) -> None:
     """Require interactive REKEY confirmation unless --yes."""
     if yes:
         return
+    # input() reads stdin. Piped, that is whatever the pipe holds, so a script
+    # could "confirm" by accident; make it say --yes on purpose.
+    if sys.stdin is None or not sys.stdin.isatty():
+        raise PilferError("Confirmation required: there is no terminal to ask on; pass --yes.")
     try:
         answer = input(f"Type REKEY to {action}: ")
     except EOFError as exc:
@@ -1652,95 +1848,291 @@ def _still_holds(path: str, contents: bytes) -> bool:
         return False
 
 
-def _read_no_follow(path: str, what: str) -> bytes:
+def _read_no_follow(path: str, what: str, limit: int | None = None) -> bytes:
+    """Read a file without following a symlink, up to limit bytes."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as exc:
         raise PilferError(f"could not read {what}: {exc.strerror}") from None
     with os.fdopen(fd, "rb") as handle:
-        return handle.read()
+        return handle.read() if limit is None else handle.read(limit)
 
 
-_HELP_FORMATTER = argparse.RawDescriptionHelpFormatter
+# Help layout, after gh and ripgrep: summary, Usage, Examples, then option
+# groups. argparse prints Usage first, so _Parser.format_help reorders.
+# ansible-vault's short spellings. They work and are named in the help text,
+# not in the option column, where they made the -p line wrap.
+_HIDDEN_ALIASES = frozenset({"--vault-pass-file", "--ask-vault-pass"})
 
-_HELP_EPILOG = """
-Vault passwords load as ansible-vault loads them: vault_identity_list, then
---vault-id, then -p files, then vault_password_file from Ansible's config
-(ANSIBLE_CONFIG, ./ansible.cfg, ~/.ansible.cfg, ANSIBLE_VAULT_* variables),
-then the -J prompt.
-An executable password file named by a flag or config is run and its output
-used; a *-client script is passed --vault-id. With no source at all, pilfer
-tries ~/.ansible-vault/.vault-file, .vault_password, vault_password_file, and
-finally ../../vault_password_file, reading each as a plain password file:
-those are never run, even when executable.
 
-Never commit while a session is open. Add vaultedFileList.json, .vault/,
-*.pilfer-open sidecars and *.pilfer-lock files (left only when pilfer is
-killed) to your project's .gitignore. Check the exit code of close.
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def __init__(self, prog, **kwargs):
+        # Wide enough that "-p, --vault-password-file FILE" keeps its help on one line.
+        kwargs.setdefault("max_help_position", 32)
+        super().__init__(prog, **kwargs)
 
-Run 'pilfer COMMAND --help' for command-specific options and examples.
-"""
+    def add_usage(self, usage, actions, groups, prefix=None):
+        # add_subparsers passes prefix="" to build each subcommand's prog.
+        super().add_usage(usage, actions, groups, "Usage: " if prefix is None else prefix)
 
-_OPEN_EPILOG = """
+    def _split_lines(self, text, width):
+        # break_on_hyphens off: a flag such as --no-include-encrypted-vars must not split.
+        text = self._whitespace_matcher.sub(" ", text).strip()
+        return textwrap.wrap(text, width, break_on_hyphens=False)
+
+    def _format_action(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            # List the commands without argparse's "COMMAND" header line.
+            parts = [super()._format_action(sub) for sub in action._get_subactions()]
+            return "".join(parts)
+        return super()._format_action(action)
+
+    def _format_action_invocation(self, action):
+        """'-p, --long METAVAR' rather than argparse's '-p METAVAR, --long METAVAR'."""
+        if not action.option_strings:
+            return super()._format_action_invocation(action)
+        if isinstance(action, argparse.BooleanOptionalAction):
+            # One "--[no-]name" entry instead of two flags.
+            return action.option_strings[0].replace("--", "--[no-]", 1)
+        names = ", ".join(s for s in action.option_strings if s not in _HIDDEN_ALIASES)
+        if action.nargs == 0:
+            return names
+        return (
+            f"{names} {self._format_args(action, self._get_default_metavar_for_optional(action))}"
+        )
+
+
+class _Parser(argparse.ArgumentParser):
+    """Help reads: summary, Usage, Examples (epilog), option groups, then notes."""
+
+    def __init__(self, *args, notes: str = "", **kwargs):
+        kwargs.setdefault("formatter_class", _HelpFormatter)
+        kwargs["add_help"] = False
+        super().__init__(*args, **kwargs)
+        self._notes = notes
+        self._optionals.title = "Options"
+        self._positionals.title = "Arguments"
+        self.add_argument("-h", "--help", action="help", help="Show this help")
+
+    def format_help(self):
+        formatter = self._get_formatter()
+        formatter.add_text(self.description)
+        formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
+        formatter.add_text(self.epilog)
+        for group in self._action_groups:
+            formatter.start_section(group.title)
+            formatter.add_text(group.description)
+            formatter.add_arguments(group._group_actions)
+            formatter.end_section()
+        formatter.add_text(self._notes)
+        return formatter.format_help()
+
+
+_TOP_EXAMPLES = """
 Examples:
-  pilfer open
-  pilfer open --include-encrypted-vars
-  pilfer open --include-encrypted-vars --quiet
-  pilfer open -p ~/.ansible-vault/.vault-file
-
-Whole-file vault YAML is opened by default. With --include-encrypted-vars, inline
-!vault / encrypt_string scalars become quoted plaintext plus a # pilfer:vault:N
-marker (leave the marker until close).
+  pilfer open                           decrypt the vault files in this tree
+  pilfer close                          re-encrypt them when you are done
+  pilfer status                         is anything still decrypted?
+  pilfer find-keys '*token*'            which vault files hold a key like this
+  pilfer set secrets.yml db_password    change one key without opening anything
+  pilfer agent-guide                    usage notes for AI coding agents
 """
 
-_CLOSE_EPILOG = """
+_TOP_NOTES = """
+Run 'pilfer COMMAND --help' for a command's options.
+Vault passwords load the way ansible-vault loads them; the README has the order.
+Never commit while a session is open, and check close's exit status.
+"""
+
+_OPEN_EXAMPLES = """
+Examples:
+  pilfer open                               whole-file vaults only
+  pilfer open --include-encrypted-vars      inline !vault values too
+  pilfer open -p ~/.ansible-vault/.vault-file
+"""
+
+_OPEN_NOTES = """
+With --include-encrypted-vars, each inline !vault value becomes quoted plaintext
+followed by a '# pilfer:vault:N' marker. Leave the marker in place: close uses
+it to re-encrypt the value.
+"""
+
+_CLOSE_EXAMPLES = """
 Examples:
   pilfer close
-  pilfer close --confirm-delete
+  pilfer close --confirm-delete             accept deleted inline values
   pilfer close -p ~/.ansible-vault/.vault-file
-
-Re-encrypts every entry recorded in the open session (whole-file and inline).
-No --include-encrypted-vars flag is needed on close. Each edited value is
-encrypted with the vault id and password that decrypt its backup, as
-ansible-vault edit does, so close needs the same sources as open.
 """
 
-_SET_EPILOG = """
+_CLOSE_NOTES = """
+Close re-encrypts whatever open decrypted, inline values included, so it needs
+no --include-encrypted-vars. Each edited value is encrypted with the vault id
+and password that decrypted it, as ansible-vault edit does, so close needs the
+same password sources as open.
+"""
+
+_STATUS_EXAMPLES = """
 Examples:
-  pilfer set inventory/group_vars/all/secrets.yml db_password
-      (prompts for the value without echoing it)
+  pilfer status                             is a session open, and which files
+  pilfer status --json                      the same as one JSON object
+"""
+
+_STATUS_NOTES = """
+Status reads the session list in the current directory. It prints paths, never
+values, needs no vault password and changes nothing. The text view tags each
+file whole-file or inline; --json calls these file and inline.
+
+An incomplete session is one where open was interrupted before it decrypted
+anything; 'pilfer close' clears it. Orphaned means .vault/ holds backups but
+there is no session list (an open that was not closed): run 'pilfer open' for
+recovery steps. --json showing "open": true with an empty
+files list means nothing holds plaintext; 'pilfer close' clears the list.
+
+Exit status: 0 on success (open or not), 2 on an error.
+"""
+
+_SET_EXAMPLES = """
+Examples:
+  pilfer set secrets.yml db_password        prompts for the value, hidden
+  pilfer set secrets.yml aws.prod.secret_key
+  pilfer set secrets.yml 'users[0].password'
   printf '%s' "$TOKEN" | pilfer set secrets.yml api_token
   pilfer set secrets.yml api_token -- '-starts-with-a-dash'
-
-Sets one top-level key in a closed whole-file vault without writing plaintext to
-disk. A new key is appended; an existing scalar is replaced in place, keeping an
-inline comment. The value is stored as a JSON-quoted string, so yes/no/0123 stay
-strings. A value containing {{, {% or {# is stored as !unsafe so Ansible does
-not template it. An existing !unsafe tag is kept only when Ansible would still
-load the new text as that string; otherwise the tag is dropped. A value that
-needs !unsafe and would not stay a string is refused. Refuses plaintext and
-files open in a pilfer session.
-
-Leave VALUE out to read it from stdin: a hidden prompt on a terminal, otherwise
-the whole input with one trailing newline dropped. A VALUE argument is visible
-in ps and saved in shell history.
+  pilfer set --dry-run secrets.yml db_password      check only, read no value
 """
 
-_REKEY_EPILOG = """
+_SET_NOTES = """
+KEY is a name or a Jinja-style path: aws.prod.secret_key, users[0].password,
+aws['key.with.dots']. Missing mappings along a path are created. A new key is
+appended; an existing scalar is replaced in place, keeping its inline comment.
+
+The value is stored as a quoted string, so yes, no and 0123 stay strings. A
+value containing {{, {% or {# is stored as !unsafe so Ansible does not template
+it. An existing !unsafe tag is kept only when Ansible would still load the new
+text as that string, and a value that needs !unsafe but would not stay a string
+is refused.
+
+set refuses:
+  - a plaintext file, and a file open in a pilfer session
+  - a new top-level name that is not a YAML identifier or that YAML reads as a
+    bool or null
+  - a path through a non-mapping, a missing list index, or a flow mapping
+  - a key path that touches a YAML anchor, alias or << merge, and a target
+    that is a mapping, list or block scalar (not a single value): use a pilfer
+    open session
+
+Leave VALUE out to read it from stdin: a hidden prompt on a terminal, otherwise
+the whole input minus one trailing newline. A VALUE argument shows in ps and in
+shell history.
+
+Without a terminal, set stops with an error instead of waiting: when nothing is
+on stdin, and when a password prompt (-J, --vault-id LABEL@prompt) has nobody to
+answer it. Use -p FILE or --vault-id LABEL@FILE and pipe the value in.
+
+A value that is already stored is left alone: the file is not rewritten and set
+prints "unchanged". --dry-run runs the same checks, prints what would be added
+or updated and writes nothing. It needs the vault password. A VALUE on the
+command line is checked too (empty, NUL, a value YAML would not store back
+unchanged); without one it reads no stdin and checks only the file and key, and
+says so.
+
+Exit status: 0 done (or unchanged), 1 refused or failed, 2 usage error.
+"""
+
+_FIND_EXAMPLES = """
 Examples:
-  pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --dry-run
-  pilfer rekey --old-vault-password-file OLD --new-vault-password-file NEW --yes
+  pilfer find-keys db_password          exact name
+  pilfer find-keys '*token*'            glob (quote it)
+  pilfer find-keys -E '^ha_(url|token)$'
+  pilfer find-keys --path 'aws.*.secret_key'
+  pilfer find-keys --json '*token*'     one JSON object per line, for scripts
+"""
+
+_FIND_NOTES = """
+Do not put an option between patterns: 'find-keys --json a b', not
+'find-keys a --json b'.
+A pattern matches the whole key name. Several patterns match if any one does,
+and no pattern lists every key. Files that are open in a session are read from
+their plaintext and tagged (open).
+
+Exit status: 0 a key matched, 1 none matched, 2 an error.
+"""
+
+_UPDATE_EXAMPLES = """
+Examples:
+  pilfer update db_password                 prompts for the value, hidden
+  pilfer update aws.prod.secret_key
+  pilfer update db_password --file inventory/group_vars/prod/secrets.yml
+  printf '%s' "$TOKEN" | pilfer update api_token
+  pilfer update --dry-run db_password       which file changes; reads no value
+"""
+
+_UPDATE_NOTES = """
+Update finds the file that holds KEY. If several files do, it lists them and
+asks for --file. It never creates a key: use 'pilfer set FILE KEY' for that.
+Value rules, the leading-dash rule and the anchor, merge and non-scalar target
+refusals are the same as for 'pilfer set'.
+It refuses when a file it could not read or decrypt might hold the key; pass
+--file FILE.
+Files open in a pilfer session are refused. Without a terminal, update stops
+with an error instead of waiting, as set does. A value that is already stored
+prints "unchanged" and the file is not rewritten. --dry-run prints "would
+update" and writes nothing.
+
+Exit status: 0 done (or unchanged), 1 refused or failed, 2 usage error.
+"""
+
+_REKEY_EXAMPLES = """
+Examples:
+  pilfer rekey --dry-run \\
+      --old-vault-password-file OLD --new-vault-password-file NEW
+  pilfer rekey --yes \\
+      --old-vault-password-file OLD --new-vault-password-file NEW
   pilfer rekey --new-vault-id prompt
-  pilfer rekey ... --quiet
+"""
 
-The old password loads like open: --old-vault-password-file and --old-vault-id
-plus Ansible's config. The new password is the one --new-* source. Values keep
-their vault-id label unless --new-vault-id names one. A tree on several vault
-passwords is refused.
+_REKEY_NOTES = """
+The old password loads as it does for open: --old-vault-password-file,
+--old-vault-id and Ansible's config. Values keep their vault-id label unless
+--new-vault-id names one. A tree on several vault passwords is refused.
 
-Inline !vault spans are included by default; pass --no-include-encrypted-vars for
-whole-file vault YAML only. Rekey refuses a tree with !vault values in a form
-pilfer cannot rewrite, which would stay on the old password.
+Inline !vault values are included by default. Rekey refuses a tree with !vault
+values in a form pilfer cannot rewrite, because they would stay on the old
+password. It also refuses when any file in the tree cannot be read or is
+over 64 MiB and contains $ANSIBLE_VAULT; or a pilfer marker (so it might be a
+vault). It also refuses a whole-file vault whose plaintext holds inline !vault
+values.
+
+The REKEY prompt needs a terminal; without one, pass --yes. A password prompt
+(--old-vault-id LABEL@prompt, --new-vault-id prompt) needs one too.
+"""
+
+_COMPLETION_EXAMPLES = """
+Examples:
+  pilfer completion --install               install for the shell in $SHELL
+  pilfer completion zsh --install
+  pilfer completion bash > pilfer.bash      print the script instead
+"""
+
+_COMPLETION_NOTES = """
+bash:  ~/.local/share/bash-completion/completions/pilfer
+zsh:   ~/.zfunc/_pilfer (add 'fpath=(~/.zfunc $fpath)' above compinit)
+It completes commands, options and file paths, never key names, and never
+edits your shell's startup files.
+"""
+
+
+_AGENT_GUIDE_EXAMPLES = """
+Examples:
+  pilfer agent-guide                        print the guide
+  mkdir -p ~/.agents/skills/pilfer && \\
+      pilfer agent-guide > ~/.agents/skills/pilfer/SKILL.md
+"""
+
+_AGENT_GUIDE_NOTES = """
+The guide is an Agent Skills SKILL.md. Save it where your agent reads skills.
+Claude Code reads ~/.claude/skills/pilfer/SKILL.md. Run the command again after
+upgrading pilfer to refresh the copy.
 """
 
 
@@ -1768,34 +2160,42 @@ _UNFRACK_PATH = functools.partial(unfrackpath, follow=False)
 
 def _add_vault_options(parser, help_text: str) -> None:
     """The vault flags of ansible-vault (add_vault_options), plus -p for pilfer's old flag."""
-    parser.add_argument(
+    group = parser.add_argument_group(
+        "Vault password",
+        # Hand-wrapped: RawDescriptionHelpFormatter does not wrap group text.
+        "Sources load in ansible-vault's order; see 'Vault passwords' in the\n"
+        "README. A password script named by ansible.cfg runs even with -p; do not\n"
+        "run this in a tree you have not reviewed.",
+    )
+    group.add_argument(
         "--vault-id",
         action="append",
         default=[],
         dest="vault_ids",
-        metavar="VAULT_ID",
-        help="vault identity to use, as for ansible-vault: [label@]FILE or [label@]prompt",
+        metavar="ID",
+        help="Vault identity, as for ansible-vault: [label@]FILE or [label@]prompt",
     )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
+    # -p and -J cannot be combined; -p itself repeats.
+    exclusive = group.add_mutually_exclusive_group()
+    exclusive.add_argument(
         "-p",
         "--vault-password-file",
         "--vault-pass-file",
         action="append",
         default=[],
         dest="vault_password_files",
-        metavar="VAULT_PASSWORD_FILE",
+        metavar="FILE",
         type=_UNFRACK_PATH,
-        help=help_text,
+        help=f"{help_text}. Also --vault-pass-file",
     )
-    group.add_argument(
+    exclusive.add_argument(
         "-J",
         "--ask-vault-password",
         "--ask-vault-pass",
         action="store_true",
         default=C.DEFAULT_ASK_VAULT_PASS,
         dest="ask_vault_pass",
-        help="ask for the vault password",
+        help="Ask for the vault password (not with -p). Also --ask-vault-pass",
     )
 
 
@@ -1812,25 +2212,25 @@ def _add_quiet_option(parser) -> None:
         "-q",
         "--quiet",
         action="store_true",
-        help="Suppress nested git repo skip messages during discovery",
+        help="Hide messages about skipped nested git repos",
     )
 
 
 _DEFAULT_PASSWORD_HELP = (
-    "vault password file or script; repeatable (default: Ansible's config, then common paths)"
+    "Password file or script; repeatable (default: Ansible's config, then common paths)"
 )
 
 
 def _build_argument_parser():
-    """Build the pilfer CLI parser (subcommands: open, close, rekey, set)."""
-    parser = argparse.ArgumentParser(
+    """Build the pilfer CLI parser (commands: open, close, status, find-keys, set, update, rekey, completion, agent-guide)."""
+    parser = _Parser(
         prog="pilfer",
-        formatter_class=_HELP_FORMATTER,
-        description=(
-            "Bulk decrypt Ansible vault files in a project tree for editing, then "
-            "re-encrypt when done."
-        ),
-        epilog=_HELP_EPILOG,
+        description="Decrypt Ansible vault files in a project, edit them, then re-encrypt.",
+        epilog=_TOP_EXAMPLES,
+        notes=_TOP_NOTES,
+        # argparse's default accepts any unique prefix, so `find-keys --file X`
+        # was read as --files-with-matches. A typo must be a usage error.
+        allow_abbrev=False,
     )
 
     def _parser_error(message: str) -> None:
@@ -1840,132 +2240,297 @@ def _build_argument_parser():
         # into tickets. Subparsers hand unrecognized arguments to this, the
         # top-level parser, so set needs no hook of its own.
         argv = getattr(parser, "_pilfer_argv", ())
-        if "set" in argv and _hides_unrecognized_set_value(message):
+        if ("set" in argv or "update" in argv) and _hides_unrecognized_set_value(message):
             parser.exit(2, f"{parser.prog}: error: put -- before a value that starts with -\n")
+        # An unrecognized option on a subcommand is reported by the top-level
+        # parser; show the subcommand's usage, which is the one that helps.
+        sub = subparsers.choices.get(argv[0]) if argv else None
+        if sub is not None and message.startswith("unrecognized arguments"):
+            sub.error(message)
         argparse.ArgumentParser.error(parser, message)
 
     parser.error = _parser_error  # type: ignore[method-assign]
-    parser.add_argument("--version", action="version", version=f"pilfer {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"pilfer {__version__}", help="Show the version"
+    )
 
     subparsers = parser.add_subparsers(
-        dest="action",
-        metavar="COMMAND",
-        required=True,
-        title="commands",
-        description="valid commands",
+        dest="action", metavar="COMMAND", required=True, title="Commands"
     )
+    # After add_subparsers: it builds each subcommand's prog from the parent's usage.
+    parser.usage = "%(prog)s [--version] COMMAND [OPTIONS]"
 
-    open_parser = subparsers.add_parser(
+    def command(name, summary, description, usage, examples, notes):
+        return subparsers.add_parser(
+            name,
+            help=summary,
+            description=description,
+            usage=f"%(prog)s {usage}".rstrip(),
+            epilog=examples,
+            notes=notes,
+            allow_abbrev=False,
+        )
+
+    open_parser = command(
         "open",
-        formatter_class=_HELP_FORMATTER,
-        help="decrypt vault targets for editing",
-        description="Decrypt whole-file vault YAML (and optionally inline !vault scalars).",
-        epilog=_OPEN_EPILOG,
+        "Decrypt vault files for editing",
+        "Decrypt the vault files in this tree for editing. Run 'pilfer close' when done.",
+        "[OPTIONS]",
+        _OPEN_EXAMPLES,
+        _OPEN_NOTES,
     )
-    _add_vault_options(open_parser, _DEFAULT_PASSWORD_HELP)
     open_parser.add_argument(
         "--include-encrypted-vars",
         action="store_true",
-        help="Also decrypt inline !vault / encrypt_string scalars",
+        help="Decrypt inline !vault (encrypt_string) values too",
     )
     _add_quiet_option(open_parser)
+    _add_vault_options(open_parser, _DEFAULT_PASSWORD_HELP)
 
-    close_parser = subparsers.add_parser(
+    close_parser = command(
         "close",
-        formatter_class=_HELP_FORMATTER,
-        help="re-encrypt everything this session opened",
-        description="Re-encrypt session entries (whole-file and inline).",
-        epilog=_CLOSE_EPILOG,
-    )
-    _add_vault_options(
-        close_parser, "vault password file or script; repeatable (the sources open used)"
+        "Re-encrypt what open decrypted",
+        "Re-encrypt every file the open session decrypted.",
+        "[OPTIONS]",
+        _CLOSE_EXAMPLES,
+        _CLOSE_NOTES,
     )
     close_parser.add_argument(
         "--confirm-delete",
         action="store_true",
         dest="confirm_delete",
-        help=(
-            "Confirm intentional deletion of opened inline vars (marker and secret line removed)"
-        ),
+        help="Accept deleted inline values (marker and secret line removed) and deleted vault files",
+    )
+    _add_vault_options(close_parser, "Password file or script; repeatable (what open used)")
+
+    status_parser = command(
+        "status",
+        "Show whether a session is open",
+        "Show whether a pilfer session is open and which files hold plaintext.",
+        "[OPTIONS]",
+        _STATUS_EXAMPLES,
+        _STATUS_NOTES,
+    )
+    status_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="One JSON object: open, incomplete, orphaned, files (file, kind)",
     )
 
-    rekey_parser = subparsers.add_parser(
+    find_parser = command(
+        "find-keys",
+        "Show which vault files hold a key",
+        "Show which vault files hold a key. Prints paths and key names, never values.\n"
+        "Whole-file vaults are read in memory, so this reveals key names they hide.",
+        "[OPTIONS] [PATTERN ...]  (do not put an option between patterns)",
+        _FIND_EXAMPLES,
+        _FIND_NOTES,
+    )
+    find_parser.add_argument(
+        "patterns",
+        nargs="*",
+        metavar="PATTERN",
+        help="Key name to match; * and ? are wildcards (default: every key)",
+    )
+    find_parser.add_argument(
+        "-E",
+        "--regex",
+        action="store_true",
+        help="Treat patterns as regular expressions that match anywhere in the name",
+    )
+    find_parser.add_argument(
+        "-i", "--ignore-case", action="store_true", help="Ignore case when matching"
+    )
+    find_parser.add_argument(
+        "--path",
+        action="store_true",
+        help=(
+            "Match the full key path (aws.prod.key) instead of the last name. "
+            "Names with a dash or dot print and match as ['my-key']"
+        ),
+    )
+    find_parser.add_argument(
+        "--include-encrypted-vars",
+        action="store_true",
+        help="Also list keys whose value is an inline !vault string",
+    )
+    output = find_parser.add_argument_group("Output").add_mutually_exclusive_group()
+    output.add_argument(
+        "-l",
+        "--files-with-matches",
+        action="store_true",
+        help="Print only the names of files with a match",
+    )
+    output.add_argument(
+        "--json",
+        action="store_true",
+        help="One JSON object per line: file, key, path, kind, open, vault_id",
+    )
+    _add_vault_options(find_parser, _DEFAULT_PASSWORD_HELP)
+
+    set_parser = command(
+        "set",
+        "Set one key in a vault file without opening it",
+        "Add or replace one key in a closed whole-file vault. No plaintext reaches disk.",
+        "[OPTIONS] FILE KEY [VALUE]",
+        _SET_EXAMPLES,
+        _SET_NOTES,
+    )
+    completion.mark_file(
+        set_parser.add_argument("file", metavar="FILE", help="Whole-file vault YAML")
+    )
+    set_parser.add_argument(
+        "key", metavar="KEY", help="Name or path of the key, such as db_password or aws.prod.key"
+    )
+    set_parser.add_argument(
+        "value",
+        metavar="VALUE",
+        nargs="?",
+        help="New string value (default: read stdin or prompt; use -- before a leading dash)",
+    )
+    set_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Check the file and key (and VALUE, if given) and say what would change, "
+            "reading no stdin and writing nothing"
+        ),
+    )
+    _add_vault_options(set_parser, _DEFAULT_PASSWORD_HELP)
+
+    update_parser = command(
+        "update",
+        "Replace an existing key's value, wherever it lives",
+        "Replace the value of an existing key in whichever vault file holds it.",
+        "[OPTIONS] KEY [VALUE]",
+        _UPDATE_EXAMPLES,
+        _UPDATE_NOTES,
+    )
+    update_parser.add_argument(
+        "key", metavar="KEY", help="Name or path of the key, such as aws.prod.secret_key"
+    )
+    update_parser.add_argument(
+        "value",
+        metavar="VALUE",
+        nargs="?",
+        help="New string value (default: read stdin or prompt; use -- before a leading dash)",
+    )
+    completion.mark_file(
+        update_parser.add_argument(
+            "--file", metavar="FILE", help="Only look in this vault file, to pick between several"
+        )
+    )
+    update_parser.add_argument(
+        "--include-encrypted-vars",
+        action="store_true",
+        help="Also replace inline !vault values, keeping each one's vault id",
+    )
+    update_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Check the key path (and VALUE, if given) and say what would change, "
+            "reading no stdin and writing nothing"
+        ),
+    )
+    _add_vault_options(update_parser, _DEFAULT_PASSWORD_HELP)
+
+    rekey_parser = command(
         "rekey",
-        formatter_class=_HELP_FORMATTER,
-        help="rotate vault password across the tree",
-        description="Re-key whole-file and inline vault targets without an open session.",
-        epilog=_REKEY_EPILOG,
+        "Change the vault password across the tree",
+        "Change the vault password of every file and inline value in the tree.",
+        "[OPTIONS]",
+        _REKEY_EXAMPLES,
+        _REKEY_NOTES,
     )
-    rekey_parser.add_argument(
-        "--old-vault-password-file",
-        action="append",
-        default=[],
-        dest="old_vault_password_files",
-        metavar="OLD_VAULT_PASSWORD_FILE",
-        type=_UNFRACK_PATH,
-        help="current vault password file or script; repeatable (default: Ansible's config)",
+    old = rekey_parser.add_argument_group("Current password")
+    completion.mark_file(
+        old.add_argument(
+            "--old-vault-password-file",
+            action="append",
+            default=[],
+            dest="old_vault_password_files",
+            metavar="FILE",
+            type=_UNFRACK_PATH,
+            help="Password file or script; repeatable (default: Ansible's config)",
+        )
     )
-    rekey_parser.add_argument(
+    old.add_argument(
         "--old-vault-id",
         action="append",
         default=[],
         dest="old_vault_ids",
-        metavar="OLD_VAULT_ID",
-        help="current vault identity, [label@]FILE or [label@]prompt; repeatable",
+        metavar="ID",
+        help="Vault identity, [label@]FILE or [label@]prompt; repeatable",
     )
-    new_group = rekey_parser.add_mutually_exclusive_group(required=True)
-    new_group.add_argument(
-        "--new-vault-password-file",
-        type=_UNFRACK_PATH,
-        help="new vault password file or script",
+    new = rekey_parser.add_argument_group("New password (one required)")
+    new_group = new.add_mutually_exclusive_group(required=True)
+    completion.mark_file(
+        new_group.add_argument(
+            "--new-vault-password-file",
+            metavar="FILE",
+            type=_UNFRACK_PATH,
+            help="Password file or script",
+        )
     )
     new_group.add_argument(
         "--new-vault-id",
-        help="new vault identity, [label@]FILE or [label@]prompt; a label relabels every value",
+        metavar="ID",
+        help="Vault identity, [label@]FILE or [label@]prompt; a label relabels every value",
     )
     rekey_parser.add_argument(
         "--include-encrypted-vars",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Include inline !vault spans (default: on; --no-include-encrypted-vars "
-        "rekeys whole-file vault YAML only)",
+        help="Rekey inline !vault values too (default: on)",
     )
     rekey_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Decrypt-check and print plan without writing",
+        help="Check that everything decrypts and print the plan, writing nothing",
     )
     rekey_parser.add_argument(
         "--yes",
         action="store_true",
-        help="Skip interactive REKEY confirmation",
+        help="Skip the REKEY confirmation prompt",
     )
     rekey_parser.add_argument(
         "--rotate-password-file",
         action="store_true",
         help=(
-            "After 100%% success, move old password file to *_old and write the "
+            "After full success, move the old password file to *_old and write the "
             "new password at the old path"
         ),
     )
     _add_quiet_option(rekey_parser)
 
-    set_parser = subparsers.add_parser(
-        "set",
-        formatter_class=_HELP_FORMATTER,
-        help="set one key in a whole-file vault without opening it",
-        description="Add or replace one top-level string in a closed whole-file vault.",
-        epilog=_SET_EPILOG,
+    completion_parser = command(
+        "completion",
+        "Print or install shell completion (bash, zsh)",
+        "Print a shell completion script, or install it with --install.",
+        "[OPTIONS] [SHELL]",
+        _COMPLETION_EXAMPLES,
+        _COMPLETION_NOTES,
     )
-    set_parser.add_argument("file", help="Whole-file vault YAML")
-    set_parser.add_argument("key", help="Top-level key to add or replace")
-    set_parser.add_argument(
-        "value",
+    completion_parser.add_argument(
+        "shell",
+        metavar="SHELL",
         nargs="?",
-        help="New string value. Omit it to read stdin or get a hidden prompt "
-        "(use -- before a value with a leading dash)",
+        choices=("bash", "zsh"),
+        help="bash or zsh (default: the shell in $SHELL)",
     )
-    _add_vault_options(set_parser, _DEFAULT_PASSWORD_HELP)
+    completion_parser.add_argument(
+        "--install", action="store_true", help="Write the script where the shell finds it"
+    )
+
+    command(
+        "agent-guide",
+        "Print a SKILL.md that teaches AI coding agents to use pilfer",
+        "Print the pilfer guide for AI coding agents, as an Agent Skills SKILL.md.",
+        "",
+        _AGENT_GUIDE_EXAMPLES,
+        _AGENT_GUIDE_NOTES,
+    )
 
     return parser
 
@@ -1986,15 +2551,62 @@ def _interrupted_hint(action: str) -> str:
     return ""
 
 
+def _run_agent_guide() -> int:
+    """Print the packaged SKILL.md exactly as stored."""
+    from importlib import resources
+
+    guide = resources.files("pilfer").joinpath("agent_guide", "SKILL.md")
+    sys.stdout.write(guide.read_text(encoding="utf-8"))
+    return 0
+
+
+def _silence_closed_pipe() -> None:
+    """Point stdout and stderr at /dev/null so the flush at interpreter exit
+    cannot raise again (that is the traceback and exit 120)."""
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            os.dup2(os.open(os.devnull, os.O_WRONLY), stream.fileno())
+
+
 def main(argv=None):
     """Main CLI entry point for pilfer"""
+    try:
+        try:
+            return _main(argv)
+        finally:
+            # Flush here, not at interpreter exit: the tail of the output can
+            # still be buffered when the reader goes away (and argparse --help
+            # and --version write, then exit).
+            if sys.stdout is not None:
+                sys.stdout.flush()
+    except BrokenPipeError:
+        # `pilfer find-keys --json | head -n1`: the reader closed early. Exit as
+        # a shell reports SIGPIPE (128 + 13).
+        _silence_closed_pipe()
+        return 141
+
+
+def _main(argv=None):
     parser = _build_argument_parser()
     parser._pilfer_argv = list(argv) if argv is not None else sys.argv[1:]  # type: ignore[attr-defined]
     args = parser.parse_args(argv)
 
     try:
+        if args.action == "status":
+            return _run_status(args)
         if args.action == "set":
             return _run_set(args)
+        if args.action == "completion":
+            return completion.run_completion(args, parser)
+        if args.action == "agent-guide":
+            return _run_agent_guide()
+        if args.action in ("find-keys", "update"):
+            # Imported here: find_keys imports helpers from this module.
+            from pilfer import find_keys
+
+            if args.action == "find-keys":
+                return find_keys.run_find_keys(args)
+            return find_keys.run_update(args)
         with project_session_lock():
             if args.action == "open":
                 print("🔓 Searching for and decrypting vault files...")
@@ -2004,10 +2616,9 @@ def main(argv=None):
                     announce_skips=not args.quiet,
                 )
                 if opened:
-                    # ANSI bold around the next command (TTY-friendly; harmless in pipes).
                     print(
                         "✅ All vault files decrypted. Edit as needed, "
-                        "then run '\033[1mpilfer close\033[0m' to re-encrypt."
+                        "then run 'pilfer close' to re-encrypt."
                     )
             elif args.action == "close":
                 print("🔒 Re-encrypting vault files...")
@@ -2044,20 +2655,92 @@ def main(argv=None):
         # is kept for the next close, as after any other failure.
         print(f"Interrupted.{_interrupted_hint(args.action)}", file=sys.stderr)
         return 130
+    except BrokenPipeError:
+        raise  # main() handles it; it is not an "Error:" for the user
     except Exception as exc:
         # PilferError for refusals, OSError and anything else for the rest.
         # Blank line after per-file ⚠️ blocks; keep a plain Error: summary line.
+        # The split is intentional: the mutating commands (open, close, rekey, set,
+        # update) have always printed "Error:", so scripts that match it keep working.
+        # find-keys and status are newer read-only commands that print "pilfer:" (see
+        # _run_status) and use exit 2 for errors, which this path does not.
         print(file=sys.stderr)
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"Error: {safe_multiline(str(exc))}", file=sys.stderr)
         return 1
     return 0
 
 
+def _run_status(args) -> int:
+    """Report the open session from its list and artifacts. Reads only; no password, no lock."""
+    try:
+        _refuse_planted_session_links()
+        report = {"open": False, "incomplete": False, "orphaned": False, "files": []}
+        if not _session_is_open():
+            # No list but backups: an open that was never closed (or whose list was
+            # deleted). Saying "No session open." here would hide that the files
+            # may still hold plaintext.
+            report["orphaned"] = _vault_dir_has_artifacts()
+        else:
+            entries = _load_session()
+            report["open"] = True
+            report["incomplete"] = _session_is_incomplete(entries)
+            if not report["incomplete"]:
+                report["files"] = [
+                    {"file": os.path.relpath(entry["path"]), "kind": entry.get("kind", "file")}
+                    for entry in entries
+                    if not _never_opened(entry)
+                ]
+    except Exception as exc:
+        # find-keys' convention: 2 is an error, so a script can tell it from "no session".
+        print(f"pilfer: {safe_multiline(str(exc))}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report))
+        return 0
+    files = report["files"]
+    if report["orphaned"]:
+        print(
+            "No session list, but .vault/ holds backups from an open that was not "
+            "closed; run 'pilfer open' for recovery steps."
+        )
+    elif not report["open"]:
+        print("No session open.")
+    elif report["incomplete"]:
+        print(
+            "Session open, but incomplete: open was interrupted before it decrypted "
+            "anything. Run 'pilfer close' to clear it."
+        )
+    elif not files:
+        print("Session open: no files hold plaintext. Run 'pilfer close' to clear it.")
+    else:
+        count = len(files)
+        print(
+            f"Session open: {count} files hold plaintext. Run 'pilfer close' to re-encrypt them."
+            if count > 1
+            else "Session open: 1 file holds plaintext. Run 'pilfer close' to re-encrypt it."
+        )
+        for item in files:
+            kind = "whole-file" if item["kind"] == "file" else safe_text(str(item["kind"]))
+            print(f"  {safe_text(item['file'])}  ({kind})")
+    return 0
+
+
+# set_keys reports past tense; a dry run says what the real run would do.
+_DRY_VERBS = {"added": "add", "updated": "update"}
+
+
 def _run_set(args) -> int:
     # Imported here: vault_set imports helpers from this module.
-    from pilfer.vault_set import read_value, set_keys
+    from pilfer.vault_set import (
+        CHECK_PLACEHOLDER,
+        DRY_RUN_UNCHECKED,
+        read_value,
+        set_keys,
+        warn_value_on_argv,
+    )
 
     value = args.value
+    warn_value_on_argv(args)
     # Before the password loads: a mistyped path should not cost a prompt or a
     # script run, and should name the vault, not its x.yml.pilfer-lock sibling.
     if not os.path.isfile(args.file):
@@ -2065,13 +2748,33 @@ def _run_set(args) -> int:
     # Loaded once: the check and the write both need it, and a password
     # script or prompt should run one time.
     vault = load_vault(_sources(args))
+    if args.dry_run:
+        # Same checks as a real run, then stop: stdin is never read, so nothing
+        # asks for one, and check_only never replaces the vault. A VALUE already
+        # on the command line is checked as itself; otherwise the placeholder
+        # stands in and the value is unchecked.
+        actions = set_keys(
+            args.file,
+            {args.key: CHECK_PLACEHOLDER if value is None else value},
+            vault,
+            check_only=True,
+        )
+        action = actions[args.key]
+        if action == "unchanged":  # only possible with a VALUE that is already stored
+            print(f"unchanged {safe_text(args.key)} in {safe_text(args.file)}")
+        else:
+            print(f"would {_DRY_VERBS[action]} {safe_text(args.key)} in {safe_text(args.file)}")
+        if value is None:
+            print(DRY_RUN_UNCHECKED)
+        _warn_unused_sources(vault, safe_text(args.file))
+        return 0
     if value is None:
         # Refuse before asking for the secret, not after someone has pasted it.
-        set_keys(args.file, {args.key: "pilfer-set-check-placeholder"}, vault, check_only=True)
+        set_keys(args.file, {args.key: CHECK_PLACEHOLDER}, vault, check_only=True)
         value = read_value(args.key)
     actions = set_keys(args.file, {args.key: value}, vault)
-    print(f"{actions[args.key]} {args.key} in {args.file}")
-    _warn_unused_sources(vault, args.file)
+    print(f"{actions[args.key]} {safe_text(args.key)} in {safe_text(args.file)}")
+    _warn_unused_sources(vault, safe_text(args.file))
     return 0
 
 

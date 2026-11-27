@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from pilfer.errors import PilferError
+from pilfer.errors import PilferError, safe_text
 
 # Empty sibling of the vault. Scan skips it. Not the temp prefix:
 # open deletes extensionless .pilfer-rekey-* leftovers, which would drop a
@@ -223,7 +223,7 @@ def vault_file_lock(path: str | os.PathLike) -> Iterator[None]:
                 # Print once, not on each inode-recheck retry.
                 if not announced:
                     print(
-                        f"Waiting for another pilfer run (lock {lock_path})...",
+                        f"Waiting for another pilfer run (lock {safe_text(str(lock_path))})...",
                         file=sys.stderr,
                         flush=True,
                     )

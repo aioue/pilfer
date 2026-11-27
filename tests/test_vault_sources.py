@@ -7,12 +7,16 @@ holding one secret at a time, so a value under the wrong password fails.
 """
 
 import os
+import pty
+import re
+import select
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -86,7 +90,9 @@ class ProjectTest(unittest.TestCase):
         answers: str | None = None,
         cwd: Path | None = None,
     ) -> subprocess.CompletedProcess:
-        """Run pilfer.py in cwd (the project). answers is piped to stdin for a prompt."""
+        """Run pilfer.py in cwd (the project). answers is typed at a terminal prompt."""
+        if answers is not None:
+            return self._typed(args, env, answers, cwd)
         return subprocess.run(
             [sys.executable, str(PILFER_SCRIPT), *args],
             capture_output=True,
@@ -102,6 +108,52 @@ class ProjectTest(unittest.TestCase):
             # A test run in the background inherits SIGINT ignored, and then
             # Python never turns ctrl-c into KeyboardInterrupt.
             preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
+        )
+
+    def _typed(self, args, env, answers: str, cwd) -> subprocess.CompletedProcess:
+        """Run pilfer.py with a pseudo-terminal as stdin and stderr, typing one
+        answer line at each password prompt. pilfer refuses a prompt without a
+        terminal, and a hidden prompt discards input typed before it appears."""
+        master, slave = pty.openpty()
+        lines = answers.splitlines(keepends=True)
+        proc = subprocess.Popen(
+            [sys.executable, str(PILFER_SCRIPT), *args],
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=slave,
+            cwd=cwd or self.dir,
+            env={**self.env, **(env or {})},
+            text=True,
+            start_new_session=True,
+            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
+        )
+        os.close(slave)
+        seen, typed = "", 0
+        deadline = time.monotonic() + 60
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([master], [], [], 0.2)
+                if ready:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    seen += chunk.decode(errors="replace")
+                    # "Vault password: " for -J, "Vault password (id): " for a vault id.
+                    prompts = re.findall(r"password[^\n:]*: ", seen, re.IGNORECASE)
+                    if len(prompts) > typed and typed < len(lines):
+                        os.write(master, lines[typed].encode())
+                        typed += 1
+                elif proc.poll() is not None:
+                    break
+            stdout, _ = proc.communicate(timeout=30)
+        finally:
+            proc.kill()
+            os.close(master)
+        return subprocess.CompletedProcess(
+            proc.args, proc.returncode, stdout, seen.replace("\r\n", "\n")
         )
 
     def ok(self, result: subprocess.CompletedProcess) -> subprocess.CompletedProcess:
@@ -612,7 +664,7 @@ class TestCloseUnusedFlags(ProjectTest):
 
 
 class TestInteractiveSources(ProjectTest):
-    """Prompts, driven through pilfer with the answers piped to stdin."""
+    """Prompts, driven through pilfer with the answers typed on a pseudo-terminal."""
 
     def test_dash_J_opens_and_closes(self):
         self.write("secret.yml", only("typed").encrypt(b"token: old\n"))
@@ -682,6 +734,48 @@ class TestInteractiveSources(ProjectTest):
         self.ok(self.pilfer("close", "--vault-id", "a@prompt", answers="pw1\n"))
 
 
+class TestNoTerminal(ProjectTest):
+    """With no terminal a prompt is refused up front, naming the way out."""
+
+    def test_password_prompts_are_refused_before_anything_is_read(self):
+        self.write("secret.yml", only("typed").encrypt(b"token: old\n"))
+        for flag in (["-J"], ["--vault-id", "lbl@prompt"]):
+            with self.subTest(flag=flag):
+                # Piped text would have been taken as the password.
+                result = self.pilfer("open", *flag, answers=None)
+                self.refused(result, "-p FILE or --vault-id LABEL@FILE")
+                self.assertFalse((self.dir / "vaultedFileList.json").exists())
+
+    def test_set_value_is_never_read_as_the_password(self):
+        target = self.write("secret.yml", only("typed").encrypt(b"token: old\n"))
+        before = target.read_bytes()
+        result = subprocess.run(
+            [sys.executable, str(PILFER_SCRIPT), "set", "-J", "secret.yml", "token"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=self.dir,
+            input="typed\nvalue\n",
+            env=self.env,
+            start_new_session=True,
+        )
+        self.refused(result, "asks for the password on a terminal")
+        self.assertEqual(target.read_bytes(), before)
+
+    def test_rekey_new_prompt_and_confirmation_are_refused(self):
+        self.password_file("old-pass", "old-password")
+        target = self.write("secret.yml", only("old-password").encrypt(b"a: 1\n"))
+        before = target.read_bytes()
+        result = self.pilfer("rekey", "--old-vault-id", "old-pass", "--new-vault-id", "prompt")
+        self.refused(result, "--new-vault-password-file FILE")
+        self.password_file("new-pass", "new-password")
+        result = self.pilfer(
+            "rekey", "--old-vault-id", "old-pass", "--new-vault-password-file", "new-pass"
+        )
+        self.refused(result, "pass --yes")
+        self.assertEqual(target.read_bytes(), before)
+
+
 class TestRekeyPreconditions(ProjectTest):
     """Rotation preconditions are checked before any file is rewritten."""
 
@@ -717,6 +811,21 @@ class TestRekeyPreconditions(ProjectTest):
             with self.subTest(extra=extra):
                 result = self.rotate(*extra)
                 self.refused(result, "old-pass_old")
+                self.assertEqual(result.returncode, 1)
+                self.assert_untouched()
+
+    def test_a_whole_file_vault_holding_inline_values_refuses_before_any_write(self):
+        # Rekey would rotate only the outer blob; the nested value would stay on
+        # the old password while rekey reported success.
+        inner_ct = only("old-password").encrypt(b"nested-secret")
+        plaintext = inline("inner", inner_ct) + "plain: x\n"
+        self.write("nested.yml", only("old-password").encrypt(plaintext.encode()))
+        self.before["nested.yml"] = (self.dir / "nested.yml").read_bytes()
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                result = self.rotate(*extra)
+                self.refused(result, "inline vault value(s) pilfer cannot rotate")
+                self.assertIn("nested.yml", result.stderr)
                 self.assertEqual(result.returncode, 1)
                 self.assert_untouched()
 

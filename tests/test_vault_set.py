@@ -5,6 +5,7 @@ import json
 import os
 import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -53,6 +54,10 @@ TRICKY = "  p#ss \"q\" \\back\\ 's' ünï ☃ 😀 tab\there  "
 COERCIBLE = ("yes", "no", "on", "off", "0123", "1e3", "null", "~", "true")
 
 
+class _Blocked(BaseException):
+    """Raised by the hang guard. BaseException: attempt() catches Exception only."""
+
+
 def _vault(password: str = PASSWORD) -> VaultLib:
     return VaultLib([(DEFAULT_VAULT_ID_MATCH, VaultSecret(password.encode("utf-8")))])
 
@@ -85,6 +90,17 @@ class VaultSetBase(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
+    def _guard(self, seconds: int = 20) -> None:
+        """Fail the test instead of hanging the suite if the code under test blocks."""
+
+        def blocked(*_args):
+            raise _Blocked("blocked")
+
+        previous = signal.signal(signal.SIGALRM, blocked)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        self.addCleanup(signal.alarm, 0)  # runs first: LIFO
+        signal.alarm(seconds)
+
     def _password_file(self, name: str, password: str) -> Path:
         path = self.directory / name
         path.write_text(password + "\n", encoding="utf-8")
@@ -95,6 +111,13 @@ class VaultSetBase(unittest.TestCase):
         target = self.directory / name
         target.write_bytes(_vault().encrypt(text.encode("utf-8")))
         return target
+
+    def _no_value_read(self):
+        """Patch sys.stdin so any read or terminal probe fails the test."""
+        stdin = mock.Mock()
+        stdin.buffer.read.side_effect = AssertionError("stdin was read")
+        stdin.isatty.side_effect = AssertionError("stdin was probed")
+        return mock.patch.object(sys, "stdin", stdin)
 
     def _set(self, key: str, value: str, path: Path | None = None) -> str:
         return set_keys(path or self.vault, {key: value}, str(self.password))[key]
@@ -160,6 +183,16 @@ class TestVaultSet(VaultSetBase):
                 text = self._view()
                 self.assertEqual(text, _expected_target(value))
                 self.assertEqual(yaml.safe_load(text)["target"], value)
+
+    def test_edit_plaintext_names_a_tab_that_ansible_tolerates(self) -> None:
+        text = "db_port: 5432\t# default\n"
+        with self.assertRaises(PilferError) as caught:
+            vault_set._edit_plaintext(text, "db_port", "1")
+        self.assertIn("though Ansible reads it", str(caught.exception))
+        self.assertIn("replace the tab with spaces", str(caught.exception))
+        with self.assertRaises(PilferError) as caught:
+            vault_set._edit_plaintext("a: [1\n", "a", "1")
+        self.assertIn("not a single valid YAML document", str(caught.exception))
 
     def test_edit_plaintext_exact_for_many_values(self) -> None:
         # Pure-text check of the same edit, for values too many to run through ansible-vault.
@@ -525,7 +558,7 @@ class TestVaultSet(VaultSetBase):
         cases = [
             ("empty value", "target", ""),
             ("NUL", "target", "a\0b"),
-            ("dotted key", "a.b", SENTINEL),
+            ("dashed key", "a-b", SENTINEL),
             ("YAML key syntax", "a: b", SENTINEL),
             ("empty key", "", SENTINEL),
         ]
@@ -566,6 +599,10 @@ class TestVaultSet(VaultSetBase):
             self._set(pasted, SENTINEL)
         self.assertNotIn(pasted, str(caught.exception))
         self._assert_untouched()
+        # The refusal still says how to write a name with a dash.
+        self.assertIn("['my-key']", str(caught.exception))
+        # ...and that a new top-level key must still be an identifier.
+        self.assertIn("new top-level key must be a plain identifier", str(caught.exception))
 
     def test_refuses_plaintext_symlink_and_pilfer_sidecar(self) -> None:
         plain = self.directory / "plain.yml"
@@ -1096,6 +1133,87 @@ class TestReviewFollowups(VaultSetBase):
             self.assertEqual(set_keys(self.vault, {"target": SENTINEL}, prod)["target"], "updated")
         self.assertTrue(self.vault.read_bytes().startswith(b"$ANSIBLE_VAULT;1.2;AES256;prod\n"))
         self.assertEqual(self._view(), _expected_target(SENTINEL))
+
+
+class TestRound1Fixes(VaultSetBase):
+    def _plain_of(self, path: Path) -> bytes:
+        return _vault().decrypt(path.read_bytes())
+
+    def test_existing_odd_top_level_name_can_be_updated_but_not_created(self) -> None:
+        path = self._encrypt('"a.b":\n  c: 1\n"yes": x\n', "odd.yml")
+        pw = str(self.password)
+        self.assertEqual(
+            set_keys(path, {"['a.b'].c": "5"}, pw, create=False)["['a.b'].c"], "updated"
+        )
+        self.assertEqual(yaml.safe_load(self._plain_of(path))["a.b"], {"c": "5"})
+        # Creating the same top-level names is still refused.
+        for key in ("['x.y'].c", "['null']"):
+            with self.assertRaises(PilferError):
+                set_keys(path, {key: "v"}, pw)
+
+    def test_adding_a_key_to_a_crlf_vault_keeps_crlf(self) -> None:
+        path = self._encrypt("alpha: one\r\nbeta: two\r\n", "crlf.yml")
+        self.assertEqual(self._set("gamma", "three", path), "added")
+        plain = self._plain_of(path)
+        self.assertEqual(plain, b'alpha: one\r\nbeta: two\r\ngamma: "three"\r\n')
+
+    def test_keys_that_yaml_reads_as_bool_null_or_int_can_be_updated(self) -> None:
+        # The loader makes True, None and 1 of these keys; the path carries their text.
+        cases = (
+            ("yes", "yes: old\nz: keep\n"),
+            ("null", "null: old\nz: keep\n"),
+            ("['1']", "1: old\nz: keep\n"),
+            ("a.on", "a:\n  on: old\nz: keep\n"),
+        )
+        for key, text in cases:
+            with self.subTest(key=key):
+                path = self._encrypt(text, "odd.yml")
+                actions = set_keys(path, {key: "new"}, str(self.password), create=False)
+                self.assertEqual(actions, {key: "updated"})
+                self.assertEqual(self._plain_of(path).decode(), text.replace("old", '"new"'))
+                self.assertEqual(
+                    set_keys(path, {key: "new"}, str(self.password), create=False),
+                    {key: "unchanged"},
+                )
+
+    def test_a_shared_anchor_is_refused_and_the_file_untouched(self) -> None:
+        # `aliased mapping` passes the round-trip check (its copy keeps the sharing), so
+        # _shared_on_path is what refuses it.
+        cases = {
+            "alias": ("a: &x v\nb: *x\n", "a", "w"),
+            "aliased mapping": ("defaults: &d {token: abc}\nprod: *d\n", "prod.token", "X"),
+            "merged anchor": ("base: &b {j: 1}\nsvc:\n  <<: *b\nother: x\n", "base.j", "2"),
+            "alias last": ("d: &d {a: 1}\nprod:\n  x: 1\n  y: *d\nafter: z\n", "prod.new", "n"),
+            "merge only": ("base: &b {j: 1}\nsvc:\n  <<: *b\n", "svc.port", "2"),
+            "recursive": ("a: &a [*a]\ntarget: old\n", "target", "new"),
+        }
+        for name, (text, key, value) in cases.items():
+            with self.subTest(name):
+                path = self._encrypt(text, f"{name}.yml")
+                before = path.read_bytes()
+                with self.assertRaises(PilferError):
+                    self._set(key, value, path)
+                self._assert_untouched(path, before)
+
+    def test_adding_after_a_value_that_only_has_an_anchor_still_works(self) -> None:
+        path = self._encrypt("prod:\n  items: 1\n  y: &a v\nafter: z\n", "anchor-last.yml")
+        self.assertEqual(self._set("prod.new", "n", path), "added")
+        plain = _vault().decrypt(path.read_bytes()).decode()
+        self.assertIn('  y: &a v\n  new: "n"\nafter: z\n', plain)
+
+    def test_a_jinja2_header_value_is_written_unsafe(self) -> None:
+        value = "#jinja2:x\ny"
+        self.assertEqual(self._set("beta", value), "added")
+        self.assertIn(f"beta: !unsafe {json.dumps(value)}", self._view())
+
+    def test_a_non_scalar_target_is_refused(self) -> None:
+        for key, text in {"m": "m:\n  a: 1\n", "l": "l:\n  - 1\n", "b": "b: |\n  line\n"}.items():
+            with self.subTest(key=key):
+                path = self._encrypt(text, f"{key}.yml")
+                before = path.read_bytes()
+                with self.assertRaises(PilferError):
+                    self._set(key, "v", path)
+                self._assert_untouched(path, before)
 
 
 # Child that takes the lock, prints "H", then reads stdin until EOF. A holder

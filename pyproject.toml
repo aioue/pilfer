@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pilfer"
-version = "3.0.0"
+version = "3.1.0"
 authors = [
     {name = "Tom Paine", email = "github@aioue.net"},
 ]
@@ -35,6 +35,8 @@ dependencies = [
     # 2.21 is the floor CI tests: CLI.setup_vault_secrets(initialize_context=)
     # and VaultHelper are recent. No upper bound; CI also tests the latest core.
     "ansible-core>=2.21",
+    # Generates the bash and zsh completion scripts for `pilfer completion`.
+    "shtab>=1.7",
 ]
 keywords = [
     "ansible",
@@ -78,3 +80,8 @@ include = ["pilfer*"]
 exclude_dirs = ["tests", ".venv", "build", "dist"]
 # Intentional best-effort cleanup paths (same policy as ruff SIM105 ignore).
 skips = ["B110"]
+
+[tool.setuptools.package-data]
+# agent_guide/ has no __init__.py, so find does not see it as a package; this
+# ships SKILL.md inside pilfer for `pilfer agent-guide`.
+pilfer = ["agent_guide/*.md"]

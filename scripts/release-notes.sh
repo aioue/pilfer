@@ -13,6 +13,21 @@ fi
 version="$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
 echo "## pilfer ${version}"
 echo
+
+# The README's "## What's new in MAJOR.MINOR" section, for any version, so the
+# release page lists the changes in prose above the commit subjects.
+if [[ "${version}" =~ ^([0-9]+\.[0-9]+)\. ]]; then
+  whats_new="$(awk -v h="## What's new in ${BASH_REMATCH[1]}" '
+    $0 == h { on = 1; next }
+    on && /^## / { exit }
+    on { print }
+  ' README.md)"
+  if [[ -n "${whats_new//[[:space:]]/}" ]]; then
+    echo "### What's new"
+    printf '%s\n' "${whats_new}"
+    echo
+  fi
+fi
 echo "### Summary"
 git log ${range} --pretty=format:'- %s (%h)' --no-merges
 echo
