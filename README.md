@@ -55,18 +55,6 @@ Add to `ansible.cfg` so you do not need `-p` on every run:
 vault_password_file = ~/.ansible-vault/.vault-file
 ```
 
-## Upgrading to 3.0
-
-- Pilfer needs Python 3.12+ and ansible-core 2.21+ (was Python 3.10+ and ansible 2.9+). It depends on ansible-core instead of ansible.
-- With `vault_id_match = True`, a `-p` password no longer opens a labelled file. `ansible-vault` refuses it too.
-- Library callers get Ansible's config as of import.
-- Non-UTF-8 password files are read as bytes, as Ansible reads them.
-- Commands that load passwords need a UTF-8 locale, as `ansible-vault` does. `LC_ALL=C` fails; use `C.UTF-8`. `--help` and `--version` work in any locale.
-- Password scripts and `-client` scripts now run ([#18](https://github.com/aioue/pilfer/issues/18)). An executable password file named by `-p`, `--vault-id` or `ansible.cfg` is run. Pilfer's own fallback files are read, never run (see [Vault passwords](https://github.com/aioue/pilfer#vault-passwords)).
-- `./ansible.cfg` in the current directory is read by Ansible, and a password script it names is run, as `ansible-vault` does. Do not run pilfer in a tree you do not trust, or set `ANSIBLE_CONFIG` or pass `-p`. 2.x only read the path.
-- A `vault_password_file` in `ansible.cfg` that does not exist is now an error. 2.x fell back to pilfer's fallback files.
-- Do not run pilfer 2.x and 3.x on the same tree at the same time. They handle lock files differently.
-
 ## Features
 
 - **Fail-safe:** & battle tested. Power outages and fat-fingers won't lose data
@@ -77,6 +65,7 @@ vault_password_file = ~/.ansible-vault/.vault-file
 - **Native Ansible:** uses Ansible's own code for operations - no surprises
 - **Better than native:** `pilfer set` inserts a key secret into a vault file in one command
 - **New in 3.0, keyring client:** keep the vault password in the macOS Keychain or Linux Secret Service
+- **Extensible:** works with any client script, e.g. `age` with a YubiKey or Secure Enclave plugin
 
 ## Usage
 
