@@ -91,20 +91,34 @@ vault_password_file = ~/.ansible-vault/.vault-file
 ```
 pilfer [--version] COMMAND ...
 
-Commands: open | close | find-keys | set | update | rekey | completion
+Commands: open | close | status | find-keys | set | update | rekey | completion
 
 pilfer open [--include-encrypted-vars] [-q] [VAULT OPTIONS]
 pilfer close [--confirm-delete] [VAULT OPTIONS]
+pilfer status [--json]
 pilfer find-keys [-E] [-i] [--path] [--include-encrypted-vars] [-l | --json] [PATTERN ...] [VAULT OPTIONS]
-pilfer update [--file FILE] [--include-encrypted-vars] [VAULT OPTIONS] KEY [VALUE]
+pilfer update [--file FILE] [--include-encrypted-vars] [--dry-run] [VAULT OPTIONS] KEY [VALUE]
 pilfer rekey [--old-vault-password-file OLD]... [--old-vault-id ID]... (--new-vault-password-file NEW | --new-vault-id ID) [options]
-pilfer set [VAULT OPTIONS] FILE KEY [VALUE]
+pilfer set [--dry-run] [VAULT OPTIONS] FILE KEY [VALUE]
 pilfer completion [--install] [bash | zsh]
 
 VAULT OPTIONS: [--vault-id ID]... [-p VAULT_PASSWORD_FILE]... [-J]
 ```
 
 Run `pilfer --help` or `pilfer COMMAND --help` for full options and examples.
+
+### Check for an open session
+
+`pilfer status` says whether a session is open and which files hold plaintext because of it. It needs no vault password, changes nothing and never prints a value.
+
+```
+$ pilfer status
+Session open: 2 files hold plaintext. Run 'pilfer close' to re-encrypt them.
+  group_vars/all/vault.yml  (whole-file)
+  inline.yml  (inline)
+```
+
+With no session it prints `No session open.` and exits 0. A session that `open` left before decrypting anything is reported as incomplete; `pilfer close` clears it. `--json` prints one object: `{"open": true, "incomplete": false, "files": [{"file": "...", "kind": "file"}]}`, where `kind` is `file` or `inline`. The exit status is 0 unless something went wrong, such as a damaged session list, which exits 2.
 
 ### Find which file holds a key
 
@@ -132,6 +146,8 @@ pilfer update db_password
 
 Values are read as for `pilfer set`. Update never creates a key; it points you to `pilfer set FILE KEY`. If several files hold the key, it lists them and asks for `--file FILE`. A key that exists only as an inline `!vault` value needs `--include-encrypted-vars`, and the new value keeps its vault-id label. Update refuses files open in a session.
 
+See [Preview a change, and unchanged values](#preview-a-change-and-unchanged-values) for `--dry-run` and what happens when the value is already stored.
+
 ### Set a single value
 
 Use `pilfer set` to add or replace a key in a whole-file vault without opening a session:
@@ -153,6 +169,29 @@ Piped input drops one trailing newline, so `echo` works too. You can pass the va
 The value stays in memory and is saved as a string, even if it looks like a YAML boolean or number. New keys are appended; replacing an existing scalar preserves any inline comment on its line. Values containing `{{`, `{%` or `{#` are tagged `!unsafe` so Ansible uses them as typed. An existing `!unsafe` tag is kept when the new text would still load as a string. `!unsafe "0123"`, `!unsafe "yes"`, and `!unsafe` dates are stored as plain quoted strings, because Ansible would otherwise retype them.
 
 Pilfer refuses plaintext files, files in an open Pilfer session, and key names that YAML reads as a boolean or null, such as `yes`, `on` and `null`. If the operation fails, the original ciphertext remains unchanged. Pilfer replaces the file while preserving its mode; hard links continue to point to the old content.
+
+### Preview a change, and unchanged values
+
+`--dry-run` on `set` and `update` runs every check of a real run and stops before writing. It prints `would update KEY in FILE` or `would add KEY in FILE`:
+
+```bash
+pilfer set --dry-run secrets.yml db_password
+pilfer update --dry-run db_password
+```
+
+It reads no value, so nothing prompts and stdin is left alone; a VALUE argument is ignored. It still needs the vault password for a whole-file vault, and it refuses what a real run refuses: a missing file, an ambiguous or missing key, a bad path, a file open in a session.
+
+When the new value equals the stored one, `set` and `update` print `unchanged KEY in FILE` and exit 0 without rewriting the file, so git sees no new vault blob and the modification time stays. The comparison happens in memory. A plain value and an `!unsafe` one differ, so switching between them counts as a change.
+
+### Without a terminal
+
+Pilfer does not wait for input it cannot get. With no terminal, these stop at once with an error that names the alternative:
+
+- `-J` or `--vault-id LABEL@prompt`: use `-p FILE` or `--vault-id LABEL@FILE`. A password is never read from piped input, so a value piped to `set` or `update` cannot be taken for one.
+- `set` or `update` with no VALUE and nothing on stdin: pipe the value in, or pass it as the last argument.
+- `rekey` without `--yes`: the `REKEY` confirmation needs a terminal. `--new-vault-id prompt` and `--old-vault-id LABEL@prompt` need one too.
+
+Behaviour at a terminal is unchanged. Piping a value to `set` while typing the password at the terminal still works.
 
 #### Set values from Python
 

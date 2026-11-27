@@ -1151,6 +1151,18 @@ def _cleanup_entry_backups(vaulted_file_path: str) -> None:
         pass  # not empty: close reports what is left in .vault
 
 
+def _never_opened(entry) -> bool:
+    """True for an entry an interrupted open never reached (see _drop_never_opened)."""
+    if _entry_has_open_artifacts(entry):
+        return False
+    try:
+        with open(entry["path"], "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return False
+    return _path_still_vault_ciphertext(entry, data)
+
+
 def _drop_never_opened(entries):
     """Leave out entries an interrupted open never reached.
 
@@ -1161,16 +1173,9 @@ def _drop_never_opened(entries):
     """
     kept = []
     for entry in entries:
-        path = entry["path"]
-        if not _entry_has_open_artifacts(entry):
-            try:
-                with open(path, "rb") as handle:
-                    data = handle.read()
-            except OSError:
-                data = None
-            if data is not None and _path_still_vault_ciphertext(entry, data):
-                print(f"ℹ️  Skipping {path}: it was never opened.")
-                continue
+        if _never_opened(entry):
+            print(f"ℹ️  Skipping {entry['path']}: it was never opened.")
+            continue
         kept.append(entry)
     return kept
 
@@ -1596,6 +1601,10 @@ def _confirm_rekey(yes: bool, *, action: str) -> None:
     """Require interactive REKEY confirmation unless --yes."""
     if yes:
         return
+    # input() reads stdin. Piped, that is whatever the pipe holds, so a script
+    # could "confirm" by accident; make it say --yes on purpose.
+    if sys.stdin is None or not sys.stdin.isatty():
+        raise PilferError("Confirmation required: there is no terminal to ask on; pass --yes.")
     try:
         answer = input(f"Type REKEY to {action}: ")
     except EOFError as exc:
@@ -1736,6 +1745,7 @@ _TOP_EXAMPLES = """
 Examples:
   pilfer open                           decrypt the vault files in this tree
   pilfer close                          re-encrypt them when you are done
+  pilfer status                         is anything still decrypted?
   pilfer find-keys '*token*'            which vault files hold a key like this
   pilfer set secrets.yml db_password    change one key without opening anything
 """
@@ -1773,6 +1783,22 @@ and password that decrypted it, as ansible-vault edit does, so close needs the
 same password sources as open.
 """
 
+_STATUS_EXAMPLES = """
+Examples:
+  pilfer status                             is a session open, and which files
+  pilfer status --json                      the same as one JSON object, for scripts
+"""
+
+_STATUS_NOTES = """
+Status reads the session list in the current directory. It prints paths, never
+values, needs no vault password and changes nothing. Kind is whole-file for a
+file open decrypted entirely, inline for one with decrypted !vault values.
+An incomplete session is one where open was interrupted before it decrypted
+anything; 'pilfer close' clears it.
+
+Exit status: 0 on success (open or not), 2 on an error.
+"""
+
 _SET_EXAMPLES = """
 Examples:
   pilfer set secrets.yml db_password        prompts for the value, hidden
@@ -1780,6 +1806,7 @@ Examples:
   pilfer set secrets.yml 'users[0].password'
   printf '%s' "$TOKEN" | pilfer set secrets.yml api_token
   pilfer set secrets.yml api_token -- '-starts-with-a-dash'
+  pilfer set --dry-run secrets.yml db_password      check only, read no value
 """
 
 _SET_NOTES = """
@@ -1796,6 +1823,15 @@ is refused. Plaintext files and files open in a pilfer session are refused.
 Leave VALUE out to read it from stdin: a hidden prompt on a terminal, otherwise
 the whole input minus one trailing newline. A VALUE argument shows in ps and in
 shell history.
+
+Without a terminal, set stops with an error instead of waiting: when nothing is
+on stdin, and when a password prompt (-J, --vault-id LABEL@prompt) has nobody to
+answer it. Use -p FILE or --vault-id LABEL@FILE and pipe the value in.
+
+A value that is already stored is left alone: the file is not rewritten and set
+prints "unchanged". --dry-run runs the same checks, prints what would be added or
+updated and writes nothing. It reads no value (a VALUE is ignored) but needs the
+vault password.
 """
 
 _FIND_EXAMPLES = """
@@ -1821,13 +1857,17 @@ Examples:
   pilfer update aws.prod.secret_key
   pilfer update db_password --file inventory/group_vars/prod/secrets.yml
   printf '%s' "$TOKEN" | pilfer update api_token
+  pilfer update --dry-run db_password       which file would change, no value read
 """
 
 _UPDATE_NOTES = """
 Update finds the file that holds KEY. If several files do, it lists them and
 asks for --file. It never creates a key: use 'pilfer set FILE KEY' for that.
 Value rules and the leading-dash rule are the same as for 'pilfer set'.
-Files open in a pilfer session are refused.
+Files open in a pilfer session are refused. Without a terminal, update stops
+with an error instead of waiting, as set does. A value that is already stored
+prints "unchanged" and the file is not rewritten. --dry-run prints "would
+update" and writes nothing.
 """
 
 _REKEY_EXAMPLES = """
@@ -1847,6 +1887,9 @@ The old password loads as it does for open: --old-vault-password-file,
 Inline !vault values are included by default. Rekey refuses a tree with !vault
 values in a form pilfer cannot rewrite, because they would stay on the old
 password.
+
+The REKEY prompt needs a terminal; without one, pass --yes. A password prompt
+(--old-vault-id LABEL@prompt, --new-vault-id prompt) needs one too.
 """
 
 _COMPLETION_EXAMPLES = """
@@ -1948,7 +1991,7 @@ _DEFAULT_PASSWORD_HELP = (
 
 
 def _build_argument_parser():
-    """Build the pilfer CLI parser (commands: open, close, find-keys, set, update, rekey, completion)."""
+    """Build the pilfer CLI parser (commands: open, close, status, find-keys, set, update, rekey, completion)."""
     parser = _Parser(
         prog="pilfer",
         description="Decrypt Ansible vault files in a project, edit them, then re-encrypt.",
@@ -2020,6 +2063,20 @@ def _build_argument_parser():
     )
     _add_vault_options(close_parser, "Password file or script; repeatable (what open used)")
 
+    status_parser = command(
+        "status",
+        "Show whether a session is open",
+        "Show whether a pilfer session is open and which files hold plaintext because of it.",
+        "[OPTIONS]",
+        _STATUS_EXAMPLES,
+        _STATUS_NOTES,
+    )
+    status_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="One JSON object: open, incomplete, files (file, kind)",
+    )
+
     find_parser = command(
         "find-keys",
         "Show which vault files hold a key",
@@ -2088,6 +2145,11 @@ def _build_argument_parser():
         nargs="?",
         help="New string value (default: read stdin or prompt; use -- before a leading dash)",
     )
+    set_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check the file and key and say what would change, reading no value and writing nothing",
+    )
     _add_vault_options(set_parser, _DEFAULT_PASSWORD_HELP)
 
     update_parser = command(
@@ -2116,6 +2178,11 @@ def _build_argument_parser():
         "--include-encrypted-vars",
         action="store_true",
         help="Also replace inline !vault values, keeping each one's vault id",
+    )
+    update_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check the file and key and say what would change, reading no value and writing nothing",
     )
     _add_vault_options(update_parser, _DEFAULT_PASSWORD_HELP)
 
@@ -2229,6 +2296,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
+        if args.action == "status":
+            return _run_status(args)
         if args.action == "set":
             return _run_set(args)
         if args.action == "completion":
@@ -2298,6 +2367,55 @@ def main(argv=None):
     return 0
 
 
+def _run_status(args) -> int:
+    """Report the open session from its list and artifacts. Reads only; no password, no lock."""
+    try:
+        _refuse_planted_session_links()
+        report = {"open": False, "incomplete": False, "files": []}
+        if _session_is_open():
+            entries = _load_session()
+            report["open"] = True
+            report["incomplete"] = _session_is_incomplete(entries)
+            if not report["incomplete"]:
+                report["files"] = [
+                    {"file": os.path.relpath(entry["path"]), "kind": entry.get("kind", "file")}
+                    for entry in entries
+                    if not _never_opened(entry)
+                ]
+    except Exception as exc:
+        # find-keys' convention: 2 is an error, so a script can tell it from "no session".
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report))
+        return 0
+    files = report["files"]
+    if not report["open"]:
+        print("No session open.")
+    elif report["incomplete"]:
+        print(
+            "Session open, but incomplete: open was interrupted before it decrypted "
+            "anything. Run 'pilfer close' to clear it."
+        )
+    elif not files:
+        print("Session open: no files hold plaintext. Run 'pilfer close' to clear it.")
+    else:
+        count = len(files)
+        print(
+            f"Session open: {count} files hold plaintext. Run 'pilfer close' to re-encrypt them."
+            if count > 1
+            else "Session open: 1 file holds plaintext. Run 'pilfer close' to re-encrypt it."
+        )
+        for item in files:
+            kind = "whole-file" if item["kind"] == "file" else item["kind"]
+            print(f"  {item['file']}  ({kind})")
+    return 0
+
+
+# set_keys reports past tense; a dry run says what the real run would do.
+_DRY_VERBS = {"added": "add", "updated": "update"}
+
+
 def _run_set(args) -> int:
     # Imported here: vault_set imports helpers from this module.
     from pilfer.vault_set import read_value, set_keys
@@ -2310,6 +2428,15 @@ def _run_set(args) -> int:
     # Loaded once: the check and the write both need it, and a password
     # script or prompt should run one time.
     vault = load_vault(_sources(args))
+    if args.dry_run:
+        # Same checks as a real run, then stop: no value is read, so nothing
+        # asks for one, and check_only never replaces the vault.
+        actions = set_keys(
+            args.file, {args.key: "pilfer-set-check-placeholder"}, vault, check_only=True
+        )
+        print(f"would {_DRY_VERBS[actions[args.key]]} {args.key} in {args.file}")
+        _warn_unused_sources(vault, args.file)
+        return 0
     if value is None:
         # Refuse before asking for the secret, not after someone has pasted it.
         set_keys(args.file, {args.key: "pilfer-set-check-placeholder"}, vault, check_only=True)

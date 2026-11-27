@@ -319,6 +319,11 @@ def run_update(args) -> int:
             )[args.key]
         return update_inline_value(target.file, args.key, value, secrets, check_only=check_only)
 
+    if args.dry_run:
+        write(PLACEHOLDER, True)
+        print(f"would update {shown} in {_shown(target.file)}")
+        _warn_unused_sources(secrets, _shown(target.file))
+        return 0
     value = args.value
     if value is None:
         # Refuse before asking for the secret, not after someone has pasted it.

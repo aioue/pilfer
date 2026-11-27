@@ -16,6 +16,7 @@ secret takes the first one loaded, which is wrong once there are several.
 """
 
 import os
+import sys
 from dataclasses import dataclass
 
 import ansible.constants as C
@@ -129,6 +130,44 @@ def _read_plain_password_file(path: str) -> VaultSecret:
     return secret
 
 
+def _can_prompt() -> bool:
+    """True when a hidden prompt would reach a person.
+
+    Ansible's prompt is getpass, which writes to and reads from /dev/tty, and
+    only when that cannot be opened falls back to stdin. Without a terminal
+    that fallback would read a piped line as the password, and for set and
+    update that line is the value. So a prompt needs stdin to be a terminal or
+    a controlling terminal to exist.
+    """
+    stdin = sys.stdin
+    if stdin is not None and stdin.isatty():
+        return True
+    try:
+        os.close(os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY))
+    except OSError:
+        return False
+    return True
+
+
+def require_terminal_for_prompt(asked_by: str, instead: str) -> None:
+    """Refuse a password prompt with no terminal to answer it, before any is shown."""
+    if not _can_prompt():
+        raise PilferError(
+            f"{asked_by} asks for the password on a terminal, and there is none here. "
+            f"Use {instead}."
+        )
+
+
+def _prompt_flag(sources: VaultSources, vault_ids) -> str | None:
+    """The first flag (or config entry) that makes load_secrets prompt, else None."""
+    if sources.ask:
+        return "-J"
+    for slug in vault_ids:
+        if _cli().split_vault_id(slug)[1] in PROMPT_SOURCES:
+            return f"--vault-id {slug}"
+    return None
+
+
 def load_secrets(sources=None) -> Secrets:
     """Every secret Ansible would load for these flags, as [(vault_id, secret)].
 
@@ -147,6 +186,10 @@ def load_secrets(sources=None) -> Secrets:
         if fallback is None:
             raise PilferError(NO_SOURCE_MESSAGE)
         return [(C.DEFAULT_VAULT_IDENTITY, _read_plain_password_file(fallback))]
+    flag = _prompt_flag(sources, vault_ids)
+    if flag:
+        # Before any password script runs: fail with nothing half done.
+        require_terminal_for_prompt(flag, "-p FILE or --vault-id LABEL@FILE")
     try:
         return _cli().setup_vault_secrets(
             DataLoader(),
@@ -303,6 +346,11 @@ def load_new_secret(sources, old_secrets: Secrets = ()) -> tuple[str, VaultSecre
     label, source = _cli().split_vault_id(slugs[0])
     _require_writable_label(label)
     vault_id = label or default
+    if source in PROMPT_SOURCES:
+        require_terminal_for_prompt(
+            f"--new-vault-id {slugs[0]}",
+            "--new-vault-password-file FILE or --new-vault-id LABEL@FILE",
+        )
     try:
         if source in PROMPT_SOURCES:
             secret = PromptVaultSecret(

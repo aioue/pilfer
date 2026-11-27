@@ -531,9 +531,13 @@ def _update_inline(path: Path, keypath: list, value: str, vault: VaultLib, check
         raise PilferError(f"{shown} in {path} is not in the `!vault |` block form pilfer rewrites")
     span = spans[0]
     try:
-        vault.decrypt(span.ciphertext)
+        current = vault.decrypt(span.ciphertext)
     except Exception:
         raise PilferError(f"could not decrypt {shown} in {path} with this vault password") from None
+    # Same value: leave the file alone, so git sees no new vault blob and the
+    # mtime stays. Compared in memory only.
+    if current == value.encode("utf-8"):
+        return "unchanged"
     try:
         ciphertext = encrypt_like(vault, value.encode("utf-8"), span.ciphertext)
     except RoundTripError:
@@ -565,6 +569,12 @@ def read_value(key: str) -> str:
         except EOFError:
             raise PilferError(f"no value for {key}") from None
     data = stdin.buffer.read(MAX_STDIN_VALUE_BYTES + 1)
+    if not data:
+        # Nothing piped (</dev/null, cron, a closed pipe): say how to give one.
+        raise PilferError(
+            f"no value for {key}: stdin is not a terminal and is empty. "
+            "Pipe the value on stdin or pass it as VALUE"
+        )
     if len(data) > MAX_STDIN_VALUE_BYTES:
         raise PilferError(f"value for {key} on stdin is over {MAX_STDIN_VALUE_BYTES} bytes")
     try:
