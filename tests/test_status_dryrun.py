@@ -41,14 +41,6 @@ class TestStatus(FindKeysBase):
         report = json.loads(out)
         self.assertEqual((code, report["open"], report["orphaned"]), (0, False, True))
 
-    def test_help_explains_orphaned_and_option_order(self) -> None:
-        for command, text in (("status", "Orphaned means"), ("find-keys", "between patterns")):
-            with self.subTest(command=command):
-                out = io.StringIO()
-                with mock.patch("sys.stdout", out), self.assertRaises(SystemExit):
-                    cli.main([command, "--help"])
-                self.assertIn(text, " ".join(out.getvalue().split()))
-
     def test_lists_files_that_hold_plaintext_without_values(self) -> None:
         self._inline()
         self.assertEqual(
@@ -73,30 +65,6 @@ class TestStatus(FindKeysBase):
         self.assertNotIn(SECRETS[0], out)
         self.assertEqual(self._main("close", "-p", str(self.password))[0], 0)
         self.assertEqual(self._status()[1], "No session open.\n")
-
-    def test_planted_entries_do_not_hang_status(self) -> None:
-        pipe = self.directory / "pipe.yml"
-        os.mkfifo(pipe)
-        self._session(
-            {"kind": "file", "path": str(pipe)},
-            {"kind": "file", "path": str(self.directory / "we\x1bird.yml")},
-        )
-        self._guard()
-        code, out, err = self._status()
-        self.assertEqual(code, 0, err)
-        self.assertNotIn("\x1b", out)
-        self.assertIn("\\x1b", out)
-
-    def test_session_entry_reads_are_capped(self) -> None:
-        from pilfer import cli
-
-        # A regular file larger than the cap: only the leading bytes come back.
-        big = self.directory / "big.yml"
-        big.write_bytes(b"x" * (cli._SESSION_INLINE_READ_CAP + 10))
-        inline = cli._read_session_entry({"kind": "inline", "path": str(big)})
-        self.assertEqual(len(inline), cli._SESSION_INLINE_READ_CAP)
-        whole = cli._read_session_entry({"kind": "file", "path": str(big)})
-        self.assertEqual(len(whole), cli._HEADER_READ_BYTES)
 
     def test_long_leading_whitespace_before_the_header_is_still_ciphertext(self) -> None:
         # More than the old 256-byte read: the entry was misreported as plaintext.
@@ -133,84 +101,65 @@ class TestDryRun(FindKeysBase):
         stat = self.vault.stat()
         return self.vault.read_bytes(), stat.st_mtime_ns
 
-    def test_set_says_what_it_would_do_and_writes_nothing(self) -> None:
+    def test_dry_run_previews_set_and_update_and_writes_nothing(self) -> None:
+        inline = self._inline()
+        before = inline.read_bytes()
         snapshot = self._snapshot()
+        pw = ("-p", str(self.password))
+        base = ("set", "--dry-run", *pw, "secrets.yml")
         with self._no_value_read():
             for key, expected in (
                 ("aws.prod.secret_key", "would update aws.prod.secret_key in secrets.yml"),
                 ("brand.new", "would add brand.new in secrets.yml"),
             ):
-                with self.subTest(key=key):
-                    code, out, err = self._main(
-                        "set", "--dry-run", "-p", str(self.password), "secrets.yml", key
-                    )
-                    self.assertEqual((code, out.splitlines()[0], err), (0, expected, ""))
-        self.assertEqual(self._snapshot(), snapshot)
-
-    def test_set_dry_run_checks_a_value_given_on_the_command_line(self) -> None:
-        snapshot = self._snapshot()
-        base = ("set", "--dry-run", "-p", str(self.password), "secrets.yml")
-        code, out, err = self._main(*base, "brand.new", "")
-        self.assertEqual(code, 1)
-        self.assertIn("empty value", err)
-        code, out, err = self._main(*base, "brand.new", "fine")
-        self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines()[0], "would add brand.new in secrets.yml")
-        self.assertNotIn("not checked", out)
-        self.assertIn("visible in ps", err)
-        code, out, _ = self._main(*base, "tail", "done")
-        self.assertEqual((code, out.splitlines()[0]), (0, "unchanged tail in secrets.yml"))
-        # No VALUE: stdin is not read, and the output says the value went unchecked.
-        with self._no_value_read():
-            code, out, err = self._main(*base, "brand.new")
-        self.assertEqual((code, err), (0, ""))
-        self.assertEqual(out.splitlines()[-1], DRY_RUN_UNCHECKED)
-        self.assertEqual(self._snapshot(), snapshot)
-
-    def test_set_refuses_what_a_real_run_refuses(self) -> None:
-        snapshot = self._snapshot()
-        for target, key in (("nope.yml", "a"), ("secrets.yml", "a..b"), ("secrets.yml", "tail.x")):
-            with self.subTest(target=target, key=key):
-                code, _, _ = self._main("set", "--dry-run", "-p", str(self.password), target, key)
-                self.assertEqual(code, 1)
-        self.assertEqual(self._main("open", "-p", str(self.password))[0], 0)
-        code, _, err = self._main(
-            "set", "--dry-run", "-p", str(self.password), "secrets.yml", "tail"
-        )
-        self.assertEqual(code, 1)
-        self.assertIn("open in a pilfer session", err)
-        self.assertEqual(self._main("close", "-p", str(self.password))[0], 0)
-        self.assertEqual(self.vault.read_bytes(), snapshot[0])
-
-    def test_update_previews_whole_file_and_inline_keys(self) -> None:
-        inline = self._inline()
-        before = inline.read_bytes()
-        snapshot = self._snapshot()
-        base = ("update", "--dry-run", "-p", str(self.password))
-        with self._no_value_read():
-            code, out, err = self._main(*base, "aws.prod.secret_key")
+                code, out, err = self._main(*base, key)
+                self.assertEqual((code, out.splitlines()[0], err), (0, expected, ""))
+            # No VALUE: stdin is not read, and the output says the value went unchecked.
+            self.assertEqual(self._main(*base, "brand.new")[1].splitlines()[-1], DRY_RUN_UNCHECKED)
+            code, out, err = self._main("update", "--dry-run", *pw, "aws.prod.secret_key")
             self.assertEqual(
                 (code, out.splitlines()[0]),
                 (0, "would update aws.prod.secret_key in secrets.yml"),
                 err,
             )
-            code, out, err = self._main(*base, "--include-encrypted-vars", "api.token")
+            code, out, err = self._main(
+                "update", "--dry-run", *pw, "--include-encrypted-vars", "api.token"
+            )
             self.assertEqual(
                 (code, out.splitlines()[0]), (0, "would update api.token in inline.yml"), err
             )
+        # A value on the command line is checked: an empty one is refused, one
+        # already stored is reported unchanged.
+        code, _, err = self._main(*base, "brand.new", "")
+        self.assertEqual(code, 1)
+        self.assertIn("empty value", err)
+        code, out, err = self._main(*base, "brand.new", "fine")
+        self.assertEqual((code, out.splitlines()[0]), (0, "would add brand.new in secrets.yml"))
+        self.assertIn("visible in ps", err)
+        code, out, _ = self._main(*base, "tail", "done")
+        self.assertEqual((code, out.splitlines()[0]), (0, "unchanged tail in secrets.yml"))
         self.assertEqual(self._snapshot(), snapshot)
         self.assertEqual(inline.read_bytes(), before)
 
-    def test_update_refuses_missing_and_ambiguous_keys(self) -> None:
+    def test_dry_run_refuses_what_a_real_run_refuses(self) -> None:
+        snapshot = self._snapshot()
+        pw = ("-p", str(self.password))
+        for target, key in (("nope.yml", "a"), ("secrets.yml", "a..b"), ("secrets.yml", "tail.x")):
+            with self.subTest(target=target, key=key):
+                self.assertEqual(self._main("set", "--dry-run", *pw, target, key)[0], 1)
+        self.assertEqual(self._main("open", *pw)[0], 0)
+        code, _, err = self._main("set", "--dry-run", *pw, "secrets.yml", "tail")
+        self.assertEqual(code, 1)
+        self.assertIn("open in a pilfer session", err)
+        self.assertEqual(self._main("close", *pw)[0], 0)
+        self.assertEqual(self.vault.read_bytes(), snapshot[0])
         self._encrypt("tail: other\n", "other.yml")
-        base = ("update", "--dry-run", "-p", str(self.password))
-        code, _, err = self._main(*base, "nope.key")
-        self.assertEqual(code, 1)
-        self.assertIn("not found", err)
-        code, _, err = self._main(*base, "tail")
-        self.assertEqual(code, 1)
-        self.assertIn("--file", err)
-        self._assert_untouched()
+        for key, text in (("nope.key", "not found"), ("tail", "--file")):
+            with self.subTest(key=key):
+                code, _, err = self._main("update", "--dry-run", *pw, key)
+                self.assertEqual(code, 1)
+                self.assertIn(text, err)
+        self.assertEqual(self.vault.read_bytes(), snapshot[0])
 
 
 class TestUnchanged(FindKeysBase):

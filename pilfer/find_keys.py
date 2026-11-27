@@ -17,16 +17,13 @@ import fnmatch
 import json
 import os
 import re
-import shlex
 import sys
 from dataclasses import dataclass
 
 from ansible.parsing.vault import AnsibleVaultFormatError
 
 from pilfer.cli import (
-    MAX_READ_BYTES,
     PilferError,
-    _check_session_path,
     _classify_file_bytes,
     _describe_skipped_vault_values,
     _encrypted_backup_path,
@@ -34,11 +31,9 @@ from pilfer.cli import (
     _is_regular_file,
     _load_session,
     _open_sidecar_path,
-    _read_no_follow,
     _refuse_planted_session_links,
     _session_is_open,
     _sources,
-    _too_large_message,
     _warn_unused_sources,
     safe_multiline,
     safe_text,
@@ -57,19 +52,22 @@ from pilfer.vault_secrets import (
     require_terminal_if_prompting,
     vault_label,
 )
-from pilfer.vault_set import CHECK_PLACEHOLDER, DRY_RUN_UNCHECKED, _clip, _shown_path
+from pilfer.vault_set import CHECK_PLACEHOLDER, DRY_RUN_UNCHECKED, _shown_path, read_capped
 
 # Per-file failure lines printed before the rest are summarised.
 MAX_FAILURE_LINES = 5
 
 
+def _capped(lines: list[str], more: str) -> list[str]:
+    """The first MAX_FAILURE_LINES lines, then `more` (with {n} the rest), so a mass failure stays short."""
+    extra = len(lines) - MAX_FAILURE_LINES
+    return lines[:MAX_FAILURE_LINES] + ([more.format(n=extra)] if extra > 0 else [])
+
+
 def _listing(names) -> str:
-    """Sorted, escaped names, one per line, capped so a mass failure stays short."""
-    names = sorted(safe_text(name) for name in names)
-    lines = [f"  {name}" for name in names[:MAX_FAILURE_LINES]]
-    if len(names) > MAX_FAILURE_LINES:
-        lines.append(f"  ... and {len(names) - MAX_FAILURE_LINES} more")
-    return "\n".join(lines)
+    """Sorted, escaped names, one per line, capped."""
+    lines = [f"  {name}" for name in sorted(safe_text(name) for name in names)]
+    return "\n".join(_capped(lines, "  ... and {n} more"))
 
 
 @dataclass
@@ -122,21 +120,12 @@ def _label_or_none(ciphertext: bytes) -> str | None:
         return None
 
 
-def _read(path: str) -> bytes:
-    # No-follow: a repo can plant a symlink where pilfer expects a vault file,
-    # a backup or a sidecar, and find-keys must not read through it.
-    data = _read_no_follow(path, "file", MAX_READ_BYTES + 1)
-    if len(data) > MAX_READ_BYTES:
-        raise PilferError(_too_large_message())
-    return data
-
-
 def _found_keys(documents) -> list:
     return [found for document in documents for found in walk_keys(document)]
 
 
 def _closed_hits(path: str, kind: str, vault: _LazyVault) -> list[KeyHit]:
-    data = _read(path)
+    data = read_capped(path, "file")
     if kind == "file":
         normalized = normalize_whole_file_vault(data)
         label = _label_or_none(normalized)
@@ -155,9 +144,7 @@ def _closed_hits(path: str, kind: str, vault: _LazyVault) -> list[KeyHit]:
                     f"(file uses vault id '{safe_text(label)}')"
                 ) from None
             raise PilferError("could not decrypt with this vault password") from None
-        # The parse cap is for plaintext inline files (attacker-controlled text),
-        # not for a vault the password holder encrypted.
-        _, documents = _compose(plaintext, limit=False, ansible_fallback=True)
+        _, documents = _compose(plaintext, ansible_fallback=True)
         return [KeyHit(path, found.path, "file", False, label) for found in _found_keys(documents)]
     _, documents = _compose(data, ansible_fallback=True)
     return [
@@ -171,14 +158,13 @@ def _open_hits(path: str, kind: str, include_inline: bool) -> list[KeyHit] | Non
     """Keys of a file open in a session, read from its plaintext. None if it is not open."""
     if not os.path.exists(_open_sidecar_path(path)):
         return None
-    data = _read(path)
+    data = read_capped(path, "file")
     if is_whole_file_vault(data):
         return None  # recorded but not yet decrypted: the scan reports it as closed
     if kind == "file":
-        # Decrypted whole-file plaintext is not capped (as in _closed_hits).
-        _, documents = _compose(data, limit=False, ansible_fallback=True)
+        _, documents = _compose(data, ansible_fallback=True)
         try:
-            label = vault_label(_read(_encrypted_backup_path(path)))
+            label = vault_label(read_capped(_encrypted_backup_path(path), "file"))
         except Exception:
             label = None
         return [KeyHit(path, found.path, "file", True, label) for found in _found_keys(documents)]
@@ -186,7 +172,7 @@ def _open_hits(path: str, kind: str, include_inline: bool) -> list[KeyHit] | Non
         return []
     labels = {}
     try:
-        meta = json.loads(_read(_inline_meta_path(path)))
+        meta = json.loads(read_capped(_inline_meta_path(path), "file"))
         labels = {span["id"]: span.get("vault_id") for span in meta["spans"]}
     except (PilferError, ValueError, KeyError, TypeError):
         pass
@@ -247,7 +233,7 @@ def collect_keys(
             path = os.path.abspath(entry["path"])
             if wanted and path != wanted:
                 continue
-            found = attempt(path, _open_entry, path, entry, include_inline)
+            found = attempt(path, _open_hits, path, entry.get("kind", "file"), include_inline)
             if found is not None:
                 seen.add(path)
                 hits.extend(found)
@@ -257,7 +243,7 @@ def collect_keys(
         targets = []
         if os.path.isfile(wanted) and not os.path.islink(wanted):
             kind = _classify_file_bytes(
-                wanted, _read(wanted), include_encrypted_vars=include_inline
+                wanted, read_capped(wanted, "file"), include_encrypted_vars=include_inline
             )
             if kind:
                 targets.append({"kind": kind, "path": wanted})
@@ -268,13 +254,12 @@ def collect_keys(
             report(f"pilfer: {safe_text(path)}: {reason}")
             failures.append(path)
         # Cannot be a vault by extension: worth knowing, not a failed search.
-        # Capped like the failures, so a tree of unreadable logs stays short.
-        for count, (path, reason) in enumerate(sorted(scan.unreadable_other)):
-            if count < MAX_FAILURE_LINES:
-                print(f"pilfer: warning: {safe_text(path)}: {reason}", file=sys.stderr)
-        extra = len(scan.unreadable_other) - MAX_FAILURE_LINES
-        if extra > 0:
-            print(f"pilfer: ... and {extra} more warning(s)", file=sys.stderr)
+        warnings = [
+            f"pilfer: warning: {safe_text(path)}: {reason}"
+            for path, reason in sorted(scan.unreadable_other)
+        ]
+        for line in _capped(warnings, "pilfer: ... and {n} more warning(s)"):
+            print(line, file=sys.stderr)
         if scan.skipped_vault_values:
             # Their names are not searched: say so, or a file whose only !vault
             # values are in unsupported forms looks like it holds no keys.
@@ -292,11 +277,6 @@ def collect_keys(
     if suppressed:
         print(f"pilfer: {suppressed} more file(s) could not be read", file=sys.stderr)
     return hits, failures
-
-
-def _open_entry(path: str, entry: dict, include_inline: bool):
-    _check_session_path(path)
-    return _open_hits(path, entry.get("kind", "file"), include_inline)
 
 
 def _shown(path: str) -> str:
@@ -420,31 +400,7 @@ def run_update(args) -> int:
         elif any(isinstance(segment, int) for segment in keypath):
             note = ""  # set cannot create a list item, so there is nothing to suggest
         else:
-            # A runnable command when the key fits on a line; a clipped key would
-            # not be one, so a long key gets the placeholder.
-            key_arg = shlex.quote(args.key) if _clip(args.key) == args.key else "KEY"
-            note = f"; to create it run: pilfer set FILE {key_arg}"
-            # A file that holds a proper prefix of the path is where set would
-            # create it. Ask set whether it would, so the hint is not a dead end.
-            holder = next(
-                (
-                    hit
-                    for hit in hits
-                    if hit.kind == "file" and hit.path == keypath[: len(hit.path)] and not hit.open
-                ),
-                None,
-            )
-            if holder is not None:
-                try:
-                    set_keys(
-                        _shown(holder.file),
-                        {args.key: CHECK_PLACEHOLDER},
-                        vault.get(),
-                        check_only=True,
-                        create=True,
-                    )
-                except PilferError as exc:
-                    note = f"; set cannot create it in {_shown(holder.file)}: {safe_multiline(str(exc))}"
+            note = "; to create it run: pilfer set FILE KEY"
         raise PilferError(f"{shown} not found in any vault file{note}")
     # One entry per file: a key twice in one file is set_keys' duplicate refusal,
     # not "in 2 files".

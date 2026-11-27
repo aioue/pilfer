@@ -131,73 +131,30 @@ _MERGE_TAG = "tag:yaml.org,2002:merge"
 def walk_keys(root: yaml.Node | None, path: list[PathSegment] | None = None) -> Iterator[KeyNode]:
     """Every mapping key under root, with its path. Nothing is constructed, so no value is read.
 
-    Non-scalar keys are skipped. The `<<` merge key is not yielded. Its mapping
-    (or each mapping of a `<<: [a, b]` sequence) contributes keys under the
-    current path. A mapping's own keys always win over merged ones, so a key
-    defined both ways is listed once, as the own one; own keys are all listed,
-    a repeated name included. Merge sources are visited in document order
-    (separate `<<` keys in order, sequence items in order), and a key supplied
-    by more than one source is listed once, by the first. No precedence among
-    merge sources is claimed: YAML loaders disagree (PyYAML 6.0.3 and 6.0.4
-    differ, and 6.0.4 even depends on string interning), and `pilfer update`
-    refuses a merge-only key anyway, so which source wins never matters here.
-
-    Keys are compared by text, so `yes` and `true` are two names here although
+    Non-scalar keys and `<<` merge keys are skipped: a key a merge supplies is
+    listed where its anchor defines it, not again under each mapping that merges
+    it. Keys are compared by text, so `yes` and `true` are two names here although
     YAML loads them as one key.
 
-    An alias reaches the anchor's node again. A node is walked once per call,
-    under the first path that reaches it: that cuts cycles, and stops an alias
+    An alias reaches the anchor's node again. A node is walked once, under the
+    first path that reaches it: that cuts recursive anchors and stops an alias
     bomb (a chain of anchors that each list the previous one twice) from being
-    walked 2**n times. So an already-walked merged anchor is skipped, and keys
-    reached only through it stay unlisted.
+    walked 2**n times.
     """
-    done: set[int] = set()
+    seen: set[int] = set()
 
     def visit(node, here):
-        if node is None or id(node) in done:
+        if node is None or id(node) in seen:
             return
-        done.add(id(node))
+        seen.add(id(node))
         if isinstance(node, yaml.MappingNode):
-            yield from visit_mapping(node, here, set())
+            for key, value in node.value:
+                if isinstance(key, yaml.ScalarNode) and key.tag != _MERGE_TAG:
+                    child = [*here, key.value]
+                    yield KeyNode(child, key.value, key, value)
+                    yield from visit(value, child)
         elif isinstance(node, yaml.SequenceNode):
             for index, item in enumerate(node.value):
                 yield from visit(item, [*here, index])
-
-    def visit_mapping(node, here, taken):
-        """Yield the keys of a mapping and add every name it yielded, own or merged, to `taken`.
-
-        `taken` holds the names already listed by a mapping that wins. A
-        mapping's own keys are all yielded, duplicates included (Ansible rejects
-        or takes the last one; that is not a reason to hide a key): only merged
-        keys are dropped when a name is already covered.
-
-        `taken` is one mutable set shared by a mapping and its merge sources.
-        Rebuilding it per source (`taken | own`) copies it each time, which is
-        quadratic with tens of thousands of sources.
-        """
-        merges = []
-        own = set()
-        for key, value in node.value:
-            if not isinstance(key, yaml.ScalarNode):
-                continue
-            if key.tag == _MERGE_TAG:
-                merges.append(value)
-                continue
-            own.add(key.value)
-            if key.value in taken:
-                continue
-            child = [*here, key.value]
-            yield KeyNode(child, key.value, key, value)
-            yield from visit(value, child)
-        # Updated in place, so what each merged item yields through its own
-        # nested `<<` is included: a name two sources reach transitively is
-        # listed once.
-        taken |= own
-        for value in merges:
-            items = value.value if isinstance(value, yaml.SequenceNode) else [value]
-            for item in items:
-                if isinstance(item, yaml.MappingNode) and id(item) not in done:
-                    done.add(id(item))
-                    yield from visit_mapping(item, here, taken)
 
     yield from visit(root, path or [])

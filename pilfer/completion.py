@@ -6,7 +6,6 @@ that would mean decrypting every vault on each Tab.
 """
 
 import os
-import subprocess
 from pathlib import Path
 
 import shtab
@@ -34,31 +33,6 @@ def _resolve_shell(name):
     return shell
 
 
-def _zsh_fpath_dir(home: Path):
-    """First writable directory under home on zsh's fpath, or None.
-
-    Asks an interactive zsh because fpath is usually built in ~/.zshrc. Its
-    other output (prompts, banners) is ignored, and any failure falls back.
-    """
-    try:
-        probe = subprocess.run(
-            ["zsh", "-ic", "print -l $fpath"],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    for line in probe.stdout.splitlines():
-        path = Path(line.strip())
-        under_home = path.is_absolute() and path.is_relative_to(home)
-        if under_home and path.is_dir() and os.access(path, os.W_OK):
-            return path
-    return None
-
-
 def _install(shell: str, script: str) -> int:
     home = Path.home()
     note = ""
@@ -66,9 +40,8 @@ def _install(shell: str, script: str) -> int:
         data = Path(os.environ.get("XDG_DATA_HOME") or home / ".local" / "share")
         target = data / "bash-completion" / "completions" / "pilfer"
     else:
-        found = _zsh_fpath_dir(home)
-        target = (found or home / ".zfunc") / "_pilfer"
-        note = "" if found else _ZSH_FPATH_NOTE
+        target = home / ".zfunc" / "_pilfer"
+        note = _ZSH_FPATH_NOTE
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
     except FileExistsError:

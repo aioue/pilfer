@@ -26,6 +26,7 @@ __description__ = (
 # user already chose (ANSIBLE_LOCAL_TEMP in the environment) is never replaced:
 # its failure is theirs to fix. An ansible.cfg local_tmp is never overridden in
 # the normal case because nothing is exported unless the import fails.
+import atexit as _atexit
 import importlib as _importlib
 import os as _os
 import shutil as _shutil
@@ -51,6 +52,8 @@ def _import_constants() -> None:
         del _os.environ["ANSIBLE_LOCAL_TEMP"]
         _shutil.rmtree(fallback, ignore_errors=True)
         raise
+    # Remove it when pilfer exits, so a run leaves nothing behind.
+    _atexit.register(_shutil.rmtree, fallback, ignore_errors=True)
 
 
 try:

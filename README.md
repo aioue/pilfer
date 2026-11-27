@@ -70,9 +70,7 @@ vault_password_file = ~/.ansible-vault/.vault-file
 - `rekey` and `open` now stop on (or warn about) files they cannot read, as `find-keys` does; see [Unreadable files](https://github.com/aioue/pilfer#unreadable-files).
 - Option abbreviations are rejected: `--files` is not short for `--files-with-matches`.
 - Changed from 3.0:
-  - `close` clears setuid, setgid, sticky and other-write bits from the restored mode.
   - `set` can now address nested paths and existing keys whose names are not identifiers, such as `a['dotted.key']`; a new top-level non-identifier name is still refused.
-  - A plaintext file over 1 MiB that may hold an inline vault value is reported as too large to parse, in the commands listed under [Unreadable files](https://github.com/aioue/pilfer#unreadable-files).
 
 ## Features
 
@@ -153,7 +151,6 @@ t.yml: api_token
 - With several patterns, a key matches if any one does. With none, every key is listed. `-l` prints only file names and cannot be combined with `--json`.
 - Each `--json` line has `file`; `key`, the last name; `path`, the names and list indexes from the file root; `kind`, `file` or `inline`; `open`, true when read from an open session; and `vault_id`, `default` for a file with no label.
 - Exit status: 0 when a key matched, 1 when none did, 2 on an error. A vault file it cannot read or decrypt is named on stderr and gives 2, even when other files matched. It exits 141 if its output pipe closes early, as with `| head`; see [Unreadable files](#unreadable-files).
-- A key supplied by several `<<` merge sources is listed once.
 - Text output escapes characters Python treats as non-printable (`\x1b`, U+202E). `--json` uses standard JSON escapes.
 
 A whole-file vault hides its key names from `grep`. `find-keys` decrypts each file in memory, so it shows those names to anyone who has the password. Pilfer has no value search, which would let you guess a secret. Files open in a session are read from their plaintext and tagged `(open)`. Keys whose value is an inline `!vault` string are skipped unless you pass `--include-encrypted-vars`; they are tagged `(inline)`.
@@ -169,7 +166,7 @@ pilfer update db_password
 Values are read as for `pilfer set`.
 
 - Update never creates a key; use `pilfer set FILE KEY` for that. It replaces only a single (scalar) value; a mapping or list is refused.
-- `set` and `update` refuse a key shared through a YAML anchor that is used elsewhere, in whole-file vaults and inline `!vault` files alike, and refuse to add a key to a mapping that has only a `<<` merge or whose last value is an alias. Edit those in a `pilfer open` session.
+- `set` and `update` refuse a key path that touches a YAML anchor, alias or `<<` merge, in whole-file vaults and inline `!vault` files alike. Edit those in a `pilfer open` session.
 - If several files hold the key, it lists them and asks for `--file FILE`.
 - A key that exists only as an inline `!vault` value needs `--include-encrypted-vars`. The new value keeps its vault-id label.
 - Files open in a session are refused.
@@ -181,7 +178,7 @@ See [Preview a change, and unchanged values](#preview-a-change-and-unchanged-val
 
 ### Unreadable files
 
-Pilfer reads every file in the tree to find vaults. A file that cannot be opened is unreadable, and so is a directory that cannot be listed. A file over 64 MiB is unreadable only if it contains `$ANSIBLE_VAULT;` or a pilfer marker; otherwise it is skipped as not a vault. A plaintext file over 1 MiB that may hold an inline vault value is also unreadable ("too large to parse"): it contains a `!vault` tag in any YAML spelling, a `%TAG` directive, or an `__ansible_vault` JSON key. A file that only mentions the word vault is not affected. The check runs only when inline values are included: `rekey` by default, `update` always, and `find-keys` or `open` with `--include-encrypted-vars`. Whole-file vaults, closed or open in a session, are limited only by the 64 MiB cap.
+Pilfer reads every file in the tree to find vaults. A file that cannot be opened is unreadable, and so is a directory that cannot be listed. A file over 64 MiB is unreadable only if its first 64 MiB holds `$ANSIBLE_VAULT;` or a pilfer marker; otherwise it is skipped as not a vault.
 
 - `rekey` refuses to start if any file is unreadable, whatever its name, and lists up to five.
 - `open` warns about up to five, then gives a count. If it found no readable vault, it exits 1 with `No readable vault files found`.
@@ -379,7 +376,7 @@ pilfer completion --install
 This writes a completion script for the shell in `$SHELL`; name `bash` or `zsh` to choose. Other shells are refused. `--install` refuses a symlink at the target. Open a new shell to use it. Pilfer never edits your shell's startup files.
 
 - bash: `${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/pilfer`
-- zsh: the first writable directory under your home on zsh's `fpath`, otherwise `~/.zfunc/_pilfer`. In that case, add `fpath=(~/.zfunc $fpath)` above `compinit` in `~/.zshrc`.
+- zsh: `~/.zfunc/_pilfer`. Add `fpath=(~/.zfunc $fpath)` above `compinit` in `~/.zshrc`.
 
 Without `--install` the script prints to stdout. It completes commands, options and file paths, never key names.
 
@@ -467,8 +464,8 @@ non-zero. It does not invent fixes for ambiguous edits.
 - **Lock wait and ctrl-c:** a second pilfer run in the same tree waits for the first and prints `Waiting for another pilfer run (lock <path>)...`. Ctrl-c exits 130. If a session is still open after an interrupted `open` or `close`, pilfer says to run `pilfer close`. After an interrupted `rekey`, re-run the same command to resume. If `<password file>_old` already exists, the rotation finished.
 - **Nested git checkouts** are skipped; run pilfer from those roots if needed.
 - **Password check on close:** `close` proves the password by decrypting a `.vault` backup. The session list stores no hash of the password.
-- **File modes:** opened plaintext is `0600`. `close` puts back the mode and group the file had at `open`, with setuid, setgid, sticky and other-write bits cleared; `rekey` and `set` keep the file's own. The group is kept only when you are a member of it.
-- **Incomplete open** (session list written, crash before decrypt) is cleared on the next `open` only when listed paths still look like vault ciphertext and there are no backups/sidecars - so you are not told to `close` ciphertext. If the session list remains but files are already plaintext (artifacts deleted), `open` still refuses. `close` and `rekey` refuse a session entry that is not a regular file. A session list entry with an unknown kind or a NUL in its path is reported as malformed.
+- **File modes:** opened plaintext is `0600`. `close` puts back the mode and group the file had at `open`; `rekey` and `set` keep the file's own. The group is kept only when you are a member of it.
+- **Incomplete open** (session list written, crash before decrypt) is cleared on the next `open` only when listed paths still look like vault ciphertext and there are no backups/sidecars - so you are not told to `close` ciphertext. If the session list remains but files are already plaintext (artifacts deleted), `open` still refuses. A malformed session list entry is reported as damaged.
 - **Leftover temp files** (`.pilfer-rekey-*`, no extension) from a killed run are deleted by the next `open`, `close` or `rekey`, dry runs included. A temp exists only until its rename, so it is never the only copy of anything, and one from a killed `open` holds plaintext.
 - **`*.pilfer-open` sidecars** sit beside opened files (whole-file opens have no `# pilfer:vault:` markers).
 
