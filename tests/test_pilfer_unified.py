@@ -209,6 +209,18 @@ class TestSessionSafety(ProjectDirTest):
         with open(backups[0], "rb") as f:
             self.assertTrue(f.read().startswith(b"$ANSIBLE_VAULT;"))
 
+    def test_deleted_whole_file_needs_confirm_delete(self):
+        self.assertEqual(self._run("open").returncode, 0)
+        os.remove("secret.yml")
+        refused = self._run("close")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("--confirm-delete", refused.stderr)
+        closed = self._run("close", "--confirm-delete")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertIn("Dropped deleted file", closed.stdout)
+        self.assertFalse(os.path.exists("vaultedFileList.json"))
+        self.assertFalse(os.path.exists(".vault"))
+
     def test_partial_close_keeps_session(self):
         self.assertEqual(self._run("open").returncode, 0)
         hash_path = next(

@@ -219,7 +219,7 @@ from pilfer.vault_set import set_keys
 set_keys(path, {key: value}, password_file)
 ```
 
-`password_file` can be a password file or script path, a `pilfer.vault_secrets.VaultSources` (password files, vault ids, prompt), or `None` for Ansible's config. Ansible reads its config once, when it is first imported, so a script gets the `ansible.cfg` of the directory it imported pilfer from. Failures and refusals raise `PilferError`, including an unreadable password file, a failing password script or failed encryption.
+`password_file` can be a password file or script path, a `pilfer.vault_secrets.VaultSources` (password files, vault ids, prompt), or `None` for Ansible's config. Ansible reads its config once, when it is first imported, so a script gets the `ansible.cfg` of the directory it imported pilfer from. Failures and refusals raise `PilferError`, including an unreadable password file when no other source loads, a failing password script or failed encryption.
 
 To check whether an update can be made before an action you cannot undo, such as minting a token, call `set_keys` with a placeholder value and `check_only=True`. This performs the edit and encryption and writes a temporary ciphertext file beside the vault, but skips the final rename. It can therefore catch problems such as a read-only directory or full disk.
 
@@ -459,7 +459,7 @@ non-zero. It does not invent fixes for ambiguous edits.
   working bytes match the open backup, or the file is vault ciphertext decryptable
   with the session password (not an arbitrary foreign vault blob).
 - **`close` is progressive** - files that succeed are encrypted and dropped from the session; failures stay plaintext until you fix and retry. Not an all-or-nothing transaction.
-- **Intentional var removal** requires `pilfer close --confirm-delete`.
+- **Intentional var removal** requires `pilfer close --confirm-delete`. So does deleting a whole vault file while it is open.
 - **Short secrets** can block close if the same bytes appear elsewhere in the file (docs/comments) - fail closed.
 - **Lock wait and ctrl-c:** a second pilfer run in the same tree waits for the first and prints `Waiting for another pilfer run (lock <path>)...`. Ctrl-c exits 130. If a session is still open after an interrupted `open` or `close`, pilfer says to run `pilfer close`. After an interrupted `rekey`, re-run the same command to resume. If `<password file>_old` already exists, the rotation finished.
 - **Nested git checkouts** are skipped; run pilfer from those roots if needed.

@@ -634,7 +634,9 @@ def update_inline_value(
 
 
 def _check_value(key: str, value: str) -> None:
-    if not isinstance(value, str) or value == "":
+    if not isinstance(value, str):
+        raise PilferError(f"the value for {_clip(key)} must be a string")
+    if value == "":
         raise PilferError(f"refusing an empty value for {_clip(key)}")
     if "\0" in value:
         raise PilferError(f"refusing a value for {_clip(key)} that contains NUL")

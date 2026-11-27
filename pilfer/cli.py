@@ -1350,9 +1350,17 @@ def recrypt_vault_files(vault_password_file_path=None, confirm_delete: bool = Fa
                     path, vault, cwd, confirm_delete=confirm_delete, restore=restore
                 ):
                     modified_count += 1
-            else:
-                if _recrypt_whole_file(path, vault, cwd, restore):
-                    modified_count += 1
+            elif not os.path.lexists(path):
+                # Deleted while open: drop it on request, or say how to get out.
+                if not confirm_delete:
+                    raise PilferError(
+                        f"{path} was deleted while open; restore it from git "
+                        "and run 'pilfer close' again, or run 'pilfer close --confirm-delete' "
+                        "to drop it from the session"
+                    )
+                print(f"Dropped deleted file from the session: {path}")
+            elif _recrypt_whole_file(path, vault, cwd, restore):
+                modified_count += 1
             # Persist session removal before deleting backups so a crash mid-close
             # leaves a retryable list (already-closed files are not re-listed).
             remaining = [e for e in remaining if e["path"] != path]
@@ -2291,7 +2299,7 @@ def _build_argument_parser():
         "--confirm-delete",
         action="store_true",
         dest="confirm_delete",
-        help="Accept deleted inline values (marker and secret line removed)",
+        help="Accept deleted inline values (marker and secret line removed) and deleted vault files",
     )
     _add_vault_options(close_parser, "Password file or script; repeatable (what open used)")
 
@@ -2608,10 +2616,9 @@ def _main(argv=None):
                     announce_skips=not args.quiet,
                 )
                 if opened:
-                    # ANSI bold around the next command (TTY-friendly; harmless in pipes).
                     print(
                         "✅ All vault files decrypted. Edit as needed, "
-                        "then run '\033[1mpilfer close\033[0m' to re-encrypt."
+                        "then run 'pilfer close' to re-encrypt."
                     )
             elif args.action == "close":
                 print("🔒 Re-encrypting vault files...")
