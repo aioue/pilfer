@@ -101,6 +101,7 @@ pilfer update [--file FILE] [--include-encrypted-vars] [--dry-run] [VAULT OPTION
 pilfer rekey [--old-vault-password-file OLD]... [--old-vault-id ID]... (--new-vault-password-file NEW | --new-vault-id ID) [options]
 pilfer set [--dry-run] [VAULT OPTIONS] FILE KEY [VALUE]
 pilfer completion [--install] [bash | zsh]
+pilfer agent-guide
 
 VAULT OPTIONS: [--vault-id ID]... [-p VAULT_PASSWORD_FILE]... [-J]
 ```
@@ -336,6 +337,16 @@ This writes a completion script for the shell in `$SHELL`; name `bash` or `zsh` 
 - zsh: the first writable directory under your home on zsh's `fpath`, otherwise `~/.zfunc/_pilfer`. In that case, add `fpath=(~/.zfunc $fpath)` above `compinit` in `~/.zshrc`.
 
 Without `--install` the script prints to stdout. It completes commands, options and file paths, never key names.
+
+### For AI agents
+
+`pilfer agent-guide` prints a `SKILL.md` that tells a coding agent to find and change secrets with `find-keys`, `update` and `set`, without printing values. Install it where your agent reads skills:
+
+```bash
+mkdir -p ~/.agents/skills/pilfer && pilfer agent-guide > ~/.agents/skills/pilfer/SKILL.md
+```
+
+Claude Code reads `~/.claude/skills/pilfer/SKILL.md`. Run the command again after upgrading pilfer.
 
 ### Examples
 

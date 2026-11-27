@@ -1748,6 +1748,7 @@ Examples:
   pilfer status                         is anything still decrypted?
   pilfer find-keys '*token*'            which vault files hold a key like this
   pilfer set secrets.yml db_password    change one key without opening anything
+  pilfer agent-guide                    usage notes for AI coding agents
 """
 
 _TOP_NOTES = """
@@ -1908,6 +1909,20 @@ edits your shell's startup files.
 """
 
 
+_AGENT_GUIDE_EXAMPLES = """
+Examples:
+  pilfer agent-guide                        print the guide
+  mkdir -p ~/.agents/skills/pilfer && \\
+      pilfer agent-guide > ~/.agents/skills/pilfer/SKILL.md
+"""
+
+_AGENT_GUIDE_NOTES = """
+The guide is an Agent Skills SKILL.md. Save it where your agent reads skills.
+Claude Code reads ~/.claude/skills/pilfer/SKILL.md. Run the command again after
+upgrading pilfer to refresh the copy.
+"""
+
+
 def _hides_unrecognized_set_value(message: str) -> bool:
     """True when argparse would print a single-dash positional as an option.
 
@@ -1991,7 +2006,7 @@ _DEFAULT_PASSWORD_HELP = (
 
 
 def _build_argument_parser():
-    """Build the pilfer CLI parser (commands: open, close, status, find-keys, set, update, rekey, completion)."""
+    """Build the pilfer CLI parser (commands: open, close, status, find-keys, set, update, rekey, completion, agent-guide)."""
     parser = _Parser(
         prog="pilfer",
         description="Decrypt Ansible vault files in a project, edit them, then re-encrypt.",
@@ -2026,7 +2041,7 @@ def _build_argument_parser():
             name,
             help=summary,
             description=description,
-            usage=f"%(prog)s {usage}",
+            usage=f"%(prog)s {usage}".rstrip(),
             epilog=examples,
             notes=notes,
         )
@@ -2270,6 +2285,15 @@ def _build_argument_parser():
         "--install", action="store_true", help="Write the script where the shell finds it"
     )
 
+    command(
+        "agent-guide",
+        "Print a SKILL.md that teaches AI coding agents to use pilfer",
+        "Print the pilfer guide for AI coding agents, as an Agent Skills SKILL.md.",
+        "",
+        _AGENT_GUIDE_EXAMPLES,
+        _AGENT_GUIDE_NOTES,
+    )
+
     return parser
 
 
@@ -2289,6 +2313,15 @@ def _interrupted_hint(action: str) -> str:
     return ""
 
 
+def _run_agent_guide() -> int:
+    """Print the packaged SKILL.md exactly as stored."""
+    from importlib import resources
+
+    guide = resources.files("pilfer").joinpath("agent_guide", "SKILL.md")
+    sys.stdout.write(guide.read_text(encoding="utf-8"))
+    return 0
+
+
 def main(argv=None):
     """Main CLI entry point for pilfer"""
     parser = _build_argument_parser()
@@ -2302,6 +2335,8 @@ def main(argv=None):
             return _run_set(args)
         if args.action == "completion":
             return completion.run_completion(args, parser)
+        if args.action == "agent-guide":
+            return _run_agent_guide()
         if args.action in ("find-keys", "update"):
             # Imported here: find_keys imports helpers from this module.
             from pilfer import find_keys

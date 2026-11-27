@@ -80,3 +80,8 @@ include = ["pilfer*"]
 exclude_dirs = ["tests", ".venv", "build", "dist"]
 # Intentional best-effort cleanup paths (same policy as ruff SIM105 ignore).
 skips = ["B110"]
+
+[tool.setuptools.package-data]
+# agent_guide/ has no __init__.py, so find does not see it as a package; this
+# ships SKILL.md inside pilfer for `pilfer agent-guide`.
+pilfer = ["agent_guide/*.md"]
