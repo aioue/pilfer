@@ -55,23 +55,6 @@ Add to `ansible.cfg` so you do not need `-p FILE` on every run:
 vault_password_file = ~/.ansible-vault/.vault-file
 ```
 
-## What's new in 3.1
-
-- `pilfer find-keys` shows which vault files hold a key. It prints names, never values.
-- `pilfer update KEY` replaces an existing key's value in whichever vault holds it.
-- `pilfer set` and `update` take nested key paths such as `aws.prod.secret_key`.
-- `pilfer completion` installs bash and zsh completion.
-- `pilfer status` shows whether a session holds plaintext, without a password.
-- `--dry-run` on `set` and `update` checks a change and writes nothing. `update` is new; `set` and `update` both print `unchanged KEY in FILE` for a value that is already stored.
-- With no terminal, `set`, `update` and password prompts stop with an error instead of hanging.
-- `pilfer agent-guide` prints a skill file for coding agents.
-- New dependency: `shtab`.
-- `--help` is rewritten, with examples first.
-- `rekey` and `open` now stop on (or warn about) files they cannot read, as `find-keys` does; see [Unreadable files](https://github.com/aioue/pilfer#unreadable-files).
-- Option abbreviations are rejected: `--files` is not short for `--files-with-matches`.
-- Changed from 3.0:
-  - `set` can now address nested paths and existing keys whose names are not identifiers, such as `a['dotted.key']`; a new top-level non-identifier name is still refused.
-
 ## Features
 
 - **Fail-safe:** & battle tested. Power outages and fat-fingers won't lose data
