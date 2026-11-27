@@ -273,7 +273,10 @@ def run_find_keys(args) -> int:
                 print(f"{_shown(hit.file)}: {rendered}{tags}")
     if failures:
         return 2
-    return 0 if hits else 1
+    if not hits:
+        print("pilfer: no key matched", file=sys.stderr)
+        return 1
+    return 0
 
 
 def run_update(args) -> int:
@@ -302,7 +305,7 @@ def run_update(args) -> int:
         suffix = f" ({failures} file(s) could not be read)" if failures else ""
         raise PilferError(f"{shown} not found in any vault file{suffix}{hint}")
     if len(targets) > 1:
-        listing = "\n".join(f"  {_shown(hit.file)}" for hit in targets)
+        listing = "\n".join(f"  {name}" for name in sorted(_shown(hit.file) for hit in targets))
         raise PilferError(
             f"{shown} is in {len(targets)} files; pass --file FILE to choose one:\n{listing}"
         )
