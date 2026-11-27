@@ -12,7 +12,9 @@ permissions:
 
 concurrency:
   group: test-suite-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only PR runs cancel an older run: a cancelled run on master shows as
+  # failing on the README badge.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:

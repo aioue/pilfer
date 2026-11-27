@@ -11,7 +11,8 @@ permissions:
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a release part way through publishing.
+  cancel-in-progress: false
 
 jobs:
   validate-and-test:
